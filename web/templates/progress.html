@@ -1,0 +1,56 @@
+<article
+  class="run-card"
+  hx-get="/runs/{{ progress.run_id }}/progress"
+  hx-trigger="every 3s"
+  hx-swap="outerHTML">
+  <div class="run-title">
+    <strong>{{ progress.run_type }}</strong>
+    <div class="run-actions">
+      <span>{{ progress.status }}</span>
+      {% if progress.status not in ["completed", "failed", "cancelled"] %}
+      <form method="post" action="/runs/{{ progress.run_id }}/cancel">
+        <button class="danger compact" type="submit">Cancel</button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+  <div class="bar" aria-label="Progress">
+    <span style="width: {{ progress.percent }}%"></span>
+  </div>
+  <dl>
+    <div><dt>Total</dt><dd>{{ progress.total }}</dd></div>
+    <div><dt>Queued</dt><dd>{{ progress.queued }}</dd></div>
+    <div><dt>Running</dt><dd>{{ progress.running }}</dd></div>
+    <div><dt>Done</dt><dd>{{ progress.succeeded }}</dd></div>
+    <div><dt>Failed</dt><dd>{{ progress.failed }}</dd></div>
+    <div><dt>Due</dt><dd>{{ progress.due_now }}</dd></div>
+    <div><dt>Late</dt><dd>{{ progress.late }}</dd></div>
+  </dl>
+  <div class="run-detail">
+    {% if progress.running_worker_id %}
+    <span>Worker {{ progress.running_worker_id }}</span>
+    {% endif %}
+    {% if progress.oldest_running_task_id %}
+    <span>Running task {{ progress.oldest_running_task_id }} since {{ progress.oldest_running_at }}</span>
+    {% endif %}
+    {% if progress.next_scheduled_for %}
+    <span>Next queued {{ progress.next_scheduled_for }}</span>
+    {% endif %}
+    {% if progress.last_error_type %}
+    <span class="error">{{ progress.last_error_type }}: {{ progress.last_error_message }}</span>
+    {% endif %}
+  </div>
+  {% if progress.events %}
+  <div class="event-list">
+    {% for event in progress.events %}
+    <div class="event-row">
+      <span>#{{ event.task_id }}</span>
+      <span>{{ event.status }}</span>
+      <span>{{ event.task_type }}</span>
+      <span>{% if event.amc_theatre_id %}Theatre {{ event.amc_theatre_id }}{% elif event.showtime_id %}Showtime {{ event.showtime_id }}{% endif %}</span>
+      <span>{% if event.last_error_type %}{{ event.last_error_type }}{% endif %}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+</article>

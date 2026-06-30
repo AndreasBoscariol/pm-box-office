@@ -31,8 +31,8 @@ except ModuleNotFoundError:  # Allow `python3 scripts/ingest/scrape_the_numbers.
 
 
 BASE_URL = "https://www.the-numbers.com"
-DEFAULT_START_DATE = dt.date(2020, 1, 1)
-DEFAULT_END_DATE = dt.date(2026, 5, 31)
+DEFAULT_START_DATE = dt.date(2026, 6, 1)
+DEFAULT_END_DATE = dt.date(2026, 6, 30)
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 MIN_DELAY_SECONDS = 20.0
 

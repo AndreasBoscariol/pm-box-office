@@ -3,15 +3,27 @@
 from __future__ import annotations
 
 import hashlib
+import datetime as dt
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 
 DEFAULT_CACHE_DIR = Path("data/raw/amc")
 DEFAULT_USER_AGENT = "pm-box-office-amc/0.1"
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    body: str
+    source_url: str
+    fetched_at: dt.datetime
+    cache_path: Path | None
+    from_cache: bool
+    status_code: int
 
 
 class HtmlFetcher:
@@ -43,10 +55,25 @@ class HtmlFetcher:
         digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
         return self.cache_dir / f"{digest}{suffix}"
 
-    def get(self, url: str) -> tuple[str, Path, bool]:
+    def get_result(
+        self,
+        url: str,
+        *,
+        refresh: bool | None = None,
+        archive_path: Path | None = None,
+    ) -> FetchResult:
         cache_path = self.cache_path(url)
-        if cache_path.exists() and not self.refresh:
-            return cache_path.read_text(encoding="utf-8"), cache_path, False
+        should_refresh = self.refresh if refresh is None else refresh
+        now = dt.datetime.now(dt.timezone.utc)
+        if cache_path.exists() and not should_refresh:
+            return FetchResult(
+                body=cache_path.read_text(encoding="utf-8"),
+                source_url=url,
+                fetched_at=now,
+                cache_path=cache_path,
+                from_cache=True,
+                status_code=200,
+            )
         if self.offline:
             raise FileNotFoundError(f"Cache miss in offline mode: {url}")
 
@@ -64,11 +91,22 @@ class HtmlFetcher:
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                     body = response.read().decode("utf-8", errors="replace")
+                    status_code = int(response.status)
                 if not body.strip():
                     raise RuntimeError(f"GET {url} returned an empty response body")
                 cache_path.write_text(body, encoding="utf-8")
+                if archive_path is not None:
+                    archive_path.parent.mkdir(parents=True, exist_ok=True)
+                    archive_path.write_text(body, encoding="utf-8")
                 self._last_request_at = time.monotonic()
-                return body, cache_path, True
+                return FetchResult(
+                    body=body,
+                    source_url=url,
+                    fetched_at=dt.datetime.now(dt.timezone.utc),
+                    cache_path=archive_path or cache_path,
+                    from_cache=False,
+                    status_code=status_code,
+                )
             except urllib.error.HTTPError as exc:
                 last_error = exc
                 if exc.code not in TRANSIENT_STATUSES or attempt == self.retries - 1:
@@ -83,9 +121,23 @@ class HtmlFetcher:
                 time.sleep(self.delay_seconds * (attempt + 1))
         raise RuntimeError(f"GET {url} failed after retry: {last_error}")
 
+    def get_live_result(self, url: str, *, archive_path: Path | None = None) -> FetchResult:
+        """Fetch from AMC even when a cache file exists.
+
+        Seat maps use this path so a later observation cannot silently reuse an
+        older seat-state page.
+        """
+
+        return self.get_result(url, refresh=True, archive_path=archive_path)
+
+    def get(self, url: str) -> tuple[str, Path, bool]:
+        result = self.get_result(url)
+        if result.cache_path is None:
+            raise RuntimeError(f"GET {url} did not produce a cache path")
+        return result.body, result.cache_path, not result.from_cache
+
     def _wait(self) -> None:
         elapsed = time.monotonic() - self._last_request_at
         delay = max(0.0, self.delay_seconds - elapsed)
         if delay:
             time.sleep(delay)
-
