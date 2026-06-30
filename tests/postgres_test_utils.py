@@ -20,6 +20,8 @@ def make_isolated_postgres_schema() -> tuple[Any, str]:
         conn = connect_database(database_url)
     except SystemExit as exc:
         raise unittest.SkipTest(str(exc)) from exc
+    except Exception as exc:
+        raise unittest.SkipTest(f"Could not connect to PostgreSQL test database: {exc}") from exc
 
     schema = f"test_{uuid.uuid4().hex}"
     conn.execute(f"CREATE SCHEMA {quote_ident(schema)}")
