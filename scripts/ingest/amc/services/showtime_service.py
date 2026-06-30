@@ -46,7 +46,7 @@ def collect_theatre_showtimes(
 def create_inventory_run(conn: Any, *, exhibition_date: dt.date) -> tuple[str, int]:
     campaign_id = db.ensure_campaign(conn, exhibition_date)
     run_id = db.create_run(conn, campaign_id=campaign_id, run_type="showtime_inventory", status="queued")
-    theatres = db.select_active_theatres(conn)
+    theatres = db.select_active_theatres_basic(conn)
     task_count = db.create_inventory_tasks(conn, run_id=run_id, theatres=theatres)
     return str(run_id), task_count
 

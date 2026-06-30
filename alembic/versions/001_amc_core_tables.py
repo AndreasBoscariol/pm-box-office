@@ -39,11 +39,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute("DROP SCHEMA IF EXISTS analytics CASCADE")
     for table in (
-        "movie_day_actuals",
         "movie_day_estimates",
-        "amc_movie_targets",
-        "movie_amc_matches",
-        "amc_collection_runs",
         "amc_seat_snapshots",
         "collection_tasks",
         "collection_runs",

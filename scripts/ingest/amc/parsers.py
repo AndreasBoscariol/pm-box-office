@@ -411,10 +411,10 @@ def extract_rsc_seat_fill(
         raise ValueError("Could not find showtime.seatingLayout.seats in AMC RSC payload")
     return replace(
         seat_fill_from_seats(
-        [seat for seat in seats if isinstance(seat, dict)],
-        theatre_slug=theatre_slug,
-        date=date,
-        showtime_id=showtime_id,
+            [seat for seat in seats if isinstance(seat, dict)],
+            theatre_slug=theatre_slug,
+            date=date,
+            showtime_id=showtime_id,
         ),
         parse_method="rsc",
     )
@@ -484,15 +484,97 @@ def fetch_showtimes_for_date(fetcher: Any, *, theatre_slug: str, date: dt.date) 
     raise ValueError(f"Could not find AMC showtimes in embedded Apollo data or rendered HTML for {url}")
 
 
-def fetch_seat_fill(fetcher: Any, *, theatre_slug: str, date: dt.date, showtime_id: str) -> SeatFill:
-    url = current_showtime_seats_url(showtime_id)
-    if hasattr(fetcher, "get_live_result"):
+def collect_showtimes(
+    fetcher: Any,
+    *,
+    theatre_slug: str,
+    start_date: dt.date,
+    end_date: dt.date,
+    with_seat_fill: bool = False,
+) -> list[ShowtimeRecord]:
+    if end_date < start_date:
+        raise ValueError("end_date must be on or after start_date")
+
+    rows: list[ShowtimeRecord] = []
+    day = start_date
+    while day <= end_date:
+        day_rows = fetch_showtimes_for_date(fetcher, theatre_slug=theatre_slug, date=day)
+        if with_seat_fill:
+            day_rows = [
+                replace(
+                    row,
+                    total_seats=fill.total_seats,
+                    available_seats=fill.available_seats,
+                    filled_or_unavailable_seats=fill.filled_or_unavailable_seats,
+                    fill_rate=fill.fill_rate,
+                )
+                for row in day_rows
+                for fill in [
+                    fetch_seat_fill(
+                        fetcher,
+                        theatre_slug=theatre_slug,
+                        date=day,
+                        showtime_id=row.showtime_id,
+                    )
+                ]
+            ]
+        rows.extend(day_rows)
+        day += dt.timedelta(days=1)
+    return rows
+
+
+def fetch_text_result(fetcher: Any, url: str, *, live: bool) -> tuple[str, str | None]:
+    if live and hasattr(fetcher, "get_live_result"):
         result = fetcher.get_live_result(url)
-        html_text = result.body
-        raw_cache_path = str(result.cache_path) if result.cache_path is not None else None
-    else:
-        html_text, cache_path, _fetched = fetcher.get(url)
-        raw_cache_path = str(cache_path) if cache_path is not None else None
+        return result.body, str(result.cache_path) if result.cache_path is not None else None
+    if hasattr(fetcher, "get_result"):
+        result = fetcher.get_result(url, refresh=live)
+        return result.body, str(result.cache_path) if result.cache_path is not None else None
+    text, cache_path, _fetched = fetcher.get(url)
+    return text, str(cache_path) if cache_path is not None else None
+
+
+def fetch_rsc_seat_fill(
+    fetcher: Any,
+    *,
+    theatre_slug: str,
+    date: dt.date,
+    showtime_id: str,
+) -> SeatFill:
+    rsc_url = current_showtime_seats_rsc_url(showtime_id)
+    rsc_text, rsc_cache_path = fetch_text_result(fetcher, rsc_url, live=True)
+    return replace(
+        extract_rsc_seat_fill(
+            rsc_text,
+            theatre_slug=theatre_slug,
+            date=date,
+            showtime_id=showtime_id,
+        ),
+        raw_cache_path=rsc_cache_path,
+    )
+
+
+def fetch_seat_fill(
+    fetcher: Any,
+    *,
+    theatre_slug: str,
+    date: dt.date,
+    showtime_id: str,
+    prefer_rsc: bool = False,
+) -> SeatFill:
+    if prefer_rsc:
+        try:
+            return fetch_rsc_seat_fill(
+                fetcher,
+                theatre_slug=theatre_slug,
+                date=date,
+                showtime_id=showtime_id,
+            )
+        except Exception:
+            pass
+
+    url = current_showtime_seats_url(showtime_id)
+    html_text, raw_cache_path = fetch_text_result(fetcher, url, live=True)
     apollo_data = maybe_parse_apollo_data(html_text, source_url=url)
     if apollo_data is not None:
         return replace(
@@ -512,20 +594,9 @@ def fetch_seat_fill(fetcher: Any, *, theatre_slug: str, date: dt.date, showtime_
     )
     if rendered_fill.total_seats:
         return replace(rendered_fill, raw_cache_path=raw_cache_path)
-    rsc_url = current_showtime_seats_rsc_url(showtime_id)
-    if hasattr(fetcher, "get_live_result"):
-        rsc_result = fetcher.get_live_result(rsc_url)
-        rsc_text = rsc_result.body
-        rsc_cache_path = str(rsc_result.cache_path) if rsc_result.cache_path is not None else None
-    else:
-        rsc_text, cache_path, _rsc_fetched = fetcher.get(rsc_url)
-        rsc_cache_path = str(cache_path) if cache_path is not None else None
-    return replace(
-        extract_rsc_seat_fill(
-            rsc_text,
-            theatre_slug=theatre_slug,
-            date=date,
-            showtime_id=showtime_id,
-        ),
-        raw_cache_path=rsc_cache_path,
+    return fetch_rsc_seat_fill(
+        fetcher,
+        theatre_slug=theatre_slug,
+        date=date,
+        showtime_id=showtime_id,
     )

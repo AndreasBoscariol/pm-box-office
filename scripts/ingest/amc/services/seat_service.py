@@ -30,6 +30,7 @@ def collect_snapshot(
         theatre_slug=showtime.theatre_slug,
         date=dt.date.fromisoformat(showtime.local_show_date),
         showtime_id=showtime.showtime_id,
+        prefer_rsc=True,
     )
     db.upsert_seat_snapshot(
         conn,

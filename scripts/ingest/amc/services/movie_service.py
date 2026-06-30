@@ -38,7 +38,7 @@ def create_seat_collection_run(
     conn: Any,
     *,
     exhibition_date: dt.date,
-    target_offset_minutes: int = 5,
+    target_offsets_minutes: tuple[int, ...] = (5,),
 ) -> tuple[str, int]:
     campaign_id = db.ensure_campaign(conn, exhibition_date)
     run_id = db.create_run(conn, campaign_id=campaign_id, run_type="seat_collection", status="queued")
@@ -59,6 +59,6 @@ def create_seat_collection_run(
             conn,
             run_id=run_id,
             showtimes=showtimes,
-            target_offset_minutes=target_offset_minutes,
+            target_offsets_minutes=target_offsets_minutes,
         )
     return str(run_id), task_count

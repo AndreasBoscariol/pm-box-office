@@ -220,12 +220,6 @@ def cmd_ingest_theatres(args: Any) -> int:
     try:
         db.initialize_amc_database(conn)
         count = theatre_service.sync_theatres(conn, fetcher)
-        run_id = db.create_collection_run(
-            conn,
-            run_type="sitemap",
-            status="completed",
-        )
-        db.complete_collection_run(conn, run_id, status="completed")
         conn.commit()
     finally:
         conn.close()
@@ -291,7 +285,7 @@ def cmd_create_seat_run(args: Any) -> int:
         run_id, task_count = movie_service.create_seat_collection_run(
             conn,
             exhibition_date=args.target_date,
-            target_offset_minutes=args.target_offset_minutes,
+            target_offsets_minutes=args.target_offsets_minutes,
         )
         conn.commit()
     finally:
@@ -349,7 +343,6 @@ def cmd_morning_showtimes(args: Any) -> int:
     target_date = args.target_date
     now_utc = parse_utc_datetime(args.now_utc) if args.now_utc else dt.datetime.now(UTC)
     conn = connect_database()
-    run_id: int | None = None
     try:
         db.initialize_amc_database(conn)
         seeded_theatres = ensure_theatres_available(conn, fetcher)
@@ -375,14 +368,6 @@ def cmd_morning_showtimes(args: Any) -> int:
                 )
         sample = stratified_sample(theatres, sample_size=args.sample_size, seed=args.seed)
         selected_theatres = [item.theatre for item in sample]
-        run_id = db.create_collection_run(
-            conn,
-            run_type="morning_showtimes",
-            target_date=target_date.isoformat(),
-            target_amc_movie_id=args.target_amc_movie_id,
-            target_amc_movie_name=args.target_amc_movie_name,
-            selected_theatre_ids=[theatre.amc_theatre_id for theatre in selected_theatres],
-        )
 
         showtime_count = 0
         target_showtime_count = 0
@@ -407,16 +392,10 @@ def cmd_morning_showtimes(args: Any) -> int:
                     fetched_at=now_utc,
                 )
 
-        db.complete_collection_run(conn, run_id, status="completed")
         if args.dry_run:
             conn.rollback()
         else:
             conn.commit()
-    except Exception as exc:
-        if run_id is not None:
-            db.complete_collection_run(conn, run_id, status="failed", error=str(exc))
-            conn.commit()
-        raise
     finally:
         conn.close()
 
@@ -463,18 +442,20 @@ def cmd_select_movie(args: Any) -> int:
         print(f"--target-amc-movie-name {selected.amc_movie_name!r}")
 
         if args.save_to_db:
-            db.upsert_movie_target(
+            db.upsert_amc_movie(
                 conn,
-                target_date=args.target_date.isoformat(),
                 amc_movie_id=selected.amc_movie_id,
                 amc_movie_name=selected.amc_movie_name,
-                source_theatre_id=theatre.amc_theatre_id,
-                source_theatre_slug=theatre.slug,
-                source_theatre_name=theatre.name,
-                notes=args.notes,
+            )
+            campaign_id = db.ensure_campaign(conn, args.target_date)
+            db.set_campaign_movie_selected(
+                conn,
+                campaign_id=campaign_id,
+                amc_movie_id=selected.amc_movie_id,
+                selected=True,
             )
             conn.commit()
-            print("Saved selected movie to amc_movie_targets.")
+            print("Selected movie for the campaign date.")
         else:
             conn.rollback()
     finally:
@@ -488,7 +469,6 @@ def cmd_seat_snapshots(args: Any) -> int:
     now_utc = parse_utc_datetime(args.now_utc) if args.now_utc else dt.datetime.now(UTC)
     offsets = parse_offsets(args.offset_minutes)
     conn = connect_database()
-    run_id: int | None = None
     try:
         db.initialize_amc_database(conn)
         showtimes = db.select_showtimes_for_target(
@@ -502,14 +482,6 @@ def cmd_seat_snapshots(args: Any) -> int:
             now_utc=now_utc,
             offsets_minutes=offsets,
             grace_minutes=args.grace_minutes,
-        )
-        run_id = db.create_collection_run(
-            conn,
-            run_type="seat_snapshots",
-            target_date=args.target_date.isoformat(),
-            target_amc_movie_id=args.target_amc_movie_id,
-            target_amc_movie_name=args.target_amc_movie_name,
-            selected_theatre_ids=[showtime.amc_theatre_id for showtime, _snapshot in due],
         )
 
         collected = 0
@@ -530,6 +502,7 @@ def cmd_seat_snapshots(args: Any) -> int:
                 theatre_slug=showtime.theatre_slug,
                 date=dt.date.fromisoformat(showtime.local_show_date),
                 showtime_id=showtime.showtime_id,
+                prefer_rsc=True,
             )
             db.upsert_seat_snapshot(
                 conn,
@@ -541,16 +514,10 @@ def cmd_seat_snapshots(args: Any) -> int:
             )
             collected += 1
 
-        db.complete_collection_run(conn, run_id, status="completed")
         if args.dry_run:
             conn.rollback()
         else:
             conn.commit()
-    except Exception as exc:
-        if run_id is not None:
-            db.complete_collection_run(conn, run_id, status="failed", error=str(exc))
-            conn.commit()
-        raise
     finally:
         conn.close()
 
@@ -600,7 +567,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create durable seat-scan tasks for selected movies on a date.",
     )
     seat_run.add_argument("target_date", type=parse_date)
-    seat_run.add_argument("--target-offset-minutes", type=int, default=5)
+    seat_run.add_argument(
+        "--target-offset-minutes",
+        dest="target_offsets_minutes",
+        type=parse_offsets,
+        default=(5,),
+        help="Comma-separated minutes before showtime to collect. Default: 5.",
+    )
     seat_run.set_defaults(func=cmd_create_seat_run)
 
     progress = subparsers.add_parser("run-progress", help="Print progress for a durable run.")
@@ -633,9 +606,8 @@ def build_parser() -> argparse.ArgumentParser:
     selector.add_argument(
         "--save-to-db",
         action="store_true",
-        help="Save the selected target to amc_movie_targets. Default is print-only.",
+        help="Select the movie for the campaign date. Default is print-only.",
     )
-    selector.add_argument("--notes", help="Optional notes when using --save-to-db.")
     selector.set_defaults(func=cmd_select_movie)
 
     morning = subparsers.add_parser("morning-showtimes", help="Collect morning showtimes for sampled theatres.")

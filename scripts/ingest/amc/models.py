@@ -10,7 +10,6 @@ from __future__ import annotations
 from scripts.ingest.amc.db import (
     CollectionTask,
     MovieInventoryRow,
-    SavedMovieTarget,
     StoredShowtime,
     StoredTheatre,
 )
@@ -21,7 +20,6 @@ __all__ = [
     "AmcTheatre",
     "CollectionTask",
     "MovieInventoryRow",
-    "SavedMovieTarget",
     "SeatFill",
     "ShowtimeRecord",
     "StoredShowtime",

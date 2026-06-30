@@ -5,7 +5,7 @@ import datetime as dt
 import json
 import unittest
 
-from scripts.ingest import collect_amc_showtimes as amc
+from scripts.ingest.amc import parsers as amc
 
 
 def apollo_html(payload: dict[str, object]) -> str:

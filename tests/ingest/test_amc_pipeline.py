@@ -247,39 +247,86 @@ class AmcPipelinePostgresTests(unittest.TestCase):
             self.conn.execute("SELECT COUNT(*) FROM amc_seat_snapshots").fetchone()[0],
         )
 
-    def test_movie_target_upsert_is_idempotent(self) -> None:
-        db.upsert_movie_target(
+    def test_campaign_movie_selection_is_idempotent(self) -> None:
+        db.upsert_amc_movie(
             self.conn,
-            target_date="2026-07-01",
             amc_movie_id="movie-1",
             amc_movie_name="Sample One",
-            source_theatre_id=123,
-            source_theatre_slug="amc-empire-25",
-            source_theatre_name="AMC Empire 25",
-            notes="first save",
         )
-        db.upsert_movie_target(
+        campaign_id = db.ensure_campaign(self.conn, dt.date(2026, 7, 1))
+        db.set_campaign_movie_selected(
             self.conn,
-            target_date="2026-07-01",
+            campaign_id=campaign_id,
             amc_movie_id="movie-1",
-            amc_movie_name="Sample One",
-            source_theatre_id=123,
-            source_theatre_slug="amc-empire-25",
-            source_theatre_name="AMC Empire 25",
-            notes="second save",
+            selected=True,
+        )
+        db.set_campaign_movie_selected(
+            self.conn,
+            campaign_id=campaign_id,
+            amc_movie_id="movie-1",
+            selected=True,
         )
         self.conn.commit()
 
         row = self.conn.execute(
             """
-            SELECT COUNT(*), MAX(notes)
-            FROM amc_movie_targets
-            WHERE target_date = %s AND amc_movie_id = %s
+            SELECT COUNT(*), BOOL_OR(selected)
+            FROM campaign_movies
+            WHERE campaign_id = %s AND amc_movie_id = %s
             """,
-            ("2026-07-01", "movie-1"),
+            (campaign_id, "movie-1"),
         ).fetchone()
         self.assertEqual(1, row[0])
-        self.assertEqual("second save", row[1])
+        self.assertTrue(row[1])
+
+    def test_create_seat_scan_tasks_supports_multiple_offsets(self) -> None:
+        theatre = parse_theatre_sitemap(SITEMAP_XML)[0]
+        db.upsert_theatres(self.conn, [theatre])
+        stored_theatre = db.select_active_theatres_basic(self.conn)[0]
+        db.upsert_showtimes(
+            self.conn,
+            theatre=stored_theatre,
+            showtimes=[
+                ShowtimeRecord(
+                    theatre_slug=stored_theatre.slug,
+                    date="2026-07-01",
+                    showtime_id="100",
+                    when="2026-07-01T19:00:00-04:00",
+                    movie_name="Sample One",
+                    movie_id="movie-1",
+                    showtime_url="https://www.amctheatres.com/showtimes/100",
+                    attribute_names="IMAX",
+                )
+            ],
+        )
+        campaign_id = db.ensure_campaign(self.conn, dt.date(2026, 7, 1))
+        run_id = db.create_run(self.conn, campaign_id=campaign_id, run_type="seat_collection")
+        showtime = db.select_showtimes_for_target(
+            self.conn,
+            target_date="2026-07-01",
+            target_amc_movie_id="movie-1",
+            target_amc_movie_name=None,
+        )[0]
+
+        task_count = db.create_seat_scan_tasks(
+            self.conn,
+            run_id=run_id,
+            showtimes=[showtime],
+            target_offsets_minutes=(120, 30, 5),
+        )
+        self.conn.commit()
+
+        rows = self.conn.execute(
+            """
+            SELECT priority
+            FROM collection_tasks
+            WHERE run_id = %s
+            ORDER BY priority DESC
+            """,
+            (run_id,),
+        ).fetchall()
+        self.assertEqual(3, task_count)
+        self.assertEqual([120, 30, 5], [row[0] for row in rows])
 
 
 if __name__ == "__main__":
