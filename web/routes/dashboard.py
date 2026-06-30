@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -112,7 +113,7 @@ def collect_showtimes(date_value: str) -> object:
 @router.post("/campaigns/{date_value}/movies/{amc_movie_id}")
 async def toggle_movie(date_value: str, amc_movie_id: str, request: Request) -> object:
     exhibition_date = dt.date.fromisoformat(date_value)
-    form = await request.form()
+    form = parse_qs((await request.body()).decode("utf-8"))
     conn = connect_database()
     try:
         ensure_initialized(conn)
@@ -120,7 +121,7 @@ async def toggle_movie(date_value: str, amc_movie_id: str, request: Request) -> 
             conn,
             exhibition_date=exhibition_date,
             amc_movie_id=amc_movie_id,
-            selected=form.get("selected") == "on",
+            selected=form.get("selected") == ["on"],
         )
         conn.commit()
     finally:
