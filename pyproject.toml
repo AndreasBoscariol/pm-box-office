@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pm-box-office"
+version = "0.1.0"
+description = "Box office prediction pipelines using The Numbers, Wikipedia, AMC, and Polymarket data."
+requires-python = ">=3.12"
+dependencies = [
+  "psycopg[binary]>=3.2",
+  "alembic>=1.13",
+  "fastapi>=0.115",
+  "jinja2>=3.1",
+  "uvicorn>=0.30",
+  "numpy>=2.0",
+  "pandas>=2.2",
+  "scikit-learn>=1.5",
+  "joblib>=1.4",
+  "matplotlib>=3.9",
+]
+
+[project.scripts]
+pm-box-office-amc-worker = "pm_box_office.sources.amc.jobs.worker:main"
+pm-box-office-collect-amc = "pm_box_office.sources.amc.collect:main"
+pm-box-office-polymarket-accounts = "pm_box_office.sources.polymarket.accounts:main"
+pm-box-office-scrape-the-numbers = "pm_box_office.sources.the_numbers.ingest:main"
+pm-box-office-train-amc = "pm_box_office.models.train:main"
+pm-box-office-wikipedia-ingest = "pm_box_office.sources.wikipedia.ingest:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pm_box_office = ["web/templates/*.html", "web/static/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+

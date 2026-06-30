@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
 set -eu
 cd "$(dirname "$0")/.."
-exec .venv/bin/python scripts/ingest/ingest_wikipedia_boxoffice.py "$@"
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}src"
+exec .venv/bin/python -m pm_box_office.sources.wikipedia.ingest "$@"

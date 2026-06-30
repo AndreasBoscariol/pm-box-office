@@ -1,0 +1,2 @@
+"""Wikipedia ingestion package."""
+

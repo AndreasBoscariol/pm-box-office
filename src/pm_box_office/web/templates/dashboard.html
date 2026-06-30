@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AMC Collection</title>
+    <link rel="stylesheet" href="/static/app.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <form class="date-form" method="get" action="/campaigns/{{ date_value }}">
+          <label for="date">Collection date</label>
+          <input
+            id="date"
+            name="date"
+            type="date"
+            value="{{ date_value }}"
+            onchange="if (this.value) window.location.href = '/campaigns/' + this.value"
+          >
+        </form>
+        <div class="actions">
+          <form method="post" action="/campaigns/{{ date_value }}/sync-theatres">
+            <button type="submit">Refresh theatre list</button>
+          </form>
+          <form method="post" action="/campaigns/{{ date_value }}/collect-showtimes">
+            <button type="submit">Collect showtime inventory</button>
+          </form>
+          <form method="post" action="/campaigns/{{ date_value }}/start-seat-collection">
+            <button type="submit">Start seat collection</button>
+          </form>
+          <form method="post" action="/workers/start">
+            <button type="submit">Start worker</button>
+          </form>
+          <form method="post" action="/campaigns/{{ date_value }}/cancel">
+            <button class="danger" type="submit">Cancel queues</button>
+          </form>
+        </div>
+      </header>
+
+      <section class="metrics">
+        <div>
+          <span class="label">Active AMC theatres</span>
+          <strong>{{ active_theatres }}</strong>
+        </div>
+        <div>
+          <span class="label">Last synchronized</span>
+          <strong>{{ last_theatre_sync or "Never" }}</strong>
+        </div>
+        <div>
+          <span class="label">Local worker</span>
+          <strong>{{ worker_status.running_count }}/{{ worker_status.desired_count }}</strong>
+        </div>
+        <div>
+          <span class="label">Queued tasks</span>
+          <strong>{{ queue_health.queued }}</strong>
+        </div>
+        <div>
+          <span class="label">Due now</span>
+          <strong>{{ queue_health.due_now }}</strong>
+        </div>
+        <div>
+          <span class="label">Late tasks</span>
+          <strong>{{ queue_health.late }}</strong>
+        </div>
+        <div>
+          <span class="label">5 min throughput</span>
+          <strong>{{ "%.1f"|format(queue_health.tasks_per_minute) }}/min</strong>
+        </div>
+        <div>
+          <span class="label">Backlog ETA</span>
+          <strong>
+            {% if queue_health.eta_minutes is not none %}
+              {{ "%.0f"|format(queue_health.eta_minutes) }} min
+            {% else %}
+              -
+            {% endif %}
+          </strong>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <h1>Movie Selection</h1>
+          <span>{{ movies|length }} movies</span>
+        </div>
+        <div class="toolbar">
+          <input
+            id="movie-filter"
+            type="search"
+            placeholder="Filter movies"
+            aria-label="Filter movies"
+            oninput="filterMovies(this.value)"
+          >
+          <form method="post" action="/campaigns/{{ date_value }}/movies">
+            <input type="hidden" name="action" value="select_top">
+            <input class="number-input" name="limit" type="number" min="1" value="10" aria-label="Top movie count">
+            <button type="submit">Select top</button>
+          </form>
+          <form method="post" action="/campaigns/{{ date_value }}/movies">
+            <input type="hidden" name="action" value="select_all">
+            <button type="submit">Select all</button>
+          </form>
+          <form method="post" action="/campaigns/{{ date_value }}/movies">
+            <input type="hidden" name="action" value="clear">
+            <button class="danger" type="submit">Clear selected</button>
+          </form>
+        </div>
+        <div class="table">
+          <div class="row head">
+            <span>Track</span>
+            <span>Movie</span>
+            <span>Theatres</span>
+            <span>Showtimes</span>
+          </div>
+          {% for movie in movies %}
+          <form
+            class="row movie-row"
+            method="post"
+            action="/campaigns/{{ date_value }}/movies/{{ movie.amc_movie_id }}"
+            data-movie-name="{{ movie.amc_movie_name|lower }}"
+          >
+            <span>
+              <input
+                type="checkbox"
+                name="selected"
+                value="on"
+                {% if movie.selected %}checked{% endif %}
+                onchange="this.form.submit()"
+              >
+            </span>
+            <span>{{ movie.amc_movie_name }}</span>
+            <span>{{ movie.theatre_count }}</span>
+            <span>{{ movie.showtime_count }}</span>
+          </form>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <h1>Recent Runs</h1>
+        </div>
+        <div class="runs">
+          {% for run in recent_runs %}
+          <div
+            hx-get="/runs/{{ run[0] }}/progress"
+            hx-trigger="load, every 3s"
+            hx-swap="outerHTML">
+          </div>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <h1>Worker Log</h1>
+        </div>
+        <div
+          hx-get="/workers/log"
+          hx-trigger="load, every 5s"
+          hx-swap="innerHTML">
+        </div>
+      </section>
+    </main>
+    <script>
+      function filterMovies(value) {
+        const query = value.trim().toLowerCase();
+        document.querySelectorAll(".movie-row").forEach((row) => {
+          row.hidden = query && !row.dataset.movieName.includes(query);
+        });
+      }
+    </script>
+  </body>
+</html>

@@ -12,7 +12,7 @@ services:
 
   web:
     build: .
-    command: uvicorn web.app:app --host 0.0.0.0 --port 8000
+    command: uvicorn pm_box_office.web.app:app --host 0.0.0.0 --port 8000
     environment:
       DATABASE_URL: postgresql://pm_box_office:pm_box_office@postgres:5432/pm_box_office
     ports:
@@ -22,7 +22,14 @@ services:
 
   worker:
     build: .
-    command: python3 -m scripts.ingest.amc.jobs.worker
+    command:
+      - python3
+      - -m
+      - pm_box_office.sources.amc.jobs.worker
+      - --limit
+      - ${AMC_WORKER_BATCH_LIMIT:-1}
+      - --delay-seconds
+      - ${AMC_WORKER_DELAY_SECONDS:-1.0}
     environment:
       DATABASE_URL: postgresql://pm_box_office:pm_box_office@postgres:5432/pm_box_office
     depends_on:

@@ -6,7 +6,7 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import create_engine, pool
 
-from scripts.db import database_url_from_env
+from pm_box_office.db.connection import database_url_from_env
 
 
 config = context.config

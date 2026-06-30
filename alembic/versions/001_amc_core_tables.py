@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from alembic import op
 
-from scripts.ingest.amc import db
+from pm_box_office.sources.amc import db
 
 
 revision = "001_amc_core_tables"

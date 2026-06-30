@@ -1,6 +1,9 @@
 # PostgreSQL Setup
 
-The ingest scripts are PostgreSQL-only. They read the database URL from:
+Postgres is the system of record for The Numbers actuals, Wikipedia features,
+AMC collection state, and model training datasets.
+
+DB-backed commands read the database URL in this order:
 
 1. `--database-url`
 2. `DATABASE_URL`
@@ -15,24 +18,46 @@ createdb pm_box_office
 cp .env.example .env
 ```
 
-Then edit `.env` if your local database URL differs:
+Then edit `.env` if needed:
 
 ```sh
 DATABASE_URL=postgresql://localhost/pm_box_office
 ```
 
-Run a smoke test:
+Install the project:
 
 ```sh
-scripts/run_scrape_the_numbers.sh --dry-run
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -e .
 ```
 
-The Wikipedia ingest uses the same database and should run after The Numbers
-has populated the base `movies`, `release_runs`, and `daily_box_office` tables:
+Smoke-test commands that do not mutate Postgres:
 
 ```sh
-scripts/run_ingest_wikipedia_boxoffice.sh --dry-run
+.venv/bin/python -m pm_box_office.sources.the_numbers.ingest --dry-run
+.venv/bin/python -m pm_box_office.sources.wikipedia.ingest --dry-run
+.venv/bin/python -m pm_box_office.sources.amc.collect --help
+.venv/bin/python -m pm_box_office.sources.amc.jobs.worker --help
 ```
 
-The repo uses a local `.venv` for Python dependencies because Homebrew Python is
-externally managed. VS Code is configured to use `.venv/bin/python`.
+Commands that write to Postgres include:
+
+```sh
+.venv/bin/python -m pm_box_office.sources.the_numbers.ingest
+.venv/bin/python -m pm_box_office.sources.wikipedia.ingest
+.venv/bin/python -m pm_box_office.sources.amc.collect init-db
+.venv/bin/python -m pm_box_office.sources.amc.collect ingest-theatres
+.venv/bin/python -m pm_box_office.sources.amc.jobs.worker
+.venv/bin/python -m pm_box_office.models.train
+```
+
+The Polymarket account scanner currently writes file outputs only:
+
+```sh
+.venv/bin/python -m pm_box_office.sources.polymarket.accounts
+```
+
+Legacy Python modules under `scripts/` and root `web.app` have been removed.
+Use `pm_box_office.*` package entrypoints or the console scripts from
+`pyproject.toml`.
+

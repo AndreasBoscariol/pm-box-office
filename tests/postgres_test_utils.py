@@ -5,7 +5,7 @@ import unittest
 import uuid
 from typing import Any
 
-from scripts.db import connect_database, database_url_from_env
+from pm_box_office.db.connection import connect_database, database_url_from_env
 
 
 def quote_ident(value: str) -> str:
