@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import unittest
 
 from pm_box_office.sources.amc import collect
 from pm_box_office.sources.amc import db
+from pm_box_office.sources.amc.client import FetchResult
 from pm_box_office.sources.amc.parsers import SeatFill, ShowtimeRecord
+from pm_box_office.sources.amc.parsers import showtimes_url
 from pm_box_office.sources.amc.sampling import stratified_sample
 from pm_box_office.sources.amc.scheduler import DEFAULT_OFFSETS_MINUTES, scheduled_snapshots
 from pm_box_office.sources.amc.services import movie_service, showtime_service
@@ -36,6 +39,47 @@ SITEMAP_XML = """
   </url>
 </urlset>
 """
+
+
+def apollo_html(payload: dict[str, object]) -> str:
+    return (
+        "<html><body>"
+        f"<script id=\"apollo-data\" type=\"application/json\">{json.dumps(payload)}</script>"
+        "</body></html>"
+    )
+
+
+def showtime_payload(*, showtime_id: str, movie_id: str, movie_name: str, when: str) -> dict[str, object]:
+    return {
+        f"Movie:{movie_id}": {
+            "__typename": "Movie",
+            "id": movie_id,
+            "name": movie_name,
+        },
+        f"Showtime:{showtime_id}": {
+            "__typename": "Showtime",
+            "showtimeId": showtime_id,
+            "when": when,
+            "movie": {"__ref": f"Movie:{movie_id}"},
+        },
+    }
+
+
+class FakeShowtimeFetcher:
+    def __init__(self, pages: dict[str, str]) -> None:
+        self.pages = pages
+        self.urls: list[str] = []
+
+    def get_result(self, url: str) -> FetchResult:
+        self.urls.append(url)
+        return FetchResult(
+            body=self.pages[url],
+            source_url=url,
+            fetched_at=dt.datetime(2026, 7, 1, 12, 0, tzinfo=dt.timezone.utc),
+            cache_path=None,
+            from_cache=False,
+            status_code=200,
+        )
 
 
 class AmcPipelineUnitTests(unittest.TestCase):
@@ -380,6 +424,70 @@ class AmcPipelinePostgresTests(unittest.TestCase):
         self.assertEqual(inventory_tasks_1, inventory_tasks_2)
         self.assertEqual(seat_run_1, seat_run_2)
         self.assertEqual(seat_tasks_1, seat_tasks_2)
+
+    def test_collect_theatre_showtimes_uses_embedded_dates_to_cover_window(self) -> None:
+        theatre = parse_theatre_sitemap(SITEMAP_XML)[0]
+        db.upsert_theatres(self.conn, [theatre])
+        stored_theatre = db.select_active_theatres_basic(self.conn)[0]
+        start_date = dt.date(2026, 7, 1)
+        first_page_payload = (
+            showtime_payload(
+                showtime_id="100",
+                movie_id="movie-1",
+                movie_name="Sample One",
+                when="2026-07-01T19:00:00-04:00",
+            )
+            | showtime_payload(
+                showtime_id="101",
+                movie_id="movie-2",
+                movie_name="Sample Two",
+                when="2026-07-02T18:00:00-04:00",
+            )
+        )
+        third_page_payload = showtime_payload(
+            showtime_id="102",
+            movie_id="movie-3",
+            movie_name="Sample Three",
+            when="2026-07-03T20:00:00-04:00",
+        )
+        fetcher = FakeShowtimeFetcher(
+            {
+                showtimes_url(start_date, stored_theatre.slug): apollo_html(first_page_payload),
+                showtimes_url(start_date + dt.timedelta(days=2), stored_theatre.slug): apollo_html(third_page_payload),
+            }
+        )
+
+        count = showtime_service.collect_theatre_showtimes(
+            self.conn,
+            fetcher,  # type: ignore[arg-type]
+            theatre=stored_theatre,
+            exhibition_date=start_date,
+            inventory_days=3,
+        )
+
+        self.assertEqual(3, count)
+        self.assertEqual(
+            [
+                showtimes_url(start_date, stored_theatre.slug),
+                showtimes_url(start_date + dt.timedelta(days=2), stored_theatre.slug),
+            ],
+            fetcher.urls,
+        )
+        rows = self.conn.execute(
+            """
+            SELECT showtime_id, exhibition_date
+            FROM amc_showtimes
+            ORDER BY showtime_id
+            """
+        ).fetchall()
+        self.assertEqual(
+            [
+                ("100", start_date),
+                ("101", start_date + dt.timedelta(days=1)),
+                ("102", start_date + dt.timedelta(days=2)),
+            ],
+            [(str(row[0]), row[1]) for row in rows],
+        )
 
     def test_campaign_queue_health_counts_due_and_late_tasks(self) -> None:
         campaign_id = db.ensure_campaign(self.conn, dt.date(2026, 7, 1))

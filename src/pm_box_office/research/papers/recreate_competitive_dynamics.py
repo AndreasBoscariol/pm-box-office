@@ -16,6 +16,7 @@ import argparse
 import csv
 import datetime as dt
 import math
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,9 +26,12 @@ from pm_box_office.db.connection import connect_database, database_url_from_env,
 
 
 DEFAULT_OUT_DIR = Path("results/papers/competitive_dynamics")
+DEFAULT_ANALYSIS_START = dt.date(2022, 1, 1)
 DEFAULT_GAP_THRESHOLD_DAYS = 14
 DEFAULT_MIN_POSITIVE_WEEKS = 4
 DEFAULT_WIDE_THEATER_THRESHOLD = 600
+THEORY_SEASON_WEEKS = 10.0
+THEORY_GRID_STEP = 0.1
 
 
 @dataclass(frozen=True)
@@ -101,6 +105,9 @@ class LifecycleEstimate:
     chart_coverage_days: int
     delay_weeks: float
     is_wide: bool
+    season_label: str | None = None
+    season_start: dt.date | None = None
+    season_delay_weeks: float | None = None
 
 
 def parse_date(value: str) -> dt.date:
@@ -109,6 +116,25 @@ def parse_date(value: str) -> dt.date:
 
 def date_or_none(value: str | None) -> dt.date | None:
     return parse_date(value) if value else None
+
+
+def season_for_opening_date(opening_date: dt.date) -> tuple[str, dt.date] | None:
+    summer_start = dt.date(opening_date.year, 5, 25)
+    summer_end = dt.date(opening_date.year, 9, 5)
+    if summer_start <= opening_date <= summer_end:
+        return f"summer_{opening_date.year}", summer_start
+
+    holiday_start = dt.date(opening_date.year, 11, 1)
+    holiday_end = dt.date(opening_date.year + 1, 1, 5)
+    if holiday_start <= opening_date <= holiday_end:
+        return f"holiday_{opening_date.year}", holiday_start
+
+    previous_holiday_start = dt.date(opening_date.year - 1, 11, 1)
+    previous_holiday_end = dt.date(opening_date.year, 1, 5)
+    if previous_holiday_start <= opening_date <= previous_holiday_end:
+        return f"holiday_{opening_date.year - 1}", previous_holiday_start
+
+    return None
 
 
 def mean(values: Iterable[float]) -> float:
@@ -173,25 +199,15 @@ def validate_database(conn: Any) -> None:
 def default_analysis_window(conn: Any) -> tuple[dt.date, dt.date]:
     row = conn.execute(
         """
-        SELECT substr(chart_date, 1, 7) AS month,
-               MIN(chart_date) AS start_date,
-               MAX(chart_date) AS end_date,
-               COUNT(DISTINCT chart_date) AS chart_dates
-        FROM daily_chart_pages
-        GROUP BY month
-        HAVING COUNT(DISTINCT chart_date) >= 28
-        ORDER BY month DESC
-        LIMIT 1
+        SELECT GREATEST(
+            COALESCE((SELECT MAX(box_office_date) FROM daily_box_office), '0001-01-01'),
+            COALESCE((SELECT MAX(chart_date) FROM daily_chart_pages), '0001-01-01')
+        )
         """
     ).fetchone()
-    if row:
-        return parse_date(row[1]), parse_date(row[2])
-    row = conn.execute(
-        "SELECT MIN(box_office_date), MAX(box_office_date) FROM daily_box_office"
-    ).fetchone()
-    if not row or not row[0] or not row[1]:
+    if not row or not row[0] or str(row[0]) == "0001-01-01":
         raise SystemExit("Database has no usable box-office dates.")
-    return parse_date(row[0]), parse_date(row[1])
+    return DEFAULT_ANALYSIS_START, parse_date(str(row[0]))
 
 
 def load_daily_rows(conn: Any) -> list[DailyRow]:
@@ -261,6 +277,19 @@ def split_release_episodes(
         if current:
             episodes.append(make_episode(release_run_id, episode_index, current))
     return episodes
+
+
+def filter_release_episodes(
+    episodes: list[ReleaseEpisode],
+    *,
+    analysis_start: dt.date,
+    analysis_end: dt.date,
+) -> list[ReleaseEpisode]:
+    return [
+        episode
+        for episode in episodes
+        if analysis_start <= episode.opening_date <= analysis_end
+    ]
 
 
 def make_episode(release_run_id: int, episode_index: int, rows: list[DailyRow]) -> ReleaseEpisode:
@@ -429,6 +458,15 @@ def opening_share_for_episode(
     return share, attraction, coverage_days
 
 
+def opening_weekend_gross_usd(episode: ReleaseEpisode) -> int:
+    opening = episode.opening_date
+    return sum(
+        row.gross_usd
+        for row in episode.rows
+        if 0 <= (row.box_office_date - opening).days <= 2
+    )
+
+
 def estimate_lifecycles(
     episodes: list[ReleaseEpisode],
     conn: Any,
@@ -453,6 +491,9 @@ def estimate_lifecycles(
             chart_totals,
             chart_movie_gross,
         )
+        season = season_for_opening_date(episode.opening_date)
+        season_label = season[0] if season else None
+        season_start = season[1] if season else None
         estimates.append(
             LifecycleEstimate(
                 episode=episode,
@@ -466,6 +507,11 @@ def estimate_lifecycles(
                 chart_coverage_days=coverage_days,
                 delay_weeks=(episode.opening_date - analysis_start).days / 7.0,
                 is_wide=episode.max_theaters >= wide_theater_threshold,
+                season_label=season_label,
+                season_start=season_start,
+                season_delay_weeks=(episode.opening_date - season_start).days / 7.0
+                if season_start
+                else None,
             )
         )
     return estimates, weekly_by_episode
@@ -477,11 +523,21 @@ def regression_rows(estimates: list[LifecycleEstimate], analysis_start: dt.date,
         for estimate in estimates
         if estimate.is_wide
         and estimate.half_life_weeks is not None
+        and estimate.season_delay_weeks is not None
         and analysis_start <= estimate.episode.opening_date <= analysis_end
     ]
     outputs: list[dict[str, object]] = []
 
     specs = [
+        (
+            "delay_on_opening_weekend_gross_millions_and_half_life",
+            [
+                ("intercept", lambda e: 1.0),
+                ("opening_weekend_gross_millions", lambda e: opening_weekend_gross_usd(e.episode) / 1_000_000.0),
+                ("half_life_weeks", lambda e: float(e.half_life_weeks)),
+            ],
+            timing_sample,
+        ),
         (
             "delay_on_opening_gross_millions_and_half_life",
             [
@@ -518,7 +574,7 @@ def regression_rows(estimates: list[LifecycleEstimate], analysis_start: dt.date,
             )
             continue
         x = [[fn(estimate) for _, fn in terms] for estimate in sample]
-        y = [estimate.delay_weeks for estimate in sample]
+        y = [float(estimate.season_delay_weeks) for estimate in sample]
         beta, se, r2, f_stat = ols(x, y)
         for (term, _), estimate, term_se in zip(terms, beta, se):
             outputs.append(
@@ -546,6 +602,7 @@ def model_vs_observed_rows(
         for estimate in estimates
         if estimate.is_wide
         and estimate.half_life_weeks is not None
+        and estimate.season_delay_weeks is not None
         and analysis_start <= estimate.episode.opening_date <= analysis_end
     ]
     if len(sample) < 2:
@@ -566,23 +623,28 @@ def model_vs_observed_rows(
     rows = []
     for i, left in enumerate(sample):
         for right in sample[i + 1 :]:
-            if left.episode.opening_date == right.episode.opening_date:
+            if left.season_label != right.season_label:
+                continue
+            if left.season_delay_weeks == right.season_delay_weeks:
                 continue
             left_strength = strength[left.episode.episode_id]
             right_strength = strength[right.episode.episode_id]
             if abs(left_strength - right_strength) < 1e-9:
                 continue
             predicted = left if left_strength > right_strength else right
-            observed = left if left.episode.opening_date < right.episode.opening_date else right
+            observed = left if float(left.season_delay_weeks) < float(right.season_delay_weeks) else right
             rows.append(
                 {
+                    "season_label": left.season_label,
                     "left_episode_id": left.episode.episode_id,
                     "left_title": left.episode.title,
                     "left_opening_date": left.episode.opening_date.isoformat(),
+                    "left_season_delay_weeks": left.season_delay_weeks,
                     "left_strength_score": left_strength,
                     "right_episode_id": right.episode.episode_id,
                     "right_title": right.episode.title,
                     "right_opening_date": right.episode.opening_date.isoformat(),
+                    "right_season_delay_weeks": right.season_delay_weeks,
                     "right_strength_score": right_strength,
                     "predicted_first_episode_id": predicted.episode.episode_id,
                     "observed_first_episode_id": observed.episode.episode_id,
@@ -664,7 +726,11 @@ def lifecycle_rows(estimates: list[LifecycleEstimate]) -> list[dict[str, object]
                 "release_year": episode.release_year,
                 "opening_date": episode.opening_date.isoformat(),
                 "delay_weeks": estimate.delay_weeks,
+                "season_label": estimate.season_label,
+                "season_start": estimate.season_start.isoformat() if estimate.season_start else None,
+                "season_delay_weeks": estimate.season_delay_weeks,
                 "positive_weeks": estimate.positive_weeks,
+                "opening_weekend_gross_usd": opening_weekend_gross_usd(episode),
                 "opening_7_day_gross_usd": estimate.opening_7_day_gross_usd,
                 "max_theaters": episode.max_theaters,
                 "decay_beta": estimate.decay_beta,
@@ -695,6 +761,457 @@ def opening_share_rows(estimates: list[LifecycleEstimate]) -> list[dict[str, obj
     ]
 
 
+def regression_model_rows(
+    rows: list[dict[str, object]],
+    model: str,
+) -> list[dict[str, object]]:
+    return [row for row in rows if row["model"] == model]
+
+
+def regression_value(
+    rows: list[dict[str, object]],
+    *,
+    model: str,
+    term: str,
+    field: str,
+) -> object | None:
+    for row in rows:
+        if row["model"] == model and row["term"] == term:
+            return row[field]
+    return None
+
+
+def paper_vs_database_summary_rows(
+    estimates: list[LifecycleEstimate],
+    regression: list[dict[str, object]],
+    model_rows: list[dict[str, object]],
+    analysis_start: dt.date,
+    analysis_end: dt.date,
+) -> list[dict[str, object]]:
+    timing_sample = [
+        estimate
+        for estimate in estimates
+        if estimate.is_wide
+        and estimate.half_life_weeks is not None
+        and estimate.season_delay_weeks is not None
+        and analysis_start <= estimate.episode.opening_date <= analysis_end
+    ]
+    opening_model = "delay_on_opening_weekend_gross_millions_and_half_life"
+    share_model = "delay_on_opening_share_and_half_life"
+    accuracy = None
+    if model_rows:
+        accuracy = sum(int(row["prediction_correct"]) for row in model_rows) / len(model_rows)
+    rows = [
+        {
+            "result": "sample",
+            "paper_1990_reported": "24 major summer movies, delay from May 25",
+            "database_2022_plus": (
+                f"{len(timing_sample)} wide 2022+ summer/holiday release episodes, "
+                "delay normalized within season"
+            ),
+        },
+        {
+            "result": "opening_gross_t_stat",
+            "paper_1990_reported": "-3.6, p < .005",
+            "database_2022_plus": regression_value(
+                regression,
+                model=opening_model,
+                term="opening_weekend_gross_millions",
+                field="t_stat",
+            ),
+        },
+        {
+            "result": "half_life_t_stat_in_opening_gross_model",
+            "paper_1990_reported": "-.47, p > .5",
+            "database_2022_plus": regression_value(
+                regression,
+                model=opening_model,
+                term="half_life_weeks",
+                field="t_stat",
+            ),
+        },
+        {
+            "result": "opening_gross_model_f_stat",
+            "paper_1990_reported": "7.1, p < .005",
+            "database_2022_plus": regression_value(
+                regression,
+                model=opening_model,
+                term="intercept",
+                field="f_stat",
+            ),
+        },
+        {
+            "result": "opening_share_model_f_stat",
+            "paper_1990_reported": "5.6, p < .02",
+            "database_2022_plus": regression_value(
+                regression,
+                model=share_model,
+                term="intercept",
+                field="f_stat",
+            ),
+        },
+        {
+            "result": "pairwise_stronger_opens_earlier_accuracy",
+            "paper_1990_reported": "not reported as pairwise accuracy",
+            "database_2022_plus": accuracy,
+        },
+    ]
+    return rows
+
+
+@dataclass(frozen=True)
+class TheoryMovie:
+    opening_attraction: float
+    half_life_weeks: float
+
+    @property
+    def decay_beta(self) -> float:
+        return math.log(2.0) / self.half_life_weeks
+
+
+@dataclass(frozen=True)
+class DuopolyEquilibrium:
+    movie1_opening_week: float
+    movie2_opening_week: float
+    classification: str
+
+
+def theory_attraction(movie: TheoryMovie, t: float, opening_week: float) -> float:
+    if t < opening_week:
+        return 0.0
+    return movie.opening_attraction * math.exp(-movie.decay_beta * (t - opening_week))
+
+
+def duopoly_revenue(
+    player: int,
+    movie1: TheoryMovie,
+    movie2: TheoryMovie,
+    *,
+    movie1_opening_week: float,
+    movie2_opening_week: float,
+    season_weeks: float = THEORY_SEASON_WEEKS,
+    integration_steps: int = 160,
+) -> float:
+    start = movie1_opening_week if player == 1 else movie2_opening_week
+    if start >= season_weeks:
+        return 0.0
+    dt_step = (season_weeks - start) / integration_steps
+    total = 0.0
+    for index in range(integration_steps):
+        t = start + (index + 0.5) * dt_step
+        a1 = theory_attraction(movie1, t, movie1_opening_week)
+        a2 = theory_attraction(movie2, t, movie2_opening_week)
+        denominator = 1.0 + a1 + a2
+        attraction = a1 if player == 1 else a2
+        total += attraction / denominator * dt_step
+    return total
+
+
+def candidate_opening_weeks(
+    season_weeks: float = THEORY_SEASON_WEEKS,
+    step: float = THEORY_GRID_STEP,
+) -> list[float]:
+    count = int(round(season_weeks / step))
+    return [round(index * step, 10) for index in range(count + 1)]
+
+
+def best_response_opening_week(
+    player: int,
+    movie1: TheoryMovie,
+    movie2: TheoryMovie,
+    *,
+    other_opening_week: float,
+    season_weeks: float = THEORY_SEASON_WEEKS,
+    step: float = THEORY_GRID_STEP,
+) -> float:
+    best_week = 0.0
+    best_revenue = -1.0
+    for week in candidate_opening_weeks(season_weeks, step):
+        revenue = duopoly_revenue(
+            player,
+            movie1,
+            movie2,
+            movie1_opening_week=week if player == 1 else other_opening_week,
+            movie2_opening_week=other_opening_week if player == 1 else week,
+            season_weeks=season_weeks,
+        )
+        if revenue > best_revenue + 1e-10:
+            best_week = week
+            best_revenue = revenue
+    return best_week
+
+
+def is_best_response(
+    player: int,
+    movie1: TheoryMovie,
+    movie2: TheoryMovie,
+    *,
+    own_opening_week: float,
+    other_opening_week: float,
+    season_weeks: float = THEORY_SEASON_WEEKS,
+    step: float = THEORY_GRID_STEP,
+    tolerance: float = 1e-6,
+) -> bool:
+    actual = duopoly_revenue(
+        player,
+        movie1,
+        movie2,
+        movie1_opening_week=own_opening_week if player == 1 else other_opening_week,
+        movie2_opening_week=other_opening_week if player == 1 else own_opening_week,
+        season_weeks=season_weeks,
+    )
+    best_week = best_response_opening_week(
+        player,
+        movie1,
+        movie2,
+        other_opening_week=other_opening_week,
+        season_weeks=season_weeks,
+        step=step,
+    )
+    best = duopoly_revenue(
+        player,
+        movie1,
+        movie2,
+        movie1_opening_week=best_week if player == 1 else other_opening_week,
+        movie2_opening_week=other_opening_week if player == 1 else best_week,
+        season_weeks=season_weeks,
+    )
+    return actual >= best - tolerance
+
+
+def classify_duopoly_equilibria(equilibria: list[tuple[float, float]]) -> str:
+    if not equilibria:
+        return "no_equilibrium_found"
+    if len(equilibria) > 1:
+        return "dual_equilibria"
+    t1, t2 = equilibria[0]
+    if abs(t1) < 1e-9 and abs(t2) < 1e-9:
+        return "simultaneous_beginning"
+    if abs(t1) < 1e-9 and t2 > 0:
+        return "movie2_delays"
+    if t1 > 0 and abs(t2) < 1e-9:
+        return "movie1_delays"
+    return "other"
+
+
+def solve_duopoly_equilibria(
+    movie1: TheoryMovie,
+    movie2: TheoryMovie,
+    *,
+    season_weeks: float = THEORY_SEASON_WEEKS,
+    step: float = THEORY_GRID_STEP,
+) -> list[DuopolyEquilibrium]:
+    candidates: list[tuple[float, float]] = []
+    movie2_delay = best_response_opening_week(
+        2,
+        movie1,
+        movie2,
+        other_opening_week=0.0,
+        season_weeks=season_weeks,
+        step=step,
+    )
+    if is_best_response(
+        1,
+        movie1,
+        movie2,
+        own_opening_week=0.0,
+        other_opening_week=movie2_delay,
+        season_weeks=season_weeks,
+        step=step,
+    ):
+        candidates.append((0.0, movie2_delay))
+
+    movie1_delay = best_response_opening_week(
+        1,
+        movie1,
+        movie2,
+        other_opening_week=0.0,
+        season_weeks=season_weeks,
+        step=step,
+    )
+    if is_best_response(
+        2,
+        movie1,
+        movie2,
+        own_opening_week=0.0,
+        other_opening_week=movie1_delay,
+        season_weeks=season_weeks,
+        step=step,
+    ):
+        candidates.append((movie1_delay, 0.0))
+
+    deduped: list[tuple[float, float]] = []
+    for candidate in candidates:
+        if candidate not in deduped:
+            deduped.append(candidate)
+    classification = classify_duopoly_equilibria(deduped)
+    return [
+        DuopolyEquilibrium(
+            movie1_opening_week=movie1_week,
+            movie2_opening_week=movie2_week,
+            classification=classification,
+        )
+        for movie1_week, movie2_week in deduped
+    ]
+
+
+def primary_duopoly_equilibrium(
+    movie1: TheoryMovie,
+    movie2: TheoryMovie,
+    *,
+    season_weeks: float = THEORY_SEASON_WEEKS,
+    step: float = THEORY_GRID_STEP,
+) -> DuopolyEquilibrium:
+    equilibria = solve_duopoly_equilibria(movie1, movie2, season_weeks=season_weeks, step=step)
+    if equilibria:
+        return equilibria[0]
+    return DuopolyEquilibrium(0.0, 0.0, "no_equilibrium_found")
+
+
+def figure4_theory_rows() -> list[dict[str, object]]:
+    rows = []
+    movie2 = TheoryMovie(0.5, 3.4)
+    for index in range(5, 101, 5):
+        attraction = index / 100.0
+        movie1 = TheoryMovie(attraction, 3.4)
+        equilibria = solve_duopoly_equilibria(movie1, movie2)
+        if not equilibria:
+            rows.append(
+                {
+                    "movie1_opening_attraction": attraction,
+                    "movie1_equilibrium_week": None,
+                    "movie2_equilibrium_week": None,
+                    "classification": "no_equilibrium_found",
+                }
+            )
+            continue
+        for equilibrium in equilibria:
+            rows.append(
+                {
+                    "movie1_opening_attraction": attraction,
+                    "movie1_equilibrium_week": equilibrium.movie1_opening_week,
+                    "movie2_equilibrium_week": equilibrium.movie2_opening_week,
+                    "classification": equilibrium.classification,
+                }
+            )
+    return rows
+
+
+def figure5_theory_rows() -> list[dict[str, object]]:
+    rows = []
+    for half_life_index in range(10, 51, 2):
+        half_life = half_life_index / 10.0
+        for attraction_index in range(5, 101, 5):
+            movie2_attraction = attraction_index / 100.0
+            equilibrium = primary_duopoly_equilibrium(
+                TheoryMovie(0.5, half_life),
+                TheoryMovie(movie2_attraction, half_life),
+            )
+            rows.append(
+                {
+                    "half_life_weeks": half_life,
+                    "movie2_opening_attraction": movie2_attraction,
+                    "classification": equilibrium.classification,
+                }
+            )
+    return rows
+
+
+def figure8_theory_rows() -> list[dict[str, object]]:
+    rows = []
+    movie1 = TheoryMovie(0.5, 3.0)
+    for half_life_index in range(10, 51, 2):
+        half_life = half_life_index / 10.0
+        for attraction_index in range(5, 101, 5):
+            movie2_attraction = attraction_index / 100.0
+            equilibrium = primary_duopoly_equilibrium(
+                movie1,
+                TheoryMovie(movie2_attraction, half_life),
+            )
+            rows.append(
+                {
+                    "movie2_half_life_weeks": half_life,
+                    "movie2_opening_attraction": movie2_attraction,
+                    "classification": equilibrium.classification,
+                }
+            )
+    return rows
+
+
+def paper_parameter_equilibrium_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    examples = [
+        ("figure_6_small_large", TheoryMovie(0.13, 1.0), TheoryMovie(1.0, 1.0)),
+        ("figure_7_small_large", TheoryMovie(0.67, 1.0), TheoryMovie(1.0, 1.0)),
+        ("long_legs_identical", TheoryMovie(0.5, 4.0), TheoryMovie(0.5, 4.0)),
+    ]
+    for label, movie1, movie2 in examples:
+        equilibria = solve_duopoly_equilibria(movie1, movie2)
+        if not equilibria:
+            rows.append(
+                {
+                    "scenario": label,
+                    "movie": "duopoly",
+                    "opening_attraction": None,
+                    "half_life_weeks": None,
+                    "recreated_equilibrium_opening_week": None,
+                    "paper_reported_opening_week": None,
+                    "classification": "no_equilibrium_found",
+                }
+            )
+        for equilibrium in equilibria:
+            rows.extend(
+                [
+                    {
+                        "scenario": label,
+                        "movie": "movie1",
+                        "opening_attraction": movie1.opening_attraction,
+                        "half_life_weeks": movie1.half_life_weeks,
+                        "recreated_equilibrium_opening_week": equilibrium.movie1_opening_week,
+                        "paper_reported_opening_week": None,
+                        "classification": equilibrium.classification,
+                    },
+                    {
+                        "scenario": label,
+                        "movie": "movie2",
+                        "opening_attraction": movie2.opening_attraction,
+                        "half_life_weeks": movie2.half_life_weeks,
+                        "recreated_equilibrium_opening_week": equilibrium.movie2_opening_week,
+                        "paper_reported_opening_week": None,
+                        "classification": equilibrium.classification,
+                    },
+                ]
+            )
+
+    table1_rows = [
+        ("table1_group1_equal_short_half_lives", 0.7, 2.0, 0.0),
+        ("table1_group1_equal_short_half_lives", 0.5, 2.0, 1.7),
+        ("table1_group1_equal_short_half_lives", 0.3, 2.0, 3.7),
+        ("table1_group2_different_half_lives", 0.5, 3.0, 0.0),
+        ("table1_group2_different_half_lives", 0.5, 2.0, 1.2),
+        ("table1_group2_different_half_lives", 0.5, 1.0, 5.4),
+        ("table1_group3_long_half_lives", 0.5, 4.0, 0.0),
+        ("table1_group3_long_half_lives", 0.5, 3.5, 0.0),
+        ("table1_group3_long_half_lives", 0.5, 3.0, 0.9),
+        ("table1_group4_equal_long_half_lives", 0.5, 4.0, 0.0),
+        ("table1_group4_equal_long_half_lives", 0.5, 4.0, 0.0),
+        ("table1_group4_equal_long_half_lives", 0.5, 4.0, 0.0),
+    ]
+    for index, (scenario, attraction, half_life, opening_week) in enumerate(table1_rows, start=1):
+        rows.append(
+            {
+                "scenario": scenario,
+                "movie": f"movie{index}",
+                "opening_attraction": attraction,
+                "half_life_weeks": half_life,
+                "recreated_equilibrium_opening_week": None,
+                "paper_reported_opening_week": opening_week,
+                "classification": "paper_reported_three_firm_table",
+            }
+        )
+    return rows
+
+
 def summary_metrics(
     db_path: Path,
     analysis_start: dt.date,
@@ -708,7 +1225,9 @@ def summary_metrics(
     timing = [
         estimate
         for estimate in lifecycle
-        if estimate.is_wide and analysis_start <= estimate.episode.opening_date <= analysis_end
+        if estimate.is_wide
+        and estimate.season_delay_weeks is not None
+        and analysis_start <= estimate.episode.opening_date <= analysis_end
     ]
     shares = [float(estimate.opening_share) for estimate in estimates if estimate.opening_share is not None]
     accuracy = None
@@ -729,7 +1248,12 @@ def summary_metrics(
         ("model_pairwise_accuracy", accuracy),
     ]
     for row in regression:
-        if row["term"] in {"opening_7_day_gross_millions", "opening_share", "half_life_weeks"}:
+        if row["term"] in {
+            "opening_weekend_gross_millions",
+            "opening_7_day_gross_millions",
+            "opening_share",
+            "half_life_weeks",
+        }:
             metrics.append((f'{row["model"]}_{row["term"]}_t_stat', row["t_stat"]))
     return [{"metric": metric, "value": value} for metric, value in metrics]
 
@@ -846,6 +1370,7 @@ def write_timing_regression_svg(path: Path, estimates: list[LifecycleEstimate], 
         for estimate in estimates
         if estimate.is_wide
         and estimate.half_life_weeks is not None
+        and estimate.season_delay_weeks is not None
         and analysis_start <= estimate.episode.opening_date <= analysis_end
     ]
     if len(sample) < 2:
@@ -854,7 +1379,7 @@ def write_timing_regression_svg(path: Path, estimates: list[LifecycleEstimate], 
     width, height = 860, 500
     left, right, top, bottom = 85, 40, 70, 370
     xs = [estimate.opening_7_day_gross_usd / 1_000_000.0 for estimate in sample]
-    ys = [estimate.delay_weeks for estimate in sample]
+    ys = [float(estimate.season_delay_weeks) for estimate in sample]
     x_min, x_max = min(xs), max(xs)
     y_min, y_max = min(ys), max(ys)
     if x_min == x_max:
@@ -882,7 +1407,7 @@ def write_timing_regression_svg(path: Path, estimates: list[LifecycleEstimate], 
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
         '<text x="36" y="34" font-family="Arial" font-size="20" font-weight="700">Timing versus opening strength</text>',
-        '<text x="36" y="58" font-family="Arial" font-size="13" fill="#555">Wide releases in the selected chart window; fitted line is bivariate for display</text>',
+        '<text x="36" y="58" font-family="Arial" font-size="13" fill="#555">Wide summer/holiday releases; y-axis is delay within each season</text>',
         f'<line x1="{left}" y1="{bottom}" x2="{width - right}" y2="{bottom}" stroke="#333"/>',
         f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" stroke="#333"/>',
         f'<line x1="{sx(line[0][0]):.1f}" y1="{sy(line[0][1]):.1f}" x2="{sx(line[1][0]):.1f}" y2="{sy(line[1][1]):.1f}" stroke="#4c78a8" stroke-width="2"/>',
@@ -894,7 +1419,7 @@ def write_timing_regression_svg(path: Path, estimates: list[LifecycleEstimate], 
     parts.extend(
         [
             '<text x="430" y="425" font-family="Arial" font-size="13" text-anchor="middle">opening 7-day gross, USD millions</text>',
-            '<text x="26" y="220" font-family="Arial" font-size="13" transform="rotate(-90 26 220)" text-anchor="middle">delay from analysis start, weeks</text>',
+            '<text x="26" y="220" font-family="Arial" font-size="13" transform="rotate(-90 26 220)" text-anchor="middle">season-relative delay, weeks</text>',
             "</svg>",
         ]
     )
@@ -928,6 +1453,140 @@ def write_model_vs_observed_svg(path: Path, rows: list[dict[str, object]]) -> No
         parts.append(f'<text x="{x + 55}" y="{bottom + 24}" font-family="Arial" font-size="13" text-anchor="middle">{label}</text>')
     accuracy = correct / len(rows)
     parts.append(f'<text x="36" y="380" font-family="Arial" font-size="13">Pairwise accuracy: {accuracy:.1%} across {len(rows)} comparisons.</text>')
+    parts.append("</svg>")
+    path.write_text("\n".join(parts), encoding="utf-8")
+
+
+def classification_color(classification: str) -> str:
+    colors = {
+        "simultaneous_beginning": "#54a24b",
+        "movie1_delays": "#e45756",
+        "movie2_delays": "#4c78a8",
+        "dual_equilibria": "#f58518",
+        "no_equilibrium_found": "#bab0ac",
+        "other": "#b279a2",
+    }
+    return colors.get(classification, "#bab0ac")
+
+
+def write_figure4_theory_svg(path: Path, rows: list[dict[str, object]]) -> None:
+    if not rows:
+        write_placeholder_svg(path, "Figure 4 recreation", "No theory rows were available.")
+        return
+    width, height = 860, 500
+    left, right, top, bottom = 80, 45, 70, 370
+    x_values = [float(row["movie1_opening_attraction"]) for row in rows]
+    y_values = [
+        float(value)
+        for row in rows
+        for value in (row["movie1_equilibrium_week"], row["movie2_equilibrium_week"])
+        if value is not None
+    ]
+    x_min, x_max = min(x_values), max(x_values)
+    y_min, y_max = 0.0, max(4.0, max(y_values) if y_values else 1.0)
+
+    def sx(value: float) -> float:
+        return left + (value - x_min) / (x_max - x_min) * (width - left - right)
+
+    def sy(value: float) -> float:
+        return bottom - (value - y_min) / (y_max - y_min) * (bottom - top)
+
+    movie1_points = []
+    movie2_points = []
+    for row in rows:
+        attraction = float(row["movie1_opening_attraction"])
+        if row["movie1_equilibrium_week"] is not None:
+            movie1_points.append((attraction, float(row["movie1_equilibrium_week"])))
+        if row["movie2_equilibrium_week"] is not None:
+            movie2_points.append((attraction, float(row["movie2_equilibrium_week"])))
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="36" y="34" font-family="Arial" font-size="20" font-weight="700">Figure 4 recreation</text>',
+        '<text x="36" y="58" font-family="Arial" font-size="13" fill="#555">Equilibrium release timing versus Movie 1 opening attraction; Movie 2 fixed at .5, half-lives 3.4 weeks</text>',
+        f'<line x1="{left}" y1="{bottom}" x2="{width - right}" y2="{bottom}" stroke="#333"/>',
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" stroke="#333"/>',
+    ]
+    for points, color, label_y, label in [
+        (movie1_points, "#e45756", 96, "Movie 1"),
+        (movie2_points, "#4c78a8", 116, "Movie 2"),
+    ]:
+        point_text = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in points)
+        if point_text:
+            parts.append(f'<polyline points="{point_text}" fill="none" stroke="{color}" stroke-width="2.5"/>')
+            for x, y in points:
+                parts.append(f'<circle cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="2.8" fill="{color}"/>')
+        parts.append(f'<text x="650" y="{label_y}" font-family="Arial" font-size="12" fill="{color}">{label}</text>')
+    parts.extend(
+        [
+            '<text x="430" y="425" font-family="Arial" font-size="13" text-anchor="middle">Movie 1 opening attraction</text>',
+            '<text x="24" y="220" font-family="Arial" font-size="13" transform="rotate(-90 24 220)" text-anchor="middle">equilibrium opening week</text>',
+            "</svg>",
+        ]
+    )
+    path.write_text("\n".join(parts), encoding="utf-8")
+
+
+def write_equilibrium_region_svg(
+    path: Path,
+    rows: list[dict[str, object]],
+    *,
+    title: str,
+    subtitle: str,
+    x_field: str,
+    y_field: str,
+    x_label: str,
+    y_label: str,
+) -> None:
+    if not rows:
+        write_placeholder_svg(path, title, "No theory rows were available.")
+        return
+    width, height = 860, 520
+    left, right, top, bottom = 95, 160, 75, 380
+    xs = sorted({float(row[x_field]) for row in rows})
+    ys = sorted({float(row[y_field]) for row in rows})
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+    cell_w = (width - left - right) / len(xs)
+    cell_h = (bottom - top) / len(ys)
+
+    def sx(value: float) -> float:
+        return left + (value - x_min) / (x_max - x_min or 1.0) * (width - left - right - cell_w)
+
+    def sy(value: float) -> float:
+        return bottom - cell_h - (value - y_min) / (y_max - y_min or 1.0) * (bottom - top - cell_h)
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        f'<text x="36" y="34" font-family="Arial" font-size="20" font-weight="700">{svg_escape(title)}</text>',
+        f'<text x="36" y="58" font-family="Arial" font-size="13" fill="#555">{svg_escape(subtitle)}</text>',
+    ]
+    for row in rows:
+        x = float(row[x_field])
+        y = float(row[y_field])
+        color = classification_color(str(row["classification"]))
+        parts.append(
+            f'<rect x="{sx(x):.1f}" y="{sy(y):.1f}" width="{cell_w + 0.5:.1f}" height="{cell_h + 0.5:.1f}" fill="{color}" fill-opacity="0.86"/>'
+        )
+    parts.extend(
+        [
+            f'<rect x="{left}" y="{top}" width="{width - left - right}" height="{bottom - top}" fill="none" stroke="#333"/>',
+            f'<text x="{left + (width - left - right) / 2:.1f}" y="435" font-family="Arial" font-size="13" text-anchor="middle">{svg_escape(x_label)}</text>',
+            f'<text x="28" y="{top + (bottom - top) / 2:.1f}" font-family="Arial" font-size="13" transform="rotate(-90 28 {top + (bottom - top) / 2:.1f})" text-anchor="middle">{svg_escape(y_label)}</text>',
+        ]
+    )
+    legend = [
+        ("simultaneous_beginning", "both begin"),
+        ("movie1_delays", "movie 1 delays"),
+        ("movie2_delays", "movie 2 delays"),
+        ("dual_equilibria", "dual equilibria"),
+        ("no_equilibrium_found", "not found"),
+    ]
+    for index, (classification, label) in enumerate(legend):
+        y = 100 + index * 28
+        parts.append(f'<rect x="720" y="{y}" width="16" height="16" fill="{classification_color(classification)}"/>')
+        parts.append(f'<text x="744" y="{y + 13}" font-family="Arial" font-size="12">{svg_escape(label)}</text>')
     parts.append("</svg>")
     path.write_text("\n".join(parts), encoding="utf-8")
 
@@ -976,15 +1635,18 @@ def write_readme(
     wide_count = sum(1 for estimate in estimates if estimate.is_wide)
     lifecycle_count = sum(1 for estimate in estimates if estimate.half_life_weeks is not None)
     text = [
-        "Database-backed competitive dynamics replication",
+        "Krider-Weinberg competitive dynamics replication for 2022+ movies",
         "",
         "This directory contains Krider-Weinberg-style lifecycle and release timing",
-        "artifacts estimated from the local The Numbers database. It does not",
-        "recreate the paper's original reported/theory figures, and it is not the",
-        "paper's original Variety 1990-1992 sample.",
+        "artifacts estimated from the local The Numbers database, plus numerical",
+        "recreations of the paper's parameter-space figures. It is not the paper's",
+        "original Variety 1990-1992 sample.",
         "",
         f"Database: {db_path}",
         f"Analysis window: {analysis_start.isoformat()} to {analysis_end.isoformat()}",
+        "Default sample rule: release episodes opening on or after 2022-01-01",
+        "Timing regression sample: wide releases in summer (May 25-Sep 5) or holiday (Nov 1-Jan 5)",
+        "Timing regression target: weeks from each movie's season start, pooled across seasons",
         f"Gap threshold for release episode splitting: {gap_threshold_days} days",
         f"Minimum positive weeks for half-life estimation: {min_positive_weeks}",
         f"Wide-release threshold: {wide_theater_threshold} theaters",
@@ -994,10 +1656,18 @@ def write_readme(
         f"Episodes with lifecycle estimates: {lifecycle_count}",
         "",
         "Primary outputs:",
-        "  database_lifecycle_estimates.csv",
-        "  database_timing_regression.csv",
-        "  database_model_vs_observed_timing.csv",
-        "  figure_database_summary_dashboard.svg",
+        "  database_2022_plus_lifecycle_estimates.csv",
+        "  database_2022_plus_timing_regression_opening_gross.csv",
+        "  database_2022_plus_timing_regression_opening_share.csv",
+        "  database_2022_plus_opening_share_distribution.csv",
+        "  database_2022_plus_standardized_log_revenue_curve.csv",
+        "  paper_parameter_equilibrium_table.csv",
+        "  paper_vs_database_2022_plus_summary.csv",
+        "  figure_b1_database_2022_plus_opening_shares.svg",
+        "  figure_b3_database_2022_plus_standardized_curve.svg",
+        "  figure_4_recreated_equilibrium_vs_opening_attraction.svg",
+        "  figure_5_recreated_equilibrium_regions.svg",
+        "  figure_8_recreated_marketability_playability_regions.svg",
     ]
     path.write_text("\n".join(text) + "\n", encoding="utf-8")
 
@@ -1012,9 +1682,15 @@ def write_outputs(
     gap_threshold_days: int,
     min_positive_weeks: int,
     wide_theater_threshold: int,
+    include_theory_recreation: bool = True,
 ) -> None:
     daily_rows = load_daily_rows(conn)
-    episodes = split_release_episodes(daily_rows, gap_threshold_days=gap_threshold_days)
+    all_episodes = split_release_episodes(daily_rows, gap_threshold_days=gap_threshold_days)
+    episodes = filter_release_episodes(
+        all_episodes,
+        analysis_start=analysis_start,
+        analysis_end=analysis_end,
+    )
     estimates, weekly_by_episode = estimate_lifecycles(
         episodes,
         conn,
@@ -1027,6 +1703,13 @@ def write_outputs(
     curve_rows = standardized_curve_rows(estimates, weekly_by_episode)
     share_rows = opening_share_rows(estimates)
     metrics = summary_metrics(db_path, analysis_start, analysis_end, estimates, regression, model_rows)
+    comparison_rows = paper_vs_database_summary_rows(
+        estimates,
+        regression,
+        model_rows,
+        analysis_start,
+        analysis_end,
+    )
 
     write_csv(out_dir / "database_schema_summary.csv", schema_summary(conn), ["table_name", "row_count"])
     write_csv(
@@ -1057,7 +1740,36 @@ def write_outputs(
             "release_year",
             "opening_date",
             "delay_weeks",
+            "season_label",
+            "season_start",
+            "season_delay_weeks",
             "positive_weeks",
+            "opening_weekend_gross_usd",
+            "opening_7_day_gross_usd",
+            "max_theaters",
+            "decay_beta",
+            "half_life_weeks",
+            "lifecycle_r2",
+            "opening_share",
+            "opening_attraction",
+            "chart_coverage_days",
+            "is_wide",
+        ],
+    )
+    write_csv(
+        out_dir / "database_2022_plus_lifecycle_estimates.csv",
+        lifecycle_rows(estimates),
+        [
+            "episode_id",
+            "title",
+            "release_year",
+            "opening_date",
+            "delay_weeks",
+            "season_label",
+            "season_start",
+            "season_delay_weeks",
+            "positive_weeks",
+            "opening_weekend_gross_usd",
             "opening_7_day_gross_usd",
             "max_theaters",
             "decay_beta",
@@ -1083,7 +1795,30 @@ def write_outputs(
         ],
     )
     write_csv(
+        out_dir / "database_2022_plus_opening_share_distribution.csv",
+        share_rows,
+        [
+            "episode_id",
+            "title",
+            "opening_date",
+            "opening_share",
+            "opening_attraction",
+            "chart_coverage_days",
+            "opening_7_day_gross_usd",
+        ],
+    )
+    write_csv(
         out_dir / "database_standardized_log_revenue_curve.csv",
+        curve_rows,
+        [
+            "half_lives_after_opening",
+            "mean_log_standardized_gross",
+            "ideal_exponential_log_decline",
+            "movie_week_count",
+        ],
+    )
+    write_csv(
+        out_dir / "database_2022_plus_standardized_log_revenue_curve.csv",
         curve_rows,
         [
             "half_lives_after_opening",
@@ -1098,16 +1833,32 @@ def write_outputs(
         ["model", "term", "estimate", "se", "t_stat", "n", "r2", "f_stat"],
     )
     write_csv(
+        out_dir / "database_2022_plus_timing_regression_opening_gross.csv",
+        regression_model_rows(
+            regression,
+            "delay_on_opening_weekend_gross_millions_and_half_life",
+        ),
+        ["model", "term", "estimate", "se", "t_stat", "n", "r2", "f_stat"],
+    )
+    write_csv(
+        out_dir / "database_2022_plus_timing_regression_opening_share.csv",
+        regression_model_rows(regression, "delay_on_opening_share_and_half_life"),
+        ["model", "term", "estimate", "se", "t_stat", "n", "r2", "f_stat"],
+    )
+    write_csv(
         out_dir / "database_model_vs_observed_timing.csv",
         model_rows,
         [
+            "season_label",
             "left_episode_id",
             "left_title",
             "left_opening_date",
+            "left_season_delay_weeks",
             "left_strength_score",
             "right_episode_id",
             "right_title",
             "right_opening_date",
+            "right_season_delay_weeks",
             "right_strength_score",
             "predicted_first_episode_id",
             "observed_first_episode_id",
@@ -1116,12 +1867,61 @@ def write_outputs(
         ],
     )
     write_csv(out_dir / "database_summary_metrics.csv", metrics, ["metric", "value"])
+    write_csv(
+        out_dir / "paper_vs_database_2022_plus_summary.csv",
+        comparison_rows,
+        ["result", "paper_1990_reported", "database_2022_plus"],
+    )
 
     write_opening_share_svg(out_dir / "figure_database_opening_share_distribution.svg", share_rows)
+    write_opening_share_svg(out_dir / "figure_b1_database_2022_plus_opening_shares.svg", share_rows)
     write_standardized_curve_svg(out_dir / "figure_database_standardized_log_revenue_curve.svg", curve_rows)
+    write_standardized_curve_svg(out_dir / "figure_b3_database_2022_plus_standardized_curve.svg", curve_rows)
     write_timing_regression_svg(out_dir / "figure_database_timing_regression.svg", estimates, analysis_start, analysis_end)
     write_model_vs_observed_svg(out_dir / "figure_database_model_vs_observed_timing.svg", model_rows)
     write_summary_dashboard_svg(out_dir / "figure_database_summary_dashboard.svg", metrics)
+
+    if include_theory_recreation:
+        figure4_rows = figure4_theory_rows()
+        figure5_rows = figure5_theory_rows()
+        figure8_rows = figure8_theory_rows()
+        write_csv(
+            out_dir / "paper_parameter_equilibrium_table.csv",
+            paper_parameter_equilibrium_rows(),
+            [
+                "scenario",
+                "movie",
+                "opening_attraction",
+                "half_life_weeks",
+                "recreated_equilibrium_opening_week",
+                "paper_reported_opening_week",
+                "classification",
+            ],
+        )
+        write_figure4_theory_svg(
+            out_dir / "figure_4_recreated_equilibrium_vs_opening_attraction.svg",
+            figure4_rows,
+        )
+        write_equilibrium_region_svg(
+            out_dir / "figure_5_recreated_equilibrium_regions.svg",
+            figure5_rows,
+            title="Figure 5 recreation",
+            subtitle="Movie 1 opening attraction fixed at .5; equal half-lives vary together",
+            x_field="half_life_weeks",
+            y_field="movie2_opening_attraction",
+            x_label="half-life, weeks",
+            y_label="Movie 2 opening attraction",
+        )
+        write_equilibrium_region_svg(
+            out_dir / "figure_8_recreated_marketability_playability_regions.svg",
+            figure8_rows,
+            title="Figure 8 recreation",
+            subtitle="Movie 1 fixed at opening attraction .5 and half-life 3 weeks; Movie 2 varies",
+            x_field="movie2_half_life_weeks",
+            y_field="movie2_opening_attraction",
+            x_label="Movie 2 half-life, weeks",
+            y_label="Movie 2 opening attraction",
+        )
     write_readme(
         out_dir / "README.txt",
         db_path=db_path,
@@ -1147,6 +1947,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gap-threshold-days", type=int, default=DEFAULT_GAP_THRESHOLD_DAYS)
     parser.add_argument("--min-positive-weeks", type=int, default=DEFAULT_MIN_POSITIVE_WEEKS)
     parser.add_argument("--wide-theater-threshold", type=int, default=DEFAULT_WIDE_THEATER_THRESHOLD)
+    parser.add_argument(
+        "--skip-theory-recreation",
+        action="store_true",
+        help="Only write database-derived artifacts; skip recreated paper-parameter figures.",
+    )
     return parser
 
 
@@ -1174,6 +1979,7 @@ def main() -> None:
             gap_threshold_days=args.gap_threshold_days,
             min_positive_weeks=args.min_positive_weeks,
             wide_theater_threshold=args.wide_theater_threshold,
+            include_theory_recreation=not args.skip_theory_recreation,
         )
     finally:
         conn.close()

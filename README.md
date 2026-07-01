@@ -52,6 +52,25 @@ The Numbers actuals:
 .venv/bin/python -m pm_box_office.sources.the_numbers.ingest --start-date 2026-06-01 --end-date 2026-06-30
 ```
 
+Boxoffice Pro forecast articles, matched back to The Numbers movies when possible:
+
+```sh
+.venv/bin/python -m pm_box_office.sources.boxofficepro.ingest --dry-run
+.venv/bin/python -m pm_box_office.sources.boxofficepro.ingest --start-date 2026-06-01 --end-date 2026-06-30
+```
+
+Boxoffice Pro may return HTTP 403 to plain Python requests. When that happens,
+seed the raw HTML cache from a normal browser and run offline:
+
+```sh
+.venv/bin/python -m pm_box_office.sources.boxofficepro.ingest --print-cache-paths --max-pages 1
+# Save the browser page source for each URL to its printed cache path.
+.venv/bin/python -m pm_box_office.sources.boxofficepro.ingest --offline --start-date 2026-06-01 --end-date 2026-06-30
+```
+
+If an article page is missing from cache, the offline error prints the exact
+article URL and cache path to save next.
+
 Wikipedia features, after The Numbers has populated movies/releases/actuals:
 
 ```sh

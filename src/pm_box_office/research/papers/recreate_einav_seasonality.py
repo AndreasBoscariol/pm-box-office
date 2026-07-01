@@ -33,15 +33,23 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import math
 import re
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
+
+from pm_box_office.db.connection import connect_database
 
 
 DEFAULT_OUT_DIR = Path("results/papers/einav_seasonality")
+DEFAULT_START_DATE = dt.date(2022, 1, 1)
+DEFAULT_WIDE_THEATER_THRESHOLD = 600
+DEFAULT_MAX_AGE_WEEKS = 10
+DEFAULT_MARKET_SIZE_PEAK_SHARE = 0.08
 
 REPORTED_INDUSTRY_TRENDS = [
     (1985, 5.54, 167, 103, 3.51, 2.69),
@@ -194,6 +202,199 @@ def write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) 
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+@dataclass(frozen=True)
+class DatabaseDailyRow:
+    movie_id: int
+    title: str
+    box_office_date: dt.date
+    gross_usd: int
+    theaters: int
+
+
+def parse_date(value: str) -> dt.date:
+    return dt.date.fromisoformat(value)
+
+
+def date_or_none(value: str | None) -> dt.date | None:
+    return parse_date(value) if value else None
+
+
+def week_start_for_date(value: dt.date) -> dt.date:
+    return value - dt.timedelta(days=value.weekday())
+
+
+def calendar_week_for_date(value: dt.date) -> str:
+    return f"{value.isocalendar().week:02d}"
+
+
+def aggregate_daily_rows_to_movie_weeks(
+    rows: list[DatabaseDailyRow],
+    *,
+    start_date: dt.date,
+    end_date: dt.date | None,
+    wide_theater_threshold: int,
+    max_age_weeks: int,
+) -> list[dict[str, object]]:
+    buckets: dict[tuple[int, dt.date], list[DatabaseDailyRow]] = defaultdict(list)
+    for row in rows:
+        week_start = week_start_for_date(row.box_office_date)
+        if week_start < start_date:
+            continue
+        if end_date is not None and week_start > end_date:
+            continue
+        buckets[(row.movie_id, week_start)].append(row)
+
+    release_week_by_movie: dict[int, dt.date] = {}
+    wide_movie_ids: set[int] = set()
+    for movie_id, week_start in buckets:
+        current = release_week_by_movie.get(movie_id)
+        if current is None or week_start < current:
+            release_week_by_movie[movie_id] = week_start
+    for (movie_id, _week_start), bucket_rows in buckets.items():
+        if max(row.theaters for row in bucket_rows) >= wide_theater_threshold:
+            wide_movie_ids.add(movie_id)
+
+    weekly_rows: list[dict[str, object]] = []
+    for (movie_id, week_start), bucket_rows in sorted(buckets.items(), key=lambda item: (item[0][1], item[0][0])):
+        if movie_id not in wide_movie_ids:
+            continue
+        release_week = release_week_by_movie[movie_id]
+        age = (week_start - release_week).days // 7
+        if age < 0 or age >= max_age_weeks:
+            continue
+        weekly_gross = sum(row.gross_usd for row in bucket_rows)
+        max_theaters = max(row.theaters for row in bucket_rows)
+        if weekly_gross <= 0:
+            continue
+        weekly_rows.append(
+            {
+                "movie_id": str(movie_id),
+                "title": bucket_rows[0].title,
+                "week_start": week_start.isoformat(),
+                "period_id": week_start.isoformat(),
+                "calendar_week": calendar_week_for_date(week_start),
+                "season_week": calendar_week_for_date(week_start),
+                "age": float(age),
+                "weekly_gross_usd": float(weekly_gross),
+                "max_theaters": max_theaters,
+                "observed_days": len(bucket_rows),
+                "is_wide": int(max_theaters >= wide_theater_threshold),
+            }
+        )
+    return weekly_rows
+
+
+def normalize_movie_week_market_shares(
+    weekly_rows: list[dict[str, object]],
+    *,
+    market_size_peak_share: float,
+) -> list[dict[str, object]]:
+    if not 0.0 < market_size_peak_share < 1.0:
+        raise ValueError("market_size_peak_share must be between 0 and 1")
+    industry_gross_by_period: dict[str, float] = defaultdict(float)
+    movie_count_by_period: dict[str, int] = defaultdict(int)
+    for row in weekly_rows:
+        period_id = str(row["period_id"])
+        industry_gross_by_period[period_id] += float(row["weekly_gross_usd"])
+        movie_count_by_period[period_id] += 1
+    if not industry_gross_by_period:
+        return []
+    peak_industry_gross = max(industry_gross_by_period.values())
+    if peak_industry_gross <= 0:
+        return []
+    pseudo_market_size_usd = peak_industry_gross / market_size_peak_share
+
+    panel = []
+    for row in weekly_rows:
+        period_id = str(row["period_id"])
+        weekly_gross = float(row["weekly_gross_usd"])
+        industry_gross = industry_gross_by_period[period_id]
+        market_share = weekly_gross / pseudo_market_size_usd
+        inside_share = industry_gross / pseudo_market_size_usd
+        if market_share <= 0 or inside_share <= 0 or inside_share >= 1:
+            continue
+        dependent_log_share = math.log(market_share) - math.log(1.0 - inside_share)
+        log_within_industry_share = math.log(market_share / inside_share)
+        panel.append(
+            {
+                **row,
+                "market_share": market_share,
+                "inside_share": inside_share,
+                "outside_share": 1.0 - inside_share,
+                "dependent_log_share": dependent_log_share,
+                "log_within_industry_share": log_within_industry_share,
+                "movies_in_release": float(movie_count_by_period[period_id]),
+                "industry_weekly_gross_usd": industry_gross,
+                "pseudo_market_size_usd": pseudo_market_size_usd,
+            }
+        )
+    return panel
+
+
+def build_database_movie_week_panel(
+    daily_rows: list[DatabaseDailyRow],
+    *,
+    start_date: dt.date = DEFAULT_START_DATE,
+    end_date: dt.date | None = None,
+    wide_theater_threshold: int = DEFAULT_WIDE_THEATER_THRESHOLD,
+    max_age_weeks: int = DEFAULT_MAX_AGE_WEEKS,
+    market_size_peak_share: float = DEFAULT_MARKET_SIZE_PEAK_SHARE,
+) -> list[dict[str, object]]:
+    weekly_rows = aggregate_daily_rows_to_movie_weeks(
+        daily_rows,
+        start_date=start_date,
+        end_date=end_date,
+        wide_theater_threshold=wide_theater_threshold,
+        max_age_weeks=max_age_weeks,
+    )
+    return normalize_movie_week_market_shares(
+        weekly_rows,
+        market_size_peak_share=market_size_peak_share,
+    )
+
+
+def load_database_daily_rows(
+    conn: Any,
+    *,
+    start_date: dt.date,
+    end_date: dt.date | None,
+) -> list[DatabaseDailyRow]:
+    params: list[object] = [start_date.isoformat()]
+    end_clause = ""
+    if end_date is not None:
+        end_clause = "AND d.box_office_date::date <= %s"
+        params.append(end_date.isoformat())
+    rows = conn.execute(
+        f"""
+        SELECT r.movie_id,
+               m.title,
+               d.box_office_date,
+               d.gross_usd,
+               d.theaters
+        FROM daily_box_office d
+        JOIN release_runs r USING(release_run_id)
+        JOIN movies m USING(movie_id)
+        WHERE d.box_office_date::date >= %s
+          {end_clause}
+          AND d.gross_usd IS NOT NULL
+          AND d.theaters IS NOT NULL
+          AND d.is_preview = 0
+        ORDER BY r.movie_id, d.box_office_date
+        """,
+        params,
+    ).fetchall()
+    return [
+        DatabaseDailyRow(
+            movie_id=int(row[0]),
+            title=str(row[1]),
+            box_office_date=parse_date(str(row[2])),
+            gross_usd=int(row[3]),
+            theaters=int(row[4]),
+        )
+        for row in rows
+    ]
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -420,9 +621,7 @@ def prepare_panel(rows: list[dict[str, str]]) -> list[dict[str, object]]:
     return prepared
 
 
-def run_panel_estimation(out_dir: Path, panel_csv: Path) -> None:
-    rows = read_csv_rows(panel_csv)
-    panel = prepare_panel(rows)
+def estimate_panel(panel: list[dict[str, object]]) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     if len(panel) < 20:
         raise SystemExit(
             "Panel data did not contain enough usable rows. Required fields are movie_id, "
@@ -499,12 +698,6 @@ def run_panel_estimation(out_dir: Path, panel_csv: Path) -> None:
             "season_weeks": len(set(season_weeks)),
         },
     ]
-    write_csv(
-        out_dir / "local_panel_nested_logit_estimates.csv",
-        estimates,
-        ["model", "parameter", "estimate", "se_naive", "r2_residualized", "n", "movies", "season_weeks"],
-    )
-
     target_for_effects = [
         yy - second_beta[0] * aa - second_beta[1] * ww
         for yy, aa, ww in zip(y, age, within)
@@ -514,8 +707,20 @@ def run_panel_estimation(out_dir: Path, panel_csv: Path) -> None:
         {"season_week": week, "estimated_underlying_demand_effect": value}
         for week, value in sorted(week_effects.items(), key=lambda item: natural_week_key(item[0]))
     ]
+    return estimates, week_rows
+
+
+def run_panel_estimation(out_dir: Path, panel_csv: Path) -> None:
+    rows = read_csv_rows(panel_csv)
+    panel = prepare_panel(rows)
+    estimates, week_rows = estimate_panel(panel)
+    write_csv(
+        out_dir / "local_panel_nested_logit_estimates.csv",
+        estimates,
+        ["model", "parameter", "estimate", "se_naive", "r2_residualized", "n", "movies", "season_weeks"],
+    )
     write_csv(out_dir / "local_panel_estimated_week_effects.csv", week_rows, ["season_week", "estimated_underlying_demand_effect"])
-    write_panel_descriptives(out_dir, panel)
+    write_panel_descriptives(out_dir / "local_panel_descriptive_stats.csv", panel)
     write_week_effect_svg(out_dir / "local_panel_week_effects.svg", week_rows)
 
 
@@ -524,7 +729,7 @@ def natural_week_key(value: str) -> tuple[int, str]:
     return (int(numeric) if numeric is not None else 9999, value)
 
 
-def write_panel_descriptives(out_dir: Path, panel: list[dict[str, object]]) -> None:
+def panel_descriptive_rows(panel: list[dict[str, object]]) -> list[dict[str, object]]:
     columns = ["age", "market_share", "inside_share", "dependent_log_share", "log_within_industry_share", "movies_in_release"]
     rows = []
     for column in columns:
@@ -539,7 +744,408 @@ def write_panel_descriptives(out_dir: Path, panel: list[dict[str, object]]) -> N
                 "max": max(values),
             }
         )
-    write_csv(out_dir / "local_panel_descriptive_stats.csv", rows, ["variable", "n", "mean", "std_dev", "min", "max"])
+    return rows
+
+
+def write_panel_descriptives(path: Path, panel: list[dict[str, object]]) -> None:
+    write_csv(path, panel_descriptive_rows(panel), ["variable", "n", "mean", "std_dev", "min", "max"])
+
+
+def estimate_value(
+    estimates: list[dict[str, object]],
+    *,
+    model: str,
+    parameter: str,
+    field: str = "estimate",
+) -> object | None:
+    for row in estimates:
+        if row["model"] == model and row["parameter"] == parameter:
+            return row[field]
+    return None
+
+
+def centered_effect_rows(
+    values_by_week: dict[str, list[float]],
+    *,
+    output_name: str,
+) -> list[dict[str, object]]:
+    means = {week: mean(values) for week, values in values_by_week.items() if values}
+    if not means:
+        return []
+    center = mean(means.values())
+    return [
+        {"season_week": week, output_name: value - center}
+        for week, value in sorted(means.items(), key=lambda item: natural_week_key(item[0]))
+    ]
+
+
+def observed_weekly_seasonality_rows(panel: list[dict[str, object]]) -> list[dict[str, object]]:
+    inside_by_week: dict[str, list[float]] = defaultdict(list)
+    gross_by_week: dict[str, list[float]] = defaultdict(list)
+    movies_by_week: dict[str, list[float]] = defaultdict(list)
+    for row in panel:
+        season_week = str(row["season_week"])
+        inside_by_week[season_week].append(float(row["inside_share"]))
+        gross_by_week[season_week].append(float(row["industry_weekly_gross_usd"]))
+        movies_by_week[season_week].append(float(row["movies_in_release"]))
+    inside_effects = {
+        row["season_week"]: row["observed_log_inside_share_effect"]
+        for row in centered_effect_rows(
+            {week: [math.log(value) for value in values if value > 0] for week, values in inside_by_week.items()},
+            output_name="observed_log_inside_share_effect",
+        )
+    }
+    rows = []
+    for week in sorted(inside_by_week, key=natural_week_key):
+        rows.append(
+            {
+                "season_week": week,
+                "mean_inside_share": mean(inside_by_week[week]),
+                "mean_industry_weekly_gross_usd": mean(gross_by_week[week]),
+                "mean_movies_in_release": mean(movies_by_week[week]),
+                "observed_log_inside_share_effect": inside_effects.get(week),
+            }
+        )
+    return rows
+
+
+def merge_observed_and_estimated_week_effects(
+    observed_rows: list[dict[str, object]],
+    estimated_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    estimated = {
+        str(row["season_week"]): float(row["estimated_underlying_demand_effect"])
+        for row in estimated_rows
+    }
+    return [
+        {
+            **row,
+            "estimated_underlying_demand_effect": estimated.get(str(row["season_week"])),
+        }
+        for row in observed_rows
+    ]
+
+
+def seasonality_decomposition_rows(
+    observed_rows: list[dict[str, object]],
+    estimated_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    observed_values = [
+        float(row["observed_log_inside_share_effect"])
+        for row in observed_rows
+        if row["observed_log_inside_share_effect"] is not None
+    ]
+    estimated_values = [float(row["estimated_underlying_demand_effect"]) for row in estimated_rows]
+    observed_sd = sample_sd(observed_values)
+    estimated_sd = sample_sd(estimated_values)
+    return [
+        {"metric": "observed_log_inside_share_effect_sd_without_movie_fe", "paper_reported": 0.356, "database_2022_plus": observed_sd},
+        {"metric": "estimated_week_effect_sd_with_movie_fe", "paper_reported": 0.238, "database_2022_plus": estimated_sd},
+        {
+            "metric": "quality_endogeneity_amplification_ratio",
+            "paper_reported": 0.356 / 0.238,
+            "database_2022_plus": observed_sd / estimated_sd if estimated_sd else None,
+        },
+        {
+            "metric": "underlying_demand_share_of_gross_seasonal_variation",
+            "paper_reported": 0.238 / 0.356,
+            "database_2022_plus": estimated_sd / observed_sd if observed_sd else None,
+        },
+    ]
+
+
+def paper_vs_database_summary_rows(
+    panel: list[dict[str, object]],
+    estimates: list[dict[str, object]],
+    decomposition: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    decomp = {str(row["metric"]): row["database_2022_plus"] for row in decomposition}
+    return [
+        {
+            "result": "sample_movie_weeks",
+            "paper_reported": 16103,
+            "database_2022_plus": len(panel),
+        },
+        {
+            "result": "sample_titles",
+            "paper_reported": 1956,
+            "database_2022_plus": len({row["movie_id"] for row in panel}),
+        },
+        {
+            "result": "decay_beta_with_movie_fe",
+            "paper_reported": -0.220,
+            "database_2022_plus": estimate_value(estimates, model="two_way_fe_2sls", parameter="decay_beta"),
+        },
+        {
+            "result": "nested_logit_sigma_with_movie_fe",
+            "paper_reported": 0.524,
+            "database_2022_plus": estimate_value(estimates, model="two_way_fe_2sls", parameter="nested_logit_sigma"),
+        },
+        {
+            "result": "season_week_effect_sd_with_movie_fe",
+            "paper_reported": 0.238,
+            "database_2022_plus": decomp.get("estimated_week_effect_sd_with_movie_fe"),
+        },
+        {
+            "result": "season_week_effect_sd_without_movie_fe",
+            "paper_reported": 0.356,
+            "database_2022_plus": decomp.get("observed_log_inside_share_effect_sd_without_movie_fe"),
+        },
+        {
+            "result": "quality_endogeneity_amplification_ratio",
+            "paper_reported": 0.356 / 0.238,
+            "database_2022_plus": decomp.get("quality_endogeneity_amplification_ratio"),
+        },
+    ]
+
+
+def write_observed_vs_estimated_svg(path: Path, rows: list[dict[str, object]]) -> None:
+    values = [
+        row
+        for row in rows
+        if row.get("observed_log_inside_share_effect") is not None
+        and row.get("estimated_underlying_demand_effect") is not None
+    ]
+    if not values:
+        return
+    width, height = 900, 460
+    left, right, top, bottom = 70, 35, 60, 340
+    all_values = [
+        float(row[key])
+        for row in values
+        for key in ("observed_log_inside_share_effect", "estimated_underlying_demand_effect")
+    ]
+    y_min, y_max = min(all_values), max(all_values)
+    if y_min == y_max:
+        y_min -= 1
+        y_max += 1
+    pad = (y_max - y_min) * 0.12
+    y_min -= pad
+    y_max += pad
+    x_step = (width - left - right) / max(1, len(values) - 1)
+
+    def sx(index: int) -> float:
+        return left + index * x_step
+
+    def sy(value: float) -> float:
+        return bottom - (value - y_min) / (y_max - y_min) * (bottom - top)
+
+    observed_points = " ".join(
+        f'{sx(index):.1f},{sy(float(row["observed_log_inside_share_effect"])):.1f}'
+        for index, row in enumerate(values)
+    )
+    estimated_points = " ".join(
+        f'{sx(index):.1f},{sy(float(row["estimated_underlying_demand_effect"])):.1f}'
+        for index, row in enumerate(values)
+    )
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="36" y="34" font-family="Arial" font-size="20" font-weight="700">2022+ observed vs estimated seasonality</text>',
+        '<text x="36" y="56" font-family="Arial" font-size="13" fill="#555">Observed log inside-share seasonality versus movie-FE adjusted week effects</text>',
+        f'<line x1="{left}" y1="{bottom}" x2="{width - right}" y2="{bottom}" stroke="#333"/>',
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" stroke="#333"/>',
+        f'<polyline points="{observed_points}" fill="none" stroke="#c15b3f" stroke-width="2.4"/>',
+        f'<polyline points="{estimated_points}" fill="none" stroke="#2f6f73" stroke-width="2.4"/>',
+        '<text x="650" y="90" font-family="Arial" font-size="12" fill="#c15b3f">observed</text>',
+        '<text x="650" y="110" font-family="Arial" font-size="12" fill="#2f6f73">estimated with movie FE</text>',
+    ]
+    for index, row in enumerate(values):
+        if index % max(1, len(values) // 12) == 0:
+            parts.append(f'<text x="{sx(index):.1f}" y="{bottom + 20}" font-family="Arial" font-size="10" text-anchor="middle">{svg_escape(row["season_week"])}</text>')
+    parts.append("</svg>")
+    path.write_text("\n".join(parts), encoding="utf-8")
+
+
+def write_database_amplification_svg(path: Path, decomposition: list[dict[str, object]]) -> None:
+    values = {str(row["metric"]): row["database_2022_plus"] for row in decomposition}
+    observed = float(values.get("observed_log_inside_share_effect_sd_without_movie_fe") or 0.0)
+    estimated = float(values.get("estimated_week_effect_sd_with_movie_fe") or 0.0)
+    bars = [
+        ("With movie FE", estimated, "#2f6f73"),
+        ("Without movie FE", observed, "#c15b3f"),
+    ]
+    width, height = 760, 420
+    left, bottom, top = 110, 340, 60
+    max_value = max(0.1, observed, estimated)
+    scale = 250 / max_value
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="40" y="34" font-family="Arial" font-size="20" font-weight="700">2022+ seasonal amplification analogue</text>',
+        '<text x="40" y="58" font-family="Arial" font-size="13" fill="#555">Standard deviation of season-week effects, local Postgres panel</text>',
+        f'<line x1="{left}" y1="{bottom}" x2="690" y2="{bottom}" stroke="#333"/>',
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" stroke="#333"/>',
+    ]
+    for index, (label, value, color) in enumerate(bars):
+        x = 210 + index * 220
+        y = bottom - value * scale
+        parts.append(f'<rect x="{x}" y="{y:.1f}" width="100" height="{value * scale:.1f}" fill="{color}"/>')
+        parts.append(f'<text x="{x + 50}" y="{bottom + 24}" font-family="Arial" font-size="13" text-anchor="middle">{svg_escape(label)}</text>')
+        parts.append(f'<text x="{x + 50}" y="{y - 8:.1f}" font-family="Arial" font-size="13" font-weight="700" text-anchor="middle">{value:.3f}</text>')
+    parts.append("</svg>")
+    path.write_text("\n".join(parts), encoding="utf-8")
+
+
+def write_database_panel_outputs(
+    out_dir: Path,
+    panel: list[dict[str, object]],
+    *,
+    start_date: dt.date,
+    end_date: dt.date | None,
+    wide_theater_threshold: int,
+    max_age_weeks: int,
+    market_size_peak_share: float,
+) -> None:
+    estimates, week_rows = estimate_panel(panel)
+    observed_rows = observed_weekly_seasonality_rows(panel)
+    merged_week_rows = merge_observed_and_estimated_week_effects(observed_rows, week_rows)
+    decomposition = seasonality_decomposition_rows(observed_rows, week_rows)
+    comparison = paper_vs_database_summary_rows(panel, estimates, decomposition)
+
+    panel_fields = [
+        "movie_id",
+        "title",
+        "week_start",
+        "period_id",
+        "calendar_week",
+        "season_week",
+        "age",
+        "weekly_gross_usd",
+        "max_theaters",
+        "observed_days",
+        "is_wide",
+        "market_share",
+        "inside_share",
+        "outside_share",
+        "dependent_log_share",
+        "log_within_industry_share",
+        "movies_in_release",
+        "industry_weekly_gross_usd",
+        "pseudo_market_size_usd",
+    ]
+    write_csv(out_dir / "database_2022_plus_movie_week_panel.csv", panel, panel_fields)
+    write_csv(
+        out_dir / "database_2022_plus_nested_logit_estimates.csv",
+        estimates,
+        ["model", "parameter", "estimate", "se_naive", "r2_residualized", "n", "movies", "season_weeks"],
+    )
+    write_csv(
+        out_dir / "database_2022_plus_estimated_week_effects.csv",
+        week_rows,
+        ["season_week", "estimated_underlying_demand_effect"],
+    )
+    write_panel_descriptives(out_dir / "database_2022_plus_panel_descriptive_stats.csv", panel)
+    write_csv(
+        out_dir / "database_2022_plus_observed_weekly_seasonality.csv",
+        merged_week_rows,
+        [
+            "season_week",
+            "mean_inside_share",
+            "mean_industry_weekly_gross_usd",
+            "mean_movies_in_release",
+            "observed_log_inside_share_effect",
+            "estimated_underlying_demand_effect",
+        ],
+    )
+    write_csv(
+        out_dir / "database_2022_plus_seasonality_decomposition.csv",
+        decomposition,
+        ["metric", "paper_reported", "database_2022_plus"],
+    )
+    write_csv(
+        out_dir / "paper_vs_database_2022_plus_summary.csv",
+        comparison,
+        ["result", "paper_reported", "database_2022_plus"],
+    )
+    write_observed_vs_estimated_svg(
+        out_dir / "figure_database_2022_plus_observed_vs_estimated_seasonality.svg",
+        merged_week_rows,
+    )
+    write_database_amplification_svg(
+        out_dir / "figure_database_2022_plus_seasonal_amplification.svg",
+        decomposition,
+    )
+    write_database_readme(
+        out_dir / "README_database_2022_plus.txt",
+        panel=panel,
+        start_date=start_date,
+        end_date=end_date,
+        wide_theater_threshold=wide_theater_threshold,
+        max_age_weeks=max_age_weeks,
+        market_size_peak_share=market_size_peak_share,
+    )
+
+
+def write_database_readme(
+    path: Path,
+    *,
+    panel: list[dict[str, object]],
+    start_date: dt.date,
+    end_date: dt.date | None,
+    wide_theater_threshold: int,
+    max_age_weeks: int,
+    market_size_peak_share: float,
+) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "Einav 2022+ Postgres replication artifacts",
+                "",
+                "This is an approximate local-data analogue. The original paper used proprietary",
+                "ACNielsen EDI / Competitive Media Reporting data, ticket prices, population,",
+                "production costs, and advertising expenditures.",
+                "",
+                f"Panel movie-weeks: {len(panel)}",
+                f"Panel movies: {len({row['movie_id'] for row in panel})}",
+                f"Start date: {start_date.isoformat()}",
+                f"End date: {end_date.isoformat() if end_date else 'latest available'}",
+                f"Wide-release threshold: {wide_theater_threshold} theaters",
+                f"Max age weeks: {max_age_weeks}",
+                f"Pseudo market-size peak inside share: {market_size_peak_share}",
+                "",
+                "Primary database outputs are prefixed with database_2022_plus_.",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def run_database_estimation(
+    out_dir: Path,
+    *,
+    database_url: str | None,
+    start_date: dt.date,
+    end_date: dt.date | None,
+    wide_theater_threshold: int,
+    max_age_weeks: int,
+    market_size_peak_share: float,
+) -> None:
+    conn = connect_database(database_url)
+    try:
+        daily_rows = load_database_daily_rows(conn, start_date=start_date, end_date=end_date)
+    finally:
+        conn.close()
+    panel = build_database_movie_week_panel(
+        daily_rows,
+        start_date=start_date,
+        end_date=end_date,
+        wide_theater_threshold=wide_theater_threshold,
+        max_age_weeks=max_age_weeks,
+        market_size_peak_share=market_size_peak_share,
+    )
+    if len(panel) < 20:
+        raise SystemExit("Database did not produce enough usable 2022+ movie-week rows for estimation.")
+    write_database_panel_outputs(
+        out_dir,
+        panel,
+        start_date=start_date,
+        end_date=end_date,
+        wide_theater_threshold=wide_theater_threshold,
+        max_age_weeks=max_age_weeks,
+        market_size_peak_share=market_size_peak_share,
+    )
 
 
 def write_reported_outputs(out_dir: Path) -> None:
@@ -787,6 +1393,21 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR, help="Directory for recreated result artifacts.")
     parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL connection URL. When provided, builds the 2022+ panel from Postgres.",
+    )
+    parser.add_argument(
+        "--use-postgres",
+        action="store_true",
+        help="Build the 2022+ panel from DATABASE_URL or POSTGRES_DSN without passing --database-url.",
+    )
+    parser.add_argument("--start-date", default=DEFAULT_START_DATE.isoformat(), help="Postgres panel start date, YYYY-MM-DD.")
+    parser.add_argument("--end-date", help="Optional Postgres panel end date, YYYY-MM-DD.")
+    parser.add_argument("--wide-theater-threshold", type=int, default=DEFAULT_WIDE_THEATER_THRESHOLD)
+    parser.add_argument("--max-age-weeks", type=int, default=DEFAULT_MAX_AGE_WEEKS)
+    parser.add_argument("--market-size-peak-share", type=float, default=DEFAULT_MARKET_SIZE_PEAK_SHARE)
+    parser.add_argument(
         "--panel-csv",
         type=Path,
         help=(
@@ -803,6 +1424,16 @@ def main() -> None:
     write_reported_outputs(args.out_dir)
     if args.panel_csv:
         run_panel_estimation(args.out_dir, args.panel_csv)
+    if args.database_url or args.use_postgres:
+        run_database_estimation(
+            args.out_dir,
+            database_url=args.database_url,
+            start_date=parse_date(args.start_date),
+            end_date=date_or_none(args.end_date),
+            wide_theater_threshold=args.wide_theater_threshold,
+            max_age_weeks=args.max_age_weeks,
+            market_size_peak_share=args.market_size_peak_share,
+        )
     print(f"Wrote Einav reproduction artifacts to {args.out_dir}")
 
 

@@ -134,10 +134,14 @@ class RenderedShowtimesParser(HTMLParser):
         if self._time_depth:
             self._time_depth -= 1
         if self._pending_showtime is not None and tag == "a":
+            showtime_day = showtime_date_from_when(
+                self._pending_showtime["when"],
+                fallback_date=self.date,
+            )
             self.rows.append(
                 ShowtimeRecord(
                     theatre_slug=self.theatre_slug,
-                    date=self.date.isoformat(),
+                    date=showtime_day.isoformat(),
                     showtime_id=self._pending_showtime["showtime_id"],
                     when=self._pending_showtime["when"],
                     movie_name=self._current_movie_name,
@@ -212,6 +216,15 @@ def current_showtime_seats_url(showtime_id: str) -> str:
 
 def current_showtime_seats_rsc_url(showtime_id: str, token: str = "1") -> str:
     return f"{current_showtime_seats_url(showtime_id)}?{urllib.parse.urlencode({'_rsc': token})}"
+
+
+def showtime_date_from_when(when: str, *, fallback_date: dt.date) -> dt.date:
+    if not when:
+        return fallback_date
+    try:
+        return dt.datetime.fromisoformat(when.replace("Z", "+00:00")).date()
+    except ValueError:
+        return fallback_date
 
 
 def parse_apollo_data(html_text: str, *, source_url: str = "") -> JsonObject:
@@ -291,18 +304,19 @@ def extract_showtimes(
         showtime_id = str(showtime.get("showtimeId") or showtime.get("id") or "")
         if not showtime_id:
             continue
+        showtime_day = showtime_date_from_when(str(showtime.get("when") or ""), fallback_date=date)
         movie_ref = object_ref(showtime.get("movie"))
         movie = resolve_ref(apollo_data, movie_ref)
         attribute_names = extract_attribute_names(apollo_data, showtime)
         rows.append(
             ShowtimeRecord(
                 theatre_slug=theatre_slug,
-                date=date.isoformat(),
+                date=showtime_day.isoformat(),
                 showtime_id=showtime_id,
                 when=str(showtime.get("when") or ""),
                 movie_name=str((movie or {}).get("name") or ""),
                 movie_id=object_id(movie, movie_ref),
-                showtime_url=showtime_url(date, theatre_slug, showtime_id),
+                showtime_url=showtime_url(showtime_day, theatre_slug, showtime_id),
                 attribute_names="|".join(attribute_names),
             )
         )
@@ -496,9 +510,26 @@ def collect_showtimes(
         raise ValueError("end_date must be on or after start_date")
 
     rows: list[ShowtimeRecord] = []
-    day = start_date
-    while day <= end_date:
+    target_dates = {
+        start_date + dt.timedelta(days=offset)
+        for offset in range((end_date - start_date).days + 1)
+    }
+    pending_dates = set(target_dates)
+    seen_showtime_ids: set[str] = set()
+    while pending_dates:
+        day = min(pending_dates)
         day_rows = fetch_showtimes_for_date(fetcher, theatre_slug=theatre_slug, date=day)
+        day_rows = [
+            row
+            for row in day_rows
+            if dt.date.fromisoformat(row.date) in target_dates and row.showtime_id not in seen_showtime_ids
+        ]
+        for row in day_rows:
+            seen_showtime_ids.add(row.showtime_id)
+        observed_dates = {dt.date.fromisoformat(row.date) for row in day_rows}
+        pending_dates.difference_update(observed_dates)
+        pending_dates.discard(day)
+
         if with_seat_fill:
             day_rows = [
                 replace(
@@ -513,13 +544,12 @@ def collect_showtimes(
                     fetch_seat_fill(
                         fetcher,
                         theatre_slug=theatre_slug,
-                        date=day,
+                        date=dt.date.fromisoformat(row.date),
                         showtime_id=row.showtime_id,
                     )
                 ]
             ]
         rows.extend(day_rows)
-        day += dt.timedelta(days=1)
     return rows
 
 

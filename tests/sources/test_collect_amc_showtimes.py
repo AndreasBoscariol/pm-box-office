@@ -348,6 +348,40 @@ class CollectAmcShowtimesTests(unittest.TestCase):
         self.assertEqual([1, 1], [row.filled_or_unavailable_seats for row in rows])
         self.assertEqual(3, len(fetcher.urls))
 
+    def test_collect_showtimes_skips_dates_already_embedded_in_prior_page(self) -> None:
+        day = dt.date(2026, 7, 1)
+        theatre_slug = "amc-sample-10"
+        payload = {
+            "Movie:movie-1": {
+                "__typename": "Movie",
+                "id": "movie-1",
+                "name": "Sample One",
+            },
+            "Showtime:100": {
+                "__typename": "Showtime",
+                "showtimeId": "100",
+                "when": "2026-07-01T19:00:00-04:00",
+                "movie": {"__ref": "Movie:movie-1"},
+            },
+            "Showtime:101": {
+                "__typename": "Showtime",
+                "showtimeId": "101",
+                "when": "2026-07-02T19:00:00-04:00",
+                "movie": {"__ref": "Movie:movie-1"},
+            },
+        }
+        fetcher = FakeFetcher({amc.showtimes_url(day, theatre_slug): apollo_html(payload)})
+
+        rows = amc.collect_showtimes(
+            fetcher,  # type: ignore[arg-type]
+            theatre_slug=theatre_slug,
+            start_date=day,
+            end_date=day + dt.timedelta(days=1),
+        )
+
+        self.assertEqual(["2026-07-01", "2026-07-02"], [row.date for row in rows])
+        self.assertEqual([amc.showtimes_url(day, theatre_slug)], fetcher.urls)
+
     def test_fetch_seat_fill_reports_current_non_apollo_seat_pages(self) -> None:
         fetcher = FakeFetcher(
             {
