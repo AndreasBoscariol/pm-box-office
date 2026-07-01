@@ -47,6 +47,7 @@ class CandidateMovie:
     release_run_id: int
     opening_date: str
     opening_theaters: int | None
+    opening_day_gross_usd: int | None
     opening_weekend_revenue_usd: int | None
 
 
@@ -279,6 +280,7 @@ def initialize_wikipedia_database(conn: Any) -> None:
                 opening.movie_id,
                 opening.opening_date,
                 opening_day.theaters AS opening_theaters,
+                opening_day.gross_usd AS opening_day_gross_usd,
                 SUM(weekend.gross_usd) AS opening_weekend_revenue_usd
             FROM opening
             JOIN daily_box_office opening_day
@@ -293,7 +295,8 @@ def initialize_wikipedia_database(conn: Any) -> None:
                 opening.release_run_id,
                 opening.movie_id,
                 opening.opening_date,
-                opening_day.theaters;
+                opening_day.theaters,
+                opening_day.gross_usd;
 
             CREATE VIEW wiki_movie_time_features AS
             WITH matched AS (
@@ -304,6 +307,7 @@ def initialize_wikipedia_database(conn: Any) -> None:
                     bof.release_run_id,
                     bof.opening_date,
                     bof.opening_theaters,
+                    bof.opening_day_gross_usd,
                     bof.opening_weekend_revenue_usd
                 FROM movie_wiki_pages mwp
                 JOIN box_office_opening_features bof ON bof.movie_id = mwp.movie_id
@@ -385,6 +389,7 @@ def initialize_wikipedia_database(conn: Any) -> None:
                       AND (hr.rev_date::date - m.opening_date::date) <= d.movie_time_day
                 ), 0) AS R,
                 m.opening_theaters,
+                m.opening_day_gross_usd,
                 m.opening_weekend_revenue_usd
             FROM days d
             JOIN matched m
@@ -439,6 +444,7 @@ def select_candidate_movies(
             bof.release_run_id,
             bof.opening_date,
             bof.opening_theaters,
+            bof.opening_day_gross_usd,
             bof.opening_weekend_revenue_usd
         FROM movies m
         JOIN box_office_opening_features bof ON bof.movie_id = m.movie_id
@@ -465,7 +471,8 @@ def select_candidate_movies(
             release_run_id=int(row[4]),
             opening_date=row[5],
             opening_theaters=row[6],
-            opening_weekend_revenue_usd=row[7],
+            opening_day_gross_usd=row[7],
+            opening_weekend_revenue_usd=row[8],
         )
         for row in rows
     ]

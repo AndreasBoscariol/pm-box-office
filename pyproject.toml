@@ -19,6 +19,7 @@ dependencies = [
   "joblib>=1.4",
   "matplotlib>=3.9",
   "fake-useragent>=2.0",
+  "playwright>=1.45",
 ]
 
 [project.scripts]
@@ -26,10 +27,13 @@ pm-box-office-amc-worker = "pm_box_office.sources.amc.jobs.worker:main"
 pm-box-office-collect-amc = "pm_box_office.sources.amc.collect:main"
 pm-box-office-polymarket-accounts = "pm_box_office.sources.polymarket.accounts:main"
 pm-box-office-boxofficepro-ingest = "pm_box_office.sources.boxofficepro.ingest:main"
+pm-box-office-competition-opening-weekend = "pm_box_office.research.papers.recreate_competition_opening_weekend:main"
+pm-box-office-day-by-day-opening-weekend = "pm_box_office.research.papers.recreate_day_by_day_opening_weekend:main"
 pm-box-office-scrape-the-numbers = "pm_box_office.sources.the_numbers.ingest:main"
 pm-box-office-audience-ingest = "pm_box_office.sources.audience.ingest:main"
 pm-box-office-train-amc = "pm_box_office.models.train:main"
 pm-box-office-wikipedia-ingest = "pm_box_office.sources.wikipedia.ingest:main"
+pm-box-office-evaluate-boxofficepro = "pm_box_office.models.evaluate_boxofficepro:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

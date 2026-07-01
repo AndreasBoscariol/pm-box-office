@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Opening Weekend Forecasts</title>
+    <link rel="stylesheet" href="/static/app.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>Opening Weekend Forecasts</h1>
+          <span class="subtle">BOP-anchored day-by-day forecast path</span>
+        </div>
+        <div class="actions">
+          <a class="button-link" href="/">AMC Campaigns</a>
+          <a class="button-link" href="/sources">Ingest sources</a>
+        </div>
+      </header>
+
+      <section class="forecast-search-panel">
+        <label class="label" for="forecast-movie-search">Movie</label>
+        <div class="forecast-search-row">
+          <input
+            id="forecast-movie-search"
+            type="search"
+            placeholder="Search BOP-matched movies"
+            autocomplete="off"
+            aria-label="Search BOP-matched movies"
+          >
+          <button id="forecast-search-button" type="button">Search</button>
+        </div>
+        <div id="forecast-search-results" class="forecast-search-results"></div>
+      </section>
+
+      <section id="forecast-empty" class="notice">
+        Search for a BOP-matched movie to view the opening-weekend forecast path.
+      </section>
+
+      <section id="forecast-view" hidden>
+        <div class="section-head compact-head">
+          <h1 id="forecast-title">Movie</h1>
+          <span id="forecast-subtitle"></span>
+        </div>
+
+        <section class="status-strip forecast-summary" aria-label="Forecast summary">
+          <div>
+            <span class="label">Latest forecast</span>
+            <strong id="latest-prediction">-</strong>
+            <small id="latest-interval">-</small>
+          </div>
+          <div>
+            <span class="label">BOP midpoint</span>
+            <strong id="latest-bop">-</strong>
+            <small id="latest-bop-date">-</small>
+          </div>
+          <div>
+            <span class="label">Model</span>
+            <strong id="latest-model">-</strong>
+            <small id="latest-as-of">-</small>
+          </div>
+          <div>
+            <span class="label">Coverage</span>
+            <strong id="feature-coverage">-</strong>
+            <small>BOP · Wiki · Competition</small>
+          </div>
+        </section>
+
+        <div id="forecast-chart" class="forecast-chart-wrap"></div>
+
+        <section>
+          <div class="section-head compact-head">
+            <h1>Daily snapshots</h1>
+            <span id="snapshot-count">0 rows</span>
+          </div>
+          <div class="forecast-table">
+            <div class="forecast-row head">
+              <span>Day</span>
+              <span>As of</span>
+              <span>Prediction</span>
+              <span>80% interval</span>
+              <span>BOP midpoint</span>
+              <span>Model</span>
+              <span>Signals</span>
+            </div>
+            <div id="forecast-snapshot-rows"></div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script>
+      const selectedMovieId = "{{ selected_movie_id }}";
+      const searchInput = document.getElementById("forecast-movie-search");
+      const searchButton = document.getElementById("forecast-search-button");
+      const resultsEl = document.getElementById("forecast-search-results");
+      const emptyEl = document.getElementById("forecast-empty");
+      const viewEl = document.getElementById("forecast-view");
+      let searchTimer = null;
+
+      function text(value) {
+        return value === null || value === undefined || value === "" ? "-" : String(value);
+      }
+
+      function setLoading(message) {
+        resultsEl.innerHTML = `<div class="empty-row">${message}</div>`;
+      }
+
+      async function searchMovies() {
+        const query = searchInput.value.trim();
+        if (query.length < 2) {
+          resultsEl.innerHTML = "";
+          return;
+        }
+        setLoading("Searching...");
+        const response = await fetch(`/forecasts/movies?q=${encodeURIComponent(query)}`);
+        const payload = await response.json();
+        renderSearchResults(payload.movies || []);
+      }
+
+      function renderSearchResults(movies) {
+        if (!movies.length) {
+          resultsEl.innerHTML = `<div class="empty-row">No BOP-matched movies found.</div>`;
+          return;
+        }
+        resultsEl.innerHTML = movies.map((movie) => `
+          <button class="forecast-result" type="button" data-movie-id="${movie.movie_id}">
+            <span>${movie.title}</span>
+            <small>${movie.opening_date} · ${movie.latest_bop_midpoint_label}</small>
+          </button>
+        `).join("");
+      }
+
+      async function loadForecast(movieId) {
+        emptyEl.hidden = true;
+        viewEl.hidden = false;
+        document.getElementById("forecast-chart").innerHTML = "";
+        document.getElementById("forecast-snapshot-rows").innerHTML = `<div class="empty-row">Loading forecast...</div>`;
+        const response = await fetch(`/forecasts/movies/${movieId}`);
+        if (!response.ok) {
+          document.getElementById("forecast-snapshot-rows").innerHTML = `<div class="empty-row">Forecast not found.</div>`;
+          return;
+        }
+        renderForecast(await response.json());
+      }
+
+      function renderForecast(payload) {
+        const movie = payload.movie;
+        const latest = payload.latest_snapshot;
+        const features = payload.feature_availability || {};
+        document.getElementById("forecast-title").textContent = movie.title;
+        document.getElementById("forecast-subtitle").textContent = `${movie.opening_date} · ${movie.release_timing_label}`;
+        document.getElementById("latest-prediction").textContent = latest ? latest.predicted_opening_weekend_revenue_label : "-";
+        document.getElementById("latest-interval").textContent = latest ? `${latest.predicted_lower_80_label} - ${latest.predicted_upper_80_label}` : "No prediction yet";
+        document.getElementById("latest-bop").textContent = movie.latest_bop_midpoint_label;
+        document.getElementById("latest-bop-date").textContent = movie.latest_forecast_date;
+        document.getElementById("latest-model").textContent = latest ? latest.model : "-";
+        document.getElementById("latest-as-of").textContent = latest ? `as of ${latest.as_of_date}` : "-";
+        document.getElementById("feature-coverage").textContent = `${features.bop_days || 0} · ${features.wiki_days || 0} · ${features.competition_days || 0}`;
+        document.getElementById("forecast-chart").innerHTML = payload.chart_svg || "";
+        document.getElementById("snapshot-count").textContent = `${payload.snapshots.length} rows`;
+        renderSnapshotRows(payload.snapshots || []);
+        window.history.replaceState({}, "", `/forecasts?movie_id=${movie.movie_id}`);
+      }
+
+      function renderSnapshotRows(snapshots) {
+        const rowsEl = document.getElementById("forecast-snapshot-rows");
+        if (!snapshots.length) {
+          rowsEl.innerHTML = `<div class="empty-row">No visible pre-release snapshots yet.</div>`;
+          return;
+        }
+        rowsEl.innerHTML = snapshots.map((row) => `
+          <div class="forecast-row">
+            <span>t=${row.snapshot_day}</span>
+            <span>${row.as_of_date}</span>
+            <span>${row.predicted_opening_weekend_revenue_label}</span>
+            <span>${row.predicted_lower_80_label} - ${row.predicted_upper_80_label}</span>
+            <span>${row.bop_forecast_midpoint_label}</span>
+            <span>${row.model || row.status}</span>
+            <span>${row.bop_forecast_available ? "BOP" : "-"} · ${row.wiki_available ? "Wiki" : "-"} · ${row.competition_available ? "Comp" : "-"}</span>
+          </div>
+        `).join("");
+      }
+
+      searchInput.addEventListener("input", () => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(searchMovies, 180);
+      });
+      searchButton.addEventListener("click", searchMovies);
+      resultsEl.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-movie-id]");
+        if (button) loadForecast(button.dataset.movieId);
+      });
+      if (selectedMovieId) loadForecast(selectedMovieId);
+    </script>
+  </body>
+</html>

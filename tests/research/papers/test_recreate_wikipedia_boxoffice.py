@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from pm_box_office.research.papers import recreate_wikipedia_boxoffice as recreate
 from pm_box_office.sources.wikipedia import ingest
@@ -124,6 +126,175 @@ class WikipediaBoxOfficeParserTests(unittest.TestCase):
         self.assertEqual("en", args.language)
         self.assertEqual(-500, args.day_start)
         self.assertEqual(100, args.day_end)
+        self.assertFalse(args.quartile_results)
+        self.assertFalse(args.next_day_analysis)
+        self.assertFalse(args.next_day_time_validation)
+        self.assertFalse(args.opening_weekend_time_validation)
+        self.assertEqual("opening_day_gross", args.quartile_basis)
+        self.assertEqual(2024, args.train_through_year)
+        self.assertEqual(2025, args.test_start_year)
+        self.assertEqual(2026, args.test_end_year)
+        self.assertEqual("svg", args.plot_format)
+
+
+def make_extension_sample() -> recreate.Sample:
+    movies = []
+    predictors = {}
+    for idx, opening_day_gross in enumerate([100.0, 100.0, 200.0, 300.0, 400.0], start=1):
+        movie_id = str(idx)
+        movies.append(
+            recreate.Movie(
+                movie_id=movie_id,
+                title=f"Movie {idx}",
+                wiki_title=f"Movie_{idx}",
+                revenue=opening_day_gross * 3,
+                theaters=1000 + idx,
+                release_date="2026-05-01",
+                opening_day_gross=opening_day_gross,
+                release_run_id=idx,
+                inception_days=-1,
+            )
+        )
+        predictors[movie_id] = {
+            -1: {"V": float(idx), "U": 1.0, "R": 1.0, "E": 1.0},
+            0: {"V": float(idx * 10), "U": 2.0, "R": 2.0, "E": 2.0},
+            1: {"V": float(idx * 10 + 5), "U": 3.0, "R": 3.0, "E": 3.0},
+        }
+    return recreate.Sample("fixture", movies, predictors)
+
+
+class WikipediaBoxOfficeExtensionTests(unittest.TestCase):
+    def test_opening_day_quartiles_keep_ties_together(self) -> None:
+        sample = make_extension_sample()
+
+        quartiles = recreate.assign_opening_day_quartiles(sample)
+
+        self.assertEqual(quartiles["1"], quartiles["2"])
+        self.assertEqual(1, quartiles["1"])
+        self.assertEqual(2, quartiles["3"])
+        self.assertEqual(3, quartiles["4"])
+        self.assertEqual(4, quartiles["5"])
+
+    def test_next_day_panel_uses_only_features_available_on_current_day(self) -> None:
+        sample = make_extension_sample()
+        movie = sample.movies[0]
+        sample = recreate.Sample("single", [movie], {movie.movie_id: sample.predictors[movie.movie_id]})
+        quartiles = recreate.assign_opening_day_quartiles(sample)
+
+        rows = recreate.build_next_day_panel_rows(sample, {"1": {0: 100.0, 1: 200.0, 2: 50.0}}, quartiles)
+
+        self.assertEqual([0, 1], [row["movie_time_day"] for row in rows])
+        self.assertEqual(10.0, rows[0]["V"])
+        self.assertEqual(9.0, rows[0]["V_delta_1"])
+        self.assertEqual(15.0, rows[1]["V"])
+        self.assertEqual(5.0, rows[1]["V_delta_1"])
+        self.assertEqual(200.0, rows[0]["next_day_gross_usd"])
+
+    def test_fixed_quartile_thresholds_use_training_years_only(self) -> None:
+        sample = make_extension_sample()
+        for index, movie in enumerate(sample.movies):
+            movie.release_date = "2024-05-01" if index < 4 else "2026-05-01"
+
+        thresholds = recreate.fixed_quartile_thresholds(sample, train_through_year=2024)
+        quartiles = recreate.assign_opening_day_quartiles_from_thresholds(sample, thresholds)
+
+        self.assertEqual([100.0, 100.0, 200.0], thresholds)
+        self.assertEqual(4, quartiles["5"])
+
+    def test_time_split_next_day_validation_scores_only_holdout_years(self) -> None:
+        sample = make_extension_sample()
+        for index, movie in enumerate(sample.movies):
+            movie.release_date = "2024-05-01" if index < 4 else "2026-05-01"
+        thresholds = recreate.fixed_quartile_thresholds(sample, train_through_year=2024)
+        quartiles = recreate.assign_opening_day_quartiles_from_thresholds(sample, thresholds)
+        daily_actuals = {
+            movie.movie_id: {0: movie.opening_day_gross or 1.0, 1: (movie.opening_day_gross or 1.0) * 0.8}
+            for movie in sample.movies
+        }
+        panel_rows = recreate.build_next_day_panel_rows(sample, daily_actuals, quartiles)
+
+        predictions, metrics = recreate.time_split_next_day_prediction_and_metric_rows(
+            panel_rows,
+            train_through_year=2024,
+            test_start_year=2025,
+            test_end_year=2026,
+        )
+
+        self.assertTrue(predictions)
+        self.assertTrue(metrics)
+        self.assertEqual({"2026-05-01"}, {row["release_date"] for row in predictions})
+
+    def test_opening_weekend_time_validation_scores_only_holdout_years(self) -> None:
+        sample = make_extension_sample()
+        for index, movie in enumerate(sample.movies):
+            movie.release_date = "2024-05-01" if index < 4 else "2026-05-01"
+        thresholds = recreate.fixed_quartile_thresholds(sample, train_through_year=2024)
+        quartiles = recreate.assign_opening_day_quartiles_from_thresholds(sample, thresholds)
+
+        predictions, metrics = recreate.opening_weekend_time_validation_rows(
+            sample,
+            quartiles=quartiles,
+            days=[0],
+            train_through_year=2024,
+            test_start_year=2025,
+            test_end_year=2026,
+        )
+
+        self.assertTrue(predictions)
+        self.assertTrue(metrics)
+        self.assertEqual({"2026-05-01"}, {row["release_date"] for row in predictions})
+        self.assertIn("log_all_q4_interactions", {row["model"] for row in metrics})
+
+    def test_extension_writer_creates_expected_csv_and_svg_artifacts(self) -> None:
+        sample = make_extension_sample()
+        for index, movie in enumerate(sample.movies):
+            movie.release_date = "2024-05-01" if index < 4 else "2026-05-01"
+        daily_actuals = {
+            movie.movie_id: {0: movie.opening_day_gross or 1.0, 1: (movie.opening_day_gross or 1.0) * 0.8}
+            for movie in sample.movies
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+
+            recreate.write_fresh_extension_outputs(
+                out_dir=out_dir,
+                sample=sample,
+                quartile_basis="opening_day_gross",
+                quartile_days=[-1, 0, 1],
+                folds=2,
+                seed=7,
+                day_start=-1,
+                day_end=1,
+                daily_actuals=daily_actuals,
+                time_validation=True,
+                opening_weekend_time_validation=True,
+                train_through_year=2024,
+                test_start_year=2025,
+                test_end_year=2026,
+            )
+
+            for filename in [
+                "fresh_opening_day_quartiles.csv",
+                "fresh_wiki_quartile_summary.csv",
+                "fresh_quartile_model_metrics.csv",
+                "fresh_next_day_panel.csv",
+                "fresh_next_day_model_metrics.csv",
+                "fresh_next_day_predictions.csv",
+                "fresh_figure_opening_day_quartile_distribution.svg",
+                "fresh_figure_wiki_features_by_quartile.svg",
+                "fresh_figure_correlations_by_quartile.svg",
+                "fresh_figure_cv_r2_by_quartile.svg",
+                "fresh_figure_next_day_model_lift.svg",
+                "fresh_figure_next_day_error_by_release_age.svg",
+                "fresh_figure_wiki_momentum_vs_next_day_ratio.svg",
+                "fresh_figure_prediction_residuals_by_quartile.svg",
+                "fresh_time_validation_bucket_thresholds.csv",
+                "fresh_next_day_time_validation_metrics.csv",
+                "fresh_next_day_time_validation_predictions.csv",
+                "fresh_opening_weekend_time_validation_metrics.csv",
+                "fresh_opening_weekend_time_validation_predictions.csv",
+            ]:
+                self.assertTrue((out_dir / filename).exists(), filename)
 
 
 class WikipediaBoxOfficeFreshTests(unittest.TestCase):
@@ -206,6 +377,16 @@ class WikipediaBoxOfficeFreshTests(unittest.TestCase):
         self.assertEqual((10.0, 1.0, 1.0, 1.0), (values[-1]["V"], values[-1]["U"], values[-1]["R"], values[-1]["E"]))
         self.assertEqual((10.0, 2.0, 2.0, 3.0), (values[0]["V"], values[0]["U"], values[0]["R"], values[0]["E"]))
         self.assertEqual((40.0, 2.0, 2.0, 3.0), (values[1]["V"], values[1]["U"], values[1]["R"], values[1]["E"]))
+
+    def test_fresh_loader_keeps_opening_day_gross_separate_from_opening_weekend(self) -> None:
+        sample, coverage = recreate.load_fresh_sample(self.conn, day_start=-1, day_end=1)
+
+        movie = next(movie for movie in sample.movies if movie.movie_id == "1")
+        row = next(row for row in coverage if row["movie_id"] == 1)
+        self.assertEqual(100.0, movie.opening_day_gross)
+        self.assertEqual(600.0, movie.revenue)
+        self.assertEqual(100, row["opening_day_gross_usd"])
+        self.assertEqual(600, row["opening_weekend_revenue_usd"])
 
 
 if __name__ == "__main__":

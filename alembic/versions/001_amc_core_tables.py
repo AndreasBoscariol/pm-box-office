@@ -48,6 +48,8 @@ def downgrade() -> None:
         "amc_showtimes",
         "movie_source_ids",
         "movies",
+        "amc_theatre_sample_members",
+        "amc_theatre_sample_sets",
         "amc_movies",
         "amc_theatres",
     ):

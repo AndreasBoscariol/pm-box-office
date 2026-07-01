@@ -12,6 +12,8 @@ from pm_box_office.sources.amc.db import (
     MovieInventoryRow,
     StoredShowtime,
     StoredTheatre,
+    TheatreSampleMember,
+    TheatreSampleSet,
 )
 from pm_box_office.sources.amc.parsers import SeatFill, ShowtimeRecord
 from pm_box_office.sources.amc.sitemap import AmcTheatre
@@ -24,4 +26,6 @@ __all__ = [
     "ShowtimeRecord",
     "StoredShowtime",
     "StoredTheatre",
+    "TheatreSampleMember",
+    "TheatreSampleSet",
 ]

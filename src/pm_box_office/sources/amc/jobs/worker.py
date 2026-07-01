@@ -13,6 +13,7 @@ from pathlib import Path
 from pm_box_office.db.connection import connect_database
 from pm_box_office.sources.amc import db
 from pm_box_office.sources.amc.client import DEFAULT_CACHE_DIR, DEFAULT_USER_AGENT, HtmlFetcher
+from pm_box_office.sources.amc.diagnostics import diagnostics_context, log_backoff_event, short_error
 from pm_box_office.sources.amc.jobs import handlers, queue
 
 
@@ -29,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stale-running-minutes", type=int, default=5)
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--heartbeat-path", type=Path, default=Path("data/run/amc_worker.heartbeat"))
-    parser.add_argument("--delay-seconds", type=float, default=1.0)
+    parser.add_argument("--delay-seconds", type=float, default=3.0)
     parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
     parser.add_argument("--verbose", action="store_true")
     return parser
@@ -79,21 +80,27 @@ def run_worker(args: argparse.Namespace) -> int:
                     task.showtime_id,
                     task.attempt_count,
                 )
-                try:
-                    handlers.execute(conn, fetcher, task)
-                    queue.mark_succeeded(conn, task.task_id)
-                    conn.commit()
-                    LOGGER.info("task succeeded task_id=%s", task.task_id)
-                except Exception as exc:
-                    LOGGER.exception("task failed task_id=%s", task.task_id)
-                    conn.rollback()
+                with diagnostics_context(**task_diagnostics_fields(args.worker_id, task)):
                     try:
-                        queue.schedule_retry_or_fail(conn, task.task_id, exc)
+                        handlers.execute(conn, fetcher, task)
+                        queue.mark_succeeded(conn, task.task_id)
                         conn.commit()
-                    except Exception:
-                        LOGGER.exception("could not mark task failed task_id=%s", task.task_id)
+                        LOGGER.info("task succeeded task_id=%s", task.task_id)
+                    except Exception as exc:
+                        LOGGER.exception("task failed task_id=%s", task.task_id)
+                        log_backoff_event(
+                            "seat_task_failed",
+                            error_type=type(exc).__name__,
+                            error_message=short_error(exc),
+                        )
                         conn.rollback()
-                    continue
+                        try:
+                            queue.schedule_retry_or_fail(conn, task.task_id, exc)
+                            conn.commit()
+                        except Exception:
+                            LOGGER.exception("could not mark task failed task_id=%s", task.task_id)
+                            conn.rollback()
+                        continue
             if args.once:
                 LOGGER.info("processed one batch; exiting because --once was set")
                 return 0
@@ -108,6 +115,24 @@ def main() -> int:
 def write_heartbeat(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(time.time()), encoding="utf-8")
+
+
+def task_diagnostics_fields(worker_id: str, task: db.CollectionTask) -> dict[str, object]:
+    now = db.utc_now()
+    scheduled_for = db.ensure_utc(task.scheduled_for)
+    return {
+        "worker_id": worker_id,
+        "task_id": task.task_id,
+        "run_id": str(task.run_id),
+        "task_type": task.task_type,
+        "showtime_id": task.showtime_id,
+        "amc_movie_id": task.amc_movie_id,
+        "amc_theatre_id": task.amc_theatre_id,
+        "scheduled_for": scheduled_for,
+        "target_offset_minutes": task.priority or 5,
+        "attempt_count": task.attempt_count,
+        "seconds_late_at_start": max(0, int((now - scheduled_for).total_seconds())),
+    }
 
 
 if __name__ == "__main__":

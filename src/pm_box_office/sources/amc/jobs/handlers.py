@@ -7,6 +7,7 @@ from typing import Any
 
 from pm_box_office.sources.amc import db
 from pm_box_office.sources.amc.client import HtmlFetcher
+from pm_box_office.sources.amc.diagnostics import diagnostics_context
 from pm_box_office.sources.amc.services import seat_service, showtime_service
 
 
@@ -40,12 +41,13 @@ def _collect_seat_snapshot(conn: Any, fetcher: HtmlFetcher, task: db.CollectionT
     showtime = db.select_showtime_by_id(conn, task.showtime_id)
     if showtime is None:
         raise ValueError(f"No AMC showtime found for task {task.task_id}: {task.showtime_id}")
-    seat_service.collect_snapshot(
-        conn,
-        fetcher,
-        showtime=showtime,
-        target_offset_minutes=task.priority or 5,
-    )
+    with diagnostics_context(amc_theatre_id=showtime.amc_theatre_id):
+        seat_service.collect_snapshot(
+            conn,
+            fetcher,
+            showtime=showtime,
+            target_offset_minutes=task.priority or 5,
+        )
 
 
 def run_exhibition_date(conn: Any, task: db.CollectionTask) -> dt.date:

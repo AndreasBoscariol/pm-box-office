@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, Request
@@ -16,6 +18,7 @@ from pm_box_office.web.db_init import ensure_initialized
 
 WEB_ROOT = Path(__file__).resolve().parents[1]
 router = APIRouter()
+HIDDEN_SOURCE_KEYS = {"amc_worker"}
 templates = Jinja2Templates(
     env=Environment(
         loader=FileSystemLoader(str(WEB_ROOT / "templates")),
@@ -23,6 +26,47 @@ templates = Jinja2Templates(
         cache_size=0,
     )
 )
+templates.env.filters["time_ago"] = lambda value: time_ago(value)
+
+
+def visible_ingest_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in items if item.get("source_key") not in HIDDEN_SOURCE_KEYS]
+
+
+def time_ago(value: object) -> str:
+    timestamp = coerce_datetime(value)
+    if timestamp is None:
+        return "Never"
+
+    now = dt.datetime.now(timestamp.tzinfo or dt.UTC)
+    if timestamp.tzinfo is None:
+        now = now.replace(tzinfo=None)
+
+    seconds = max(0, int((now - timestamp).total_seconds()))
+    if seconds < 60:
+        return "Just now"
+
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+
+    days = hours // 24
+    return f"{days} day{'s' if days != 1 else ''} ago"
+
+
+def coerce_datetime(value: object) -> dt.datetime | None:
+    if isinstance(value, dt.datetime):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
 
 
 @router.get("/sources")
@@ -31,8 +75,8 @@ def sources_dashboard(request: Request) -> object:
     try:
         ensure_initialized(conn)
         repository.refresh_all_source_freshness(conn)
-        sources = repository.list_source_summaries(conn)
-        recent_runs = repository.list_recent_runs(conn, limit=12)
+        sources = visible_ingest_items(repository.list_source_summaries(conn))
+        recent_runs = visible_ingest_items(repository.list_recent_runs(conn, limit=50))[:12]
         log_tails = {str(run["run_id"]): repository.list_log_tail(conn, run["run_id"], limit=40) for run in recent_runs[:4]}
         conn.commit()
     finally:
@@ -95,4 +139,3 @@ def source_run_logs(request: Request, run_id: str) -> object:
         context={"request": request, "run_id": run_id, "logs": logs},
         request=request,
     )
-

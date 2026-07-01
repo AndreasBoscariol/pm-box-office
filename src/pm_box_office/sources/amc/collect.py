@@ -15,19 +15,16 @@ from pm_box_office.sources.amc.client import DEFAULT_CACHE_DIR, DEFAULT_USER_AGE
 from pm_box_office.sources.amc.parsers import (
     extract_rendered_showtimes,
     extract_showtimes,
-    fetch_seat_fill,
     maybe_parse_apollo_data,
     showtimes_url,
 )
-from pm_box_office.sources.amc.sampling import stratified_sample
-from pm_box_office.sources.amc.scheduler import (
-    DEFAULT_OFFSETS_MINUTES,
-    due_snapshots,
-    theatres_in_local_morning,
+from pm_box_office.sources.amc.services import (
+    movie_service,
+    progress_service,
+    sample_service,
+    showtime_service,
+    theatre_service,
 )
-from pm_box_office.sources.amc.services import movie_service, progress_service, showtime_service, theatre_service
-from pm_box_office.sources.amc.sitemap import fetch_theatre_sitemap, parse_theatre_sitemap
-from pm_box_office.sources.amc.timezones import UTC
 
 
 DATABASE_URL_HELP = "PostgreSQL URL. Defaults to DATABASE_URL/POSTGRES_DSN/.env."
@@ -48,13 +45,6 @@ def parse_date(value: str) -> dt.date:
         return dt.date.fromisoformat(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"Expected YYYY-MM-DD date, got {value!r}") from exc
-
-
-def parse_utc_datetime(value: str) -> dt.datetime:
-    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
 
 
 def parse_offsets(value: str) -> tuple[int, ...]:
@@ -109,24 +99,6 @@ def add_command_parser(
 
 def connect_cli_database(args: Any) -> Any:
     return connect_database(getattr(args, "database_url", None))
-
-
-def target_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--target-amc-movie-id", help="AMC movie ID to follow up.")
-    parser.add_argument("--target-amc-movie-name", help="Exact AMC movie name to follow up.")
-
-
-def require_target(args: Any) -> None:
-    if not args.target_amc_movie_id and not args.target_amc_movie_name:
-        raise SystemExit("Provide --target-amc-movie-id or --target-amc-movie-name")
-
-
-def target_matches(row: Any, *, target_id: str | None, target_name: str | None) -> bool:
-    if target_id and row.movie_id == target_id:
-        return True
-    if target_name and row.movie_name.lower() == target_name.lower():
-        return True
-    return False
 
 
 def fetch_showtime_rows(fetcher: HtmlFetcher, *, theatre_slug: str, target_date: dt.date) -> tuple[list[Any], str]:
@@ -195,30 +167,6 @@ def choose_movie_option(options: list[MovieOption], *, selection: int | None = N
     if selection < 1 or selection > len(options):
         raise SystemExit(f"Selection must be between 1 and {len(options)}")
     return options[selection - 1]
-
-
-def ensure_theatres_available(conn: Any, fetcher: HtmlFetcher) -> int:
-    if db.select_largest_theatre(conn) is not None:
-        return 0
-    xml_text, _cache_path = fetch_theatre_sitemap(fetcher)
-    theatres = parse_theatre_sitemap(xml_text)
-    return db.upsert_theatres(conn, theatres)
-
-
-def describe_local_window_block(
-    *,
-    active_count: int,
-    now_utc: dt.datetime,
-    start_hour: int,
-    end_hour: int,
-) -> str:
-    return (
-        f"No theatres are currently in the local morning window "
-        f"{start_hour:02d}:00-{end_hour:02d}:00. "
-        f"Active theatres before filtering: {active_count}. "
-        f"Current UTC time used: {now_utc.isoformat()}. "
-        "For an ad-hoc/backfill run, add --ignore-local-window."
-    )
 
 
 def cmd_init_db(args: Any) -> int:
@@ -296,6 +244,31 @@ def cmd_toggle_movie(args: Any) -> int:
     return 0
 
 
+def cmd_select_the_numbers_active(args: Any) -> int:
+    conn = connect_cli_database(args)
+    try:
+        db.initialize_amc_database(conn)
+        matches = movie_service.select_the_numbers_active_movies(
+            conn,
+            exhibition_date=args.target_date,
+            lookback_days=args.lookback_days,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    print(
+        f"Selected {len(matches)} AMC movies for {args.target_date.isoformat()} "
+        f"with The Numbers daily chart activity in the last {args.lookback_days} days."
+    )
+    for match in matches:
+        print(
+            f"- {match.amc_movie_name} (AMC {match.amc_movie_id}; "
+            f"The Numbers: {match.the_numbers_title}; latest {match.latest_box_office_date.isoformat()}; "
+            f"{match.recent_days_reported} days)"
+        )
+    return 0
+
+
 def cmd_create_seat_run(args: Any) -> int:
     conn = connect_cli_database(args)
     try:
@@ -304,11 +277,65 @@ def cmd_create_seat_run(args: Any) -> int:
             conn,
             exhibition_date=args.target_date,
             target_offsets_minutes=args.target_offsets_minutes,
+            sample_key=args.sample_key,
         )
         conn.commit()
     finally:
         conn.close()
-    print(f"Created seat collection run {run_id} with {task_count} tasks.")
+    print(f"Created sampled seat collection run {run_id} with {task_count} tasks.")
+    return 0
+
+
+def cmd_create_theatre_sample(args: Any) -> int:
+    conn = connect_cli_database(args)
+    try:
+        db.initialize_amc_database(conn)
+        sample_set = sample_service.ensure_default_theatre_sample(
+            conn,
+            sample_key=args.sample_key,
+            sample_size=args.sample_size,
+            certainty_count=args.certainty_count,
+            seed=args.seed,
+        )
+        members = sample_service.sample_members(conn, sample_set)
+        conn.commit()
+    finally:
+        conn.close()
+    print(
+        f"AMC theatre sample {sample_set.sample_key}: "
+        f"{len(members)}/{sample_set.frame_theatre_count} theatres, "
+        f"{sample_set.certainty_count} certainty, seed={sample_set.seed!r}."
+    )
+    return 0
+
+
+def cmd_sample_coverage(args: Any) -> int:
+    conn = connect_cli_database(args)
+    try:
+        db.initialize_amc_database(conn)
+        sample_set = sample_service.ensure_default_theatre_sample(conn, sample_key=args.sample_key)
+        coverage = sample_service.sample_coverage(conn, sample_set=sample_set, exhibition_date=args.target_date)
+        conn.rollback()
+    finally:
+        conn.close()
+    showtime_share = coverage.get("sampled_showtime_share")
+    screen_share = coverage.get("sampled_screen_share")
+    showtime_share_text = f"{showtime_share:.1%}" if isinstance(showtime_share, float) else "-"
+    screen_share_text = f"{screen_share:.1%}" if isinstance(screen_share, float) else "-"
+    print(
+        f"AMC sample {sample_set.sample_key} for {args.target_date.isoformat()}: "
+        f"{coverage.get('active_sample_theatres', 0)}/{coverage.get('active_theatres', 0)} theatres, "
+        f"{coverage.get('sampled_showtimes', 0)}/{coverage.get('full_showtimes', 0)} showtimes "
+        f"({showtime_share_text} share)"
+    )
+    print(
+        f"screens={coverage.get('sample_screens', 0)}/{coverage.get('active_screens', 0)} "
+        f"({screen_share_text} share), "
+        f"states={coverage.get('sample_states', 0)}, timezones={coverage.get('sample_timezones', 0)}, "
+        f"snapshots={coverage.get('snapshots', 0)}, "
+        f"missing_snapshots={coverage.get('missing_snapshots', 0)}, "
+        f"late_snapshots={coverage.get('late_snapshots', 0)}"
+    )
     return 0
 
 
@@ -355,191 +382,27 @@ def cmd_cancel_campaign(args: Any) -> int:
     return 0
 
 
-def cmd_morning_showtimes(args: Any) -> int:
-    require_target(args)
-    fetcher = build_fetcher(args)
-    target_date = args.target_date
-    now_utc = parse_utc_datetime(args.now_utc) if args.now_utc else dt.datetime.now(UTC)
+def cmd_reset_collection_state(args: Any) -> int:
+    if not args.confirm_reset:
+        raise SystemExit("Refusing to reset collection state without --confirm-reset.")
     conn = connect_cli_database(args)
     try:
         db.initialize_amc_database(conn)
-        seeded_theatres = ensure_theatres_available(conn, fetcher)
-        if seeded_theatres:
-            conn.commit()
-        all_theatres = db.select_active_theatres(conn)
-        theatres = all_theatres
-        if not args.ignore_local_window:
-            theatres = theatres_in_local_morning(
-                all_theatres,
-                now_utc=now_utc,
-                start_hour=args.morning_start_hour,
-                end_hour=args.morning_end_hour,
-            )
-            if not theatres:
-                raise SystemExit(
-                    describe_local_window_block(
-                        active_count=len(all_theatres),
-                        now_utc=now_utc,
-                        start_hour=args.morning_start_hour,
-                        end_hour=args.morning_end_hour,
-                    )
-                )
-        sample = stratified_sample(theatres, sample_size=args.sample_size, seed=args.seed)
-        selected_theatres = [item.theatre for item in sample]
-
-        showtime_count = 0
-        target_showtime_count = 0
-        for theatre in selected_theatres:
-            rows, cache_path = fetch_showtime_rows(fetcher, theatre_slug=theatre.slug, target_date=target_date)
-            showtime_count += len(rows)
-            target_showtime_count += sum(
-                1
-                for row in rows
-                if target_matches(
-                    row,
-                    target_id=args.target_amc_movie_id,
-                    target_name=args.target_amc_movie_name,
-                )
-            )
-            if not args.dry_run:
-                db.upsert_showtimes(
-                    conn,
-                    theatre=theatre,
-                    showtimes=rows,
-                    raw_cache_path=cache_path,
-                    fetched_at=now_utc,
-                )
-
-        if args.dry_run:
-            conn.rollback()
-        else:
-            conn.commit()
-    finally:
-        conn.close()
-
-    print(
-        "Collected "
-        f"{showtime_count} showtimes across {len(selected_theatres)} theatres; "
-        f"{target_showtime_count} matched the target."
-    )
-    return 0
-
-
-def cmd_select_movie(args: Any) -> int:
-    fetcher = build_fetcher(args)
-    conn = connect_cli_database(args)
-    try:
-        db.initialize_amc_database(conn)
-        seeded_theatres = ensure_theatres_available(conn, fetcher)
-        if seeded_theatres:
-            conn.commit()
-        if args.theatre_slug:
-            theatre = db.select_theatre_by_slug(conn, args.theatre_slug)
-            if theatre is None:
-                raise SystemExit(f"No active AMC theatre found with slug {args.theatre_slug!r}")
-        else:
-            theatre = db.select_largest_theatre(conn)
-            if theatre is None:
-                raise SystemExit("No active AMC theatres found. Run ingest-theatres first.")
-
-        rows, cache_path = fetch_showtime_rows(
-            fetcher,
-            theatre_slug=theatre.slug,
-            target_date=args.target_date,
-        )
-        options = movie_options_from_showtimes(rows)
-        print(
-            f"Scanned {theatre.name} ({theatre.slug}) for {args.target_date.isoformat()} "
-            f"from {cache_path}."
-        )
-        print(format_movie_options(options))
-        selected = choose_movie_option(options, selection=args.selection)
-        print()
-        print("Selected:")
-        print(f"--target-amc-movie-id {selected.amc_movie_id!r}")
-        print(f"--target-amc-movie-name {selected.amc_movie_name!r}")
-
-        if args.save_to_db:
-            db.upsert_amc_movie(
-                conn,
-                amc_movie_id=selected.amc_movie_id,
-                amc_movie_name=selected.amc_movie_name,
-            )
-            campaign_id = db.ensure_campaign(conn, args.target_date)
-            db.set_campaign_movie_selected(
-                conn,
-                campaign_id=campaign_id,
-                amc_movie_id=selected.amc_movie_id,
-                selected=True,
-            )
-            conn.commit()
-            print("Selected movie for the campaign date.")
-        else:
-            conn.rollback()
-    finally:
-        conn.close()
-    return 0
-
-
-def cmd_seat_snapshots(args: Any) -> int:
-    require_target(args)
-    fetcher = build_fetcher(args)
-    now_utc = parse_utc_datetime(args.now_utc) if args.now_utc else dt.datetime.now(UTC)
-    offsets = parse_offsets(args.offset_minutes)
-    conn = connect_cli_database(args)
-    try:
-        db.initialize_amc_database(conn)
-        showtimes = db.select_showtimes_for_target(
+        counts = db.reset_collection_state(
             conn,
-            target_date=args.target_date.isoformat(),
-            target_amc_movie_id=args.target_amc_movie_id,
-            target_amc_movie_name=args.target_amc_movie_name,
+            exhibition_date=args.target_date,
+            clear_seat_snapshots=not args.keep_seat_snapshots,
         )
-        due = due_snapshots(
-            showtimes,
-            now_utc=now_utc,
-            offsets_minutes=offsets,
-            grace_minutes=args.grace_minutes,
-        )
-
-        collected = 0
-        skipped_existing = 0
-        for showtime, snapshot in due:
-            if db.snapshot_exists(
-                conn,
-                showtime_id=showtime.showtime_id,
-                minutes_before_showtime=snapshot.minutes_before_showtime,
-            ):
-                skipped_existing += 1
-                continue
-            if args.dry_run:
-                collected += 1
-                continue
-            fill = fetch_seat_fill(
-                fetcher,
-                theatre_slug=showtime.theatre_slug,
-                date=dt.date.fromisoformat(showtime.local_show_date),
-                showtime_id=showtime.showtime_id,
-                prefer_rsc=True,
-            )
-            db.upsert_seat_snapshot(
-                conn,
-                showtime=showtime,
-                seat_fill=fill,
-                snapshot_utc_at=now_utc,
-                minutes_before_showtime=snapshot.minutes_before_showtime,
-                fetched_at=now_utc,
-            )
-            collected += 1
-
-        if args.dry_run:
-            conn.rollback()
-        else:
-            conn.commit()
+        conn.commit()
     finally:
         conn.close()
-
-    print(f"Collected {collected} due seat snapshots; skipped {skipped_existing} existing snapshots.")
+    print(
+        f"Reset AMC collection state for {args.target_date.isoformat()}: "
+        f"tasks={counts['collection_tasks']}, runs={counts['collection_runs']}, "
+        f"campaign_movies={counts['campaign_movies']}, campaigns={counts['collection_campaigns']}, "
+        f"seat_snapshots={counts['amc_seat_snapshots']}."
+    )
+    print("Preserved AMC theatres, theatre sample membership, movies, and showtime inventory.")
     return 0
 
 
@@ -581,6 +444,20 @@ def build_parser() -> argparse.ArgumentParser:
     toggle_group.add_argument("--deselected", dest="selected", action="store_false")
     toggle.set_defaults(func=cmd_toggle_movie)
 
+    select_active = add_command_parser(
+        subparsers,
+        "select-the-numbers-active",
+        help="Select AMC movies still reporting recent The Numbers daily grosses.",
+    )
+    select_active.add_argument("target_date", type=parse_date)
+    select_active.add_argument(
+        "--lookback-days",
+        type=int,
+        default=7,
+        help="Recent The Numbers daily box-office window ending on target date. Default: 7.",
+    )
+    select_active.set_defaults(func=cmd_select_the_numbers_active)
+
     seat_run = add_command_parser(subparsers, 
         "create-seat-run",
         help="Create durable seat-scan tasks for selected movies on a date.",
@@ -593,7 +470,32 @@ def build_parser() -> argparse.ArgumentParser:
         default=(5,),
         help="Comma-separated minutes before showtime to collect. Default: 5.",
     )
+    seat_run.add_argument(
+        "--sample-key",
+        default=sample_service.DEFAULT_SAMPLE_KEY,
+        help=f"Saved theatre sample key. Default: {sample_service.DEFAULT_SAMPLE_KEY}.",
+    )
     seat_run.set_defaults(func=cmd_create_seat_run)
+
+    theatre_sample = add_command_parser(
+        subparsers,
+        "create-theatre-sample",
+        help="Create or reuse the persistent fixed AMC theatre sample.",
+    )
+    theatre_sample.add_argument("--sample-key", default=sample_service.DEFAULT_SAMPLE_KEY)
+    theatre_sample.add_argument("--sample-size", type=int, default=sample_service.DEFAULT_SAMPLE_SIZE)
+    theatre_sample.add_argument("--certainty-count", type=int, default=sample_service.DEFAULT_CERTAINTY_COUNT)
+    theatre_sample.add_argument("--seed", default=sample_service.DEFAULT_SAMPLE_SEED)
+    theatre_sample.set_defaults(func=cmd_create_theatre_sample)
+
+    sample_coverage = add_command_parser(
+        subparsers,
+        "sample-coverage",
+        help="Report fixed theatre sample coverage for a date.",
+    )
+    sample_coverage.add_argument("target_date", type=parse_date)
+    sample_coverage.add_argument("--sample-key", default=sample_service.DEFAULT_SAMPLE_KEY)
+    sample_coverage.set_defaults(func=cmd_sample_coverage)
 
     progress = add_command_parser(subparsers, "run-progress", help="Print progress for a durable run.")
     progress.add_argument("run_id")
@@ -610,51 +512,19 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_campaign.add_argument("target_date", type=parse_date)
     cancel_campaign.set_defaults(func=cmd_cancel_campaign)
 
-    selector = add_command_parser(subparsers, "select-movie", help="Scan one large theatre and choose a target movie.")
-    add_fetch_args(selector)
-    selector.add_argument("target_date", type=parse_date)
-    selector.add_argument(
-        "--theatre-slug",
-        help="AMC theatre slug to scan. Defaults to the largest active theatre in the DB.",
+    reset = add_command_parser(
+        subparsers,
+        "reset-collection-state",
+        help="Clear campaign queues and date-scoped seat snapshots while preserving theatres/sample/showtimes.",
     )
-    selector.add_argument(
-        "--selection",
-        type=int,
-        help="Choose a numbered option non-interactively.",
-    )
-    selector.add_argument(
-        "--save-to-db",
+    reset.add_argument("--date", dest="target_date", required=True, type=parse_date)
+    reset.add_argument("--confirm-reset", action="store_true", help="Required guard for deleting collection state.")
+    reset.add_argument(
+        "--keep-seat-snapshots",
         action="store_true",
-        help="Select the movie for the campaign date. Default is print-only.",
+        help="Only clear campaign queue state; preserve date-scoped seat snapshots.",
     )
-    selector.set_defaults(func=cmd_select_movie)
-
-    morning = add_command_parser(subparsers, "morning-showtimes", help="Collect morning showtimes for sampled theatres.")
-    add_fetch_args(morning)
-    morning.add_argument("target_date", type=parse_date)
-    target_args(morning)
-    morning.add_argument("--sample-size", type=int, default=60)
-    morning.add_argument("--seed", default="")
-    morning.add_argument("--now-utc", help="Override current UTC time, ISO format. Useful for tests/dry runs.")
-    morning.add_argument("--morning-start-hour", type=int, default=6)
-    morning.add_argument("--morning-end-hour", type=int, default=10)
-    morning.add_argument("--ignore-local-window", action="store_true")
-    morning.add_argument("--dry-run", action="store_true")
-    morning.set_defaults(func=cmd_morning_showtimes)
-
-    snapshots = add_command_parser(subparsers, "seat-snapshots", help="Collect due seat snapshots for target showtimes.")
-    add_fetch_args(snapshots)
-    snapshots.add_argument("target_date", type=parse_date)
-    target_args(snapshots)
-    snapshots.add_argument(
-        "--offset-minutes",
-        default=",".join(str(value) for value in DEFAULT_OFFSETS_MINUTES),
-        help="Comma-separated minutes before showtime to collect.",
-    )
-    snapshots.add_argument("--grace-minutes", type=int, default=20)
-    snapshots.add_argument("--now-utc", help="Override current UTC time, ISO format. Useful for tests/dry runs.")
-    snapshots.add_argument("--dry-run", action="store_true")
-    snapshots.set_defaults(func=cmd_seat_snapshots)
+    reset.set_defaults(func=cmd_reset_collection_state)
     return parser
 
 

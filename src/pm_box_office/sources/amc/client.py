@@ -10,6 +10,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from pm_box_office.sources.amc import diagnostics
+
 
 DEFAULT_CACHE_DIR = Path("data/raw/amc")
 DEFAULT_USER_AGENT = "pm-box-office-amc/0.1"
@@ -64,6 +66,7 @@ class HtmlFetcher:
     ) -> FetchResult:
         cache_path = self.cache_path(url)
         should_refresh = self.refresh if refresh is None else refresh
+        kind = diagnostics.url_kind(url)
         now = dt.datetime.now(dt.timezone.utc)
         if cache_path.exists() and not should_refresh:
             return FetchResult(
@@ -93,7 +96,30 @@ class HtmlFetcher:
                     body = response.read().decode("utf-8", errors="replace")
                     status_code = int(response.status)
                 if not body.strip():
-                    raise RuntimeError(f"GET {url} returned an empty response body")
+                    diagnostics.log_backoff_event(
+                        "empty_body",
+                        url=url,
+                        url_kind=kind,
+                        status_code=status_code,
+                        attempt=attempt + 1,
+                        body_length=len(body),
+                        cache_path=cache_path,
+                        archive_path=archive_path,
+                    )
+                    exc = RuntimeError(f"GET {url} returned an empty response body")
+                    diagnostics.log_backoff_event(
+                        "http_failed",
+                        url=url,
+                        url_kind=kind,
+                        status_code=status_code,
+                        attempt=attempt + 1,
+                        body_length=len(body),
+                        cache_path=cache_path,
+                        archive_path=archive_path,
+                        error_type=type(exc).__name__,
+                        error_message=diagnostics.short_error(exc),
+                    )
+                    raise exc
                 cache_path.write_text(body, encoding="utf-8")
                 if archive_path is not None:
                     archive_path.parent.mkdir(parents=True, exist_ok=True)
@@ -109,17 +135,66 @@ class HtmlFetcher:
                 )
             except urllib.error.HTTPError as exc:
                 last_error = exc
-                if exc.code not in TRANSIENT_STATUSES or attempt == self.retries - 1:
-                    raise
                 retry_after = exc.headers.get("Retry-After")
+                if exc.code not in TRANSIENT_STATUSES or attempt == self.retries - 1:
+                    diagnostics.log_backoff_event(
+                        "http_failed",
+                        url=url,
+                        url_kind=kind,
+                        status_code=exc.code,
+                        attempt=attempt + 1,
+                        retry_after=retry_after,
+                        cache_path=cache_path,
+                        archive_path=archive_path,
+                        error_type=type(exc).__name__,
+                        error_message=diagnostics.short_error(exc),
+                    )
+                    raise
                 delay = float(retry_after) if retry_after else self.delay_seconds * (attempt + 1)
+                diagnostics.log_backoff_event(
+                    "http_retry",
+                    url=url,
+                    url_kind=kind,
+                    status_code=exc.code,
+                    attempt=attempt + 1,
+                    retry_delay_seconds=delay,
+                    retry_after=retry_after,
+                    cache_path=cache_path,
+                    archive_path=archive_path,
+                    error_type=type(exc).__name__,
+                    error_message=diagnostics.short_error(exc),
+                )
                 time.sleep(delay)
             except (TimeoutError, urllib.error.URLError) as exc:
                 last_error = exc
                 if attempt == self.retries - 1:
                     break
-                time.sleep(self.delay_seconds * (attempt + 1))
-        raise RuntimeError(f"GET {url} failed after retry: {last_error}")
+                delay = self.delay_seconds * (attempt + 1)
+                diagnostics.log_backoff_event(
+                    "http_retry",
+                    url=url,
+                    url_kind=kind,
+                    attempt=attempt + 1,
+                    retry_delay_seconds=delay,
+                    cache_path=cache_path,
+                    archive_path=archive_path,
+                    error_type=type(exc).__name__,
+                    error_message=diagnostics.short_error(exc),
+                )
+                time.sleep(delay)
+        exc = RuntimeError(f"GET {url} failed after retry: {last_error}")
+        logged_error = last_error or exc
+        diagnostics.log_backoff_event(
+            "http_failed",
+            url=url,
+            url_kind=kind,
+            attempt=self.retries,
+            cache_path=cache_path,
+            archive_path=archive_path,
+            error_type=type(logged_error).__name__,
+            error_message=diagnostics.short_error(logged_error),
+        )
+        raise exc
 
     def get_live_result(self, url: str, *, archive_path: Path | None = None) -> FetchResult:
         """Fetch from AMC even when a cache file exists.

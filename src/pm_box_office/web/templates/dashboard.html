@@ -25,123 +25,168 @@
             <button type="submit">Refresh theatre list</button>
           </form>
           <form method="post" action="/campaigns/{{ date_value }}/collect-showtimes">
-            <button type="submit">Collect showtime inventory</button>
+            <button type="submit">Search showtimes</button>
           </form>
-          <form method="post" action="/campaigns/{{ date_value }}/start-seat-collection">
-            <button type="submit">Start seat collection</button>
+          <form class="inline-control-form" method="post" action="/campaigns/{{ date_value }}/start-seat-collection">
+            <input type="hidden" name="sample_key" value="{{ sample_set.sample_key if sample_set else 'balanced_175' }}">
+            <button type="submit">Start sampled seat collection</button>
           </form>
-          <form method="post" action="/workers/start">
-            <button type="submit">Start worker</button>
-          </form>
-          <a class="button-link" href="/sources">Ingest sources</a>
-          <form method="post" action="/campaigns/{{ date_value }}/cancel">
-            <button class="danger" type="submit">Cancel queues</button>
-          </form>
+          <a class="button-link shaded-link" href="/forecasts">Forecasts</a>
+          <a class="button-link shaded-link" href="/sources">Pull data</a>
         </div>
       </header>
 
-      <section class="metrics">
+      <section class="status-strip" aria-label="Collection status">
         <div>
-          <span class="label">Active AMC theatres</span>
-          <strong>{{ active_theatres }}</strong>
+          <span class="label">Theatres</span>
+          <strong>{{ sample_coverage.active_sample_theatres or 0 }}/{{ sample_coverage.active_theatres or active_theatres }}</strong>
         </div>
         <div>
-          <span class="label">Last synchronized</span>
-          <strong>{{ last_theatre_sync or "Never" }}</strong>
-        </div>
-        <div>
-          <span class="label">Local worker</span>
-          <strong>{{ worker_status.running_count }}/{{ worker_status.desired_count }}</strong>
-        </div>
-        <div>
-          <span class="label">Queued tasks</span>
-          <strong>{{ queue_health.queued }}</strong>
-        </div>
-        <div>
-          <span class="label">Due now</span>
-          <strong>{{ queue_health.due_now }}</strong>
-        </div>
-        <div>
-          <span class="label">Late tasks</span>
-          <strong>{{ queue_health.late }}</strong>
-        </div>
-        <div>
-          <span class="label">5 min throughput</span>
-          <strong>{{ "%.1f"|format(queue_health.tasks_per_minute) }}/min</strong>
-        </div>
-        <div>
-          <span class="label">Backlog ETA</span>
-          <strong>
-            {% if queue_health.eta_minutes is not none %}
-              {{ "%.0f"|format(queue_health.eta_minutes) }} min
+          <span class="label">Screens</span>
+          <strong>{{ sample_coverage.sample_screens or 0 }}/{{ sample_coverage.active_screens or 0 }}</strong>
+          <small>
+            screen share:
+            {% if sample_coverage.sampled_screen_share is defined and sample_coverage.sampled_screen_share is not none %}
+              {{ "%.0f"|format(sample_coverage.sampled_screen_share * 100) }}%
             {% else %}
               -
             {% endif %}
-          </strong>
+          </small>
+        </div>
+        <div>
+          <span class="label">Showtimes</span>
+          <strong>{{ sampled_showtimes }} / {{ inventory_showtimes }}</strong>
+          <small>sample / inventory</small>
+        </div>
+        <div>
+          <span class="label">Selected movies</span>
+          <strong>{{ selected_movie_count }}</strong>
+          <small>{{ selected_sampled_showtimes }} sampled showtimes</small>
+        </div>
+        <div>
+          <span class="label">Queue</span>
+          <strong>{{ queue_health.queued }}</strong>
+          <small>{{ queue_health.due_now }} due · {{ queue_health.late }} late</small>
         </div>
       </section>
 
+      {% if (sample_overlap.peak_tasks_per_minute or 0) > 0 and (queue_health.peak_tasks_per_minute or 0) > (sample_overlap.peak_tasks_per_minute or 0) %}
+      <div class="notice error">
+        Queue peak {{ queue_health.peak_tasks_per_minute }}/min exceeds sampled peak {{ sample_overlap.peak_tasks_per_minute }}/min.
+        Clear stale queue state before restarting sampled collection.
+      </div>
+      {% endif %}
+
       <section>
-        <div class="section-head">
+        <div class="section-head compact-head">
           <h1>Movie Selection</h1>
-          <span>{{ movies|length }} movies</span>
         </div>
         <div class="toolbar">
-          <input
-            id="movie-filter"
-            type="search"
-            placeholder="Filter movies"
-            aria-label="Filter movies"
-            oninput="filterMovies(this.value)"
-          >
           <form method="post" action="/campaigns/{{ date_value }}/movies">
-            <input type="hidden" name="action" value="select_top">
-            <input class="number-input" name="limit" type="number" min="1" value="10" aria-label="Top movie count">
-            <button type="submit">Select top</button>
-          </form>
-          <form method="post" action="/campaigns/{{ date_value }}/movies">
-            <input type="hidden" name="action" value="select_all">
-            <button type="submit">Select all</button>
+            <input type="hidden" name="action" value="select_the_numbers_active">
+            <button type="submit">Select active</button>
           </form>
           <form method="post" action="/campaigns/{{ date_value }}/movies">
             <input type="hidden" name="action" value="clear">
             <button class="danger" type="submit">Clear selected</button>
           </form>
         </div>
-        <div class="table">
-          <div class="row head">
-            <span>Track</span>
-            <span>Movie</span>
-            <span>Theatres</span>
-            <span>Showtimes</span>
+
+        <details class="operator-details">
+          <summary>
+            <span>Movies to track</span>
+            <span>{{ inventory_movie_count }} inventory movies</span>
+          </summary>
+          <div class="toolbar detail-toolbar">
+            <input
+              id="movie-filter"
+              type="search"
+              placeholder="Search movies or AMC IDs"
+              aria-label="Filter movies"
+              oninput="filterMovies(this.value)"
+            >
           </div>
-          {% for movie in movies %}
-          <form
-            class="row movie-row"
-            method="post"
-            action="/campaigns/{{ date_value }}/movies/{{ movie.amc_movie_id }}"
-            data-movie-name="{{ movie.amc_movie_name|lower }}"
-          >
+          <div class="table">
+            <div class="row head">
+              <span>Track</span>
+              <span>Movie</span>
+              <span>Sample showtimes</span>
+              <span>Inventory showtimes</span>
+              <span>AMC ID</span>
+            </div>
+            {% for movie in movies %}
+            <form
+              class="row movie-row"
+              method="post"
+              action="/campaigns/{{ date_value }}/movies/{{ movie.amc_movie_id }}"
+              data-movie-name="{{ movie.amc_movie_name|lower }}"
+              data-movie-id="{{ movie.amc_movie_id|lower }}"
+            >
+              <span>
+                <input
+                  type="checkbox"
+                  name="selected"
+                  value="on"
+                  {% if movie.selected %}checked{% endif %}
+                  onchange="this.form.submit()"
+                >
+              </span>
+              <span title="{{ movie.sampled_theatre_count }} sample theatres · {{ movie.theatre_count }} inventory theatres">{{ movie.amc_movie_name }}</span>
+              <span>{{ movie.sampled_showtime_count }}</span>
+              <span>{{ movie.showtime_count }}</span>
+              <span><code>{{ movie.amc_movie_id }}</code></span>
+            </form>
+            {% else %}
+            <div class="empty-row">No movie inventory yet.</div>
+            {% endfor %}
+          </div>
+        </details>
+      </section>
+
+      <section>
+        <div class="section-head compact-head">
+          <h1>Backend workers</h1>
+          <span>
+            workers {{ worker_status.running_count }}/{{ worker_status.desired_count }}/{{ worker_status.max_count }} ·
+            batch {{ worker_status.batch_limit }} · peak/{{ worker_status.peak_per_worker }}
+          </span>
+        </div>
+        <div class="worker-grid">
+          <div class="worker-row head">
+            <span>Slot</span>
+            <span>Worker ID</span>
+            <span>PID</span>
+            <span>Status</span>
+            <span>Heartbeat</span>
+          </div>
+          {% for slot in worker_status.slots %}
+          <div class="worker-row">
+            <span>{{ slot.index }}</span>
+            <span><code>{{ slot.worker_id }}</code></span>
             <span>
-              <input
-                type="checkbox"
-                name="selected"
-                value="on"
-                {% if movie.selected %}checked{% endif %}
-                onchange="this.form.submit()"
-              >
+              {% if slot.pid is not none %}
+                <code>{{ slot.pid }}</code>
+              {% else %}
+                -
+              {% endif %}
             </span>
-            <span>{{ movie.amc_movie_name }}</span>
-            <span>{{ movie.theatre_count }}</span>
-            <span>{{ movie.showtime_count }}</span>
-          </form>
+            <span><span class="status-pill {{ slot.status }}">{{ slot.status }}</span></span>
+            <span>
+              {% if slot.heartbeat_age_seconds is not none %}
+                {{ "%.0f"|format(slot.heartbeat_age_seconds) }}s ago
+              {% else %}
+                -
+              {% endif %}
+            </span>
+          </div>
           {% endfor %}
         </div>
       </section>
 
       <section>
-        <div class="section-head">
-          <h1>Recent Runs</h1>
+        <div class="section-head compact-head">
+          <h1>Recent runs</h1>
+          <span>{{ recent_runs|length }} shown</span>
         </div>
         <div class="runs">
           {% for run in recent_runs %}
@@ -155,21 +200,28 @@
       </section>
 
       <section>
-        <div class="section-head">
+        <div class="section-head compact-head">
           <h1>Worker Log</h1>
         </div>
-        <div
-          hx-get="/workers/log"
-          hx-trigger="load, every 5s"
-          hx-swap="innerHTML">
-        </div>
+        <details class="operator-details diagnostics-detail">
+          <summary>
+            <form method="post" action="/workers/log/clear">
+              <button class="quiet compact" type="submit">Clear worker log</button>
+            </form>
+          </summary>
+          <div
+            hx-get="/workers/log"
+            hx-trigger="load, every 5s"
+            hx-swap="innerHTML">
+          </div>
+        </details>
       </section>
     </main>
     <script>
       function filterMovies(value) {
         const query = value.trim().toLowerCase();
         document.querySelectorAll(".movie-row").forEach((row) => {
-          row.hidden = query && !row.dataset.movieName.includes(query);
+          row.hidden = query && !row.dataset.movieName.includes(query) && !row.dataset.movieId.includes(query);
         });
       }
     </script>

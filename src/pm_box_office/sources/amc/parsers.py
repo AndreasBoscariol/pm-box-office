@@ -10,6 +10,8 @@ from dataclasses import dataclass, replace
 from html.parser import HTMLParser
 from typing import Any, Iterable
 
+from pm_box_office.sources.amc import diagnostics
+
 
 AMC_BASE_URL = "https://www.amctheatres.com"
 INVALID_SEAT_TYPES = {"NotASeat", "Companion", "Wheelchair"}
@@ -592,6 +594,7 @@ def fetch_seat_fill(
     showtime_id: str,
     prefer_rsc: bool = False,
 ) -> SeatFill:
+    rsc_error: Exception | None = None
     if prefer_rsc:
         try:
             return fetch_rsc_seat_fill(
@@ -600,14 +603,24 @@ def fetch_seat_fill(
                 date=date,
                 showtime_id=showtime_id,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            rsc_error = exc
+            diagnostics.log_backoff_event(
+                "rsc_missing_seats",
+                url=current_showtime_seats_rsc_url(showtime_id),
+                url_kind="rsc",
+                theatre_slug=theatre_slug,
+                exhibition_date=date,
+                showtime_id=showtime_id,
+                error_type=type(exc).__name__,
+                error_message=diagnostics.short_error(exc),
+            )
 
     url = current_showtime_seats_url(showtime_id)
     html_text, raw_cache_path = fetch_text_result(fetcher, url, live=True)
     apollo_data = maybe_parse_apollo_data(html_text, source_url=url)
     if apollo_data is not None:
-        return replace(
+        fill = replace(
             extract_seat_fill(
                 apollo_data,
                 theatre_slug=theatre_slug,
@@ -616,6 +629,19 @@ def fetch_seat_fill(
             ),
             raw_cache_path=raw_cache_path,
         )
+        if rsc_error is not None:
+            diagnostics.log_backoff_event(
+                "rsc_fallback_succeeded",
+                url=url,
+                url_kind="seat_html",
+                theatre_slug=theatre_slug,
+                exhibition_date=date,
+                showtime_id=showtime_id,
+                fallback_method=fill.parse_method,
+                body_length=len(html_text),
+                cache_path=raw_cache_path,
+            )
+        return fill
     rendered_fill = extract_rendered_seat_fill(
         html_text,
         theatre_slug=theatre_slug,
@@ -623,7 +649,20 @@ def fetch_seat_fill(
         showtime_id=showtime_id,
     )
     if rendered_fill.total_seats:
-        return replace(rendered_fill, raw_cache_path=raw_cache_path)
+        fill = replace(rendered_fill, raw_cache_path=raw_cache_path)
+        if rsc_error is not None:
+            diagnostics.log_backoff_event(
+                "rsc_fallback_succeeded",
+                url=url,
+                url_kind="seat_html",
+                theatre_slug=theatre_slug,
+                exhibition_date=date,
+                showtime_id=showtime_id,
+                fallback_method=fill.parse_method,
+                body_length=len(html_text),
+                cache_path=raw_cache_path,
+            )
+        return fill
     return fetch_rsc_seat_fill(
         fetcher,
         theatre_slug=theatre_slug,

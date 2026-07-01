@@ -12,6 +12,9 @@
         <button class="danger compact" type="submit">Cancel</button>
       </form>
       {% endif %}
+      <form method="post" action="/runs/{{ progress.run_id }}/dismiss">
+        <button class="quiet compact" type="submit">Dismiss</button>
+      </form>
     </div>
   </div>
   <div class="bar" aria-label="Progress">

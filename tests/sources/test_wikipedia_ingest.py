@@ -203,12 +203,12 @@ class WikipediaIngestTests(unittest.TestCase):
             )
         row = self.conn.execute(
             """
-            SELECT V, U, R, E, opening_theaters, opening_weekend_revenue_usd
+            SELECT V, U, R, E, opening_theaters, opening_day_gross_usd, opening_weekend_revenue_usd
             FROM wiki_movie_time_features
             WHERE movie_id = 1 AND movie_time_day = 0
             """
         ).fetchone()
-        self.assertEqual((30, 2, 2, 3, 3000, 600), row)
+        self.assertEqual((30, 2, 2, 3, 3000, 100, 600), row)
         row = self.conn.execute(
             """
             SELECT V, U, R, E
