@@ -121,6 +121,21 @@ class ScrapeTheNumbersTests(unittest.TestCase):
             cache_path.write_text("fixture", encoding="utf-8")
             conn, schema = make_isolated_postgres_schema()
             scraper.initialize_database(conn)
+            conn.execute(
+                """
+                CREATE TABLE movie_source_ids (
+                    movie_id BIGINT REFERENCES movies(movie_id),
+                    source TEXT NOT NULL,
+                    source_movie_id TEXT NOT NULL,
+                    source_title TEXT,
+                    match_status TEXT NOT NULL DEFAULT 'unmatched',
+                    match_method TEXT,
+                    match_score DOUBLE PRECISION,
+                    matched_at TIMESTAMPTZ,
+                    PRIMARY KEY (source, source_movie_id)
+                )
+                """
+            )
             try:
                 for _ in range(2):
                     scraper.insert_daily_chart_rows(
@@ -139,10 +154,22 @@ class ScrapeTheNumbersTests(unittest.TestCase):
 
                 chart_count = conn.execute("SELECT COUNT(*) FROM daily_chart_pages").fetchone()[0]
                 daily_count = conn.execute("SELECT COUNT(*) FROM daily_box_office").fetchone()[0]
+                source_id_row = conn.execute(
+                    """
+                    SELECT source_movie_id, source_title, match_status, match_method, match_score
+                    FROM movie_source_ids
+                    WHERE source = 'the_numbers'
+                    """
+                ).fetchone()
                 issue_count = scraper.reconcile(conn, issue_source="test")
 
                 self.assertEqual(1, chart_count)
                 self.assertEqual(2, daily_count)
+                self.assertEqual(chart_rows[0].movie_url, source_id_row[0])
+                self.assertEqual("Sample Movie (2026)", source_id_row[1])
+                self.assertEqual("matched", source_id_row[2])
+                self.assertEqual("source_primary_key", source_id_row[3])
+                self.assertEqual(1.0, source_id_row[4])
                 self.assertEqual(0, issue_count)
             finally:
                 drop_isolated_postgres_schema(conn, schema)

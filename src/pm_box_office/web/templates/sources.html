@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Ingest Sources</title>
+    <link rel="stylesheet" href="/static/app.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>Ingest Sources</h1>
+          <span class="subtle">Local scraper orchestration</span>
+        </div>
+        <div class="actions">
+          <a class="button-link" href="/">AMC Campaigns</a>
+        </div>
+      </header>
+
+      {% if message %}
+      <div class="notice">{{ message }}</div>
+      {% endif %}
+      {% if error %}
+      <div class="notice error">{{ error }}</div>
+      {% endif %}
+
+      <section class="source-grid">
+        {% for source in sources %}
+        <article class="source-card">
+          <div class="source-head">
+            <div>
+              <h2>{{ source.display_name }}</h2>
+              <span class="subtle">{{ source.source_key }}</span>
+            </div>
+            <span class="status-pill {{ source.running_status or 'idle' }}">
+              {{ source.running_status or "idle" }}
+            </span>
+          </div>
+
+          <dl class="source-facts">
+            <div><dt>Last success</dt><dd>{{ source.last_success_at or "Never" }}</dd></div>
+            <div><dt>Last failure</dt><dd>{{ source.last_failure_at or "Never" }}</dd></div>
+            <div><dt>Active PID</dt><dd>{{ source.running_pid or "-" }}</dd></div>
+            <div><dt>Max concurrency</dt><dd>{{ source.max_concurrency }}</dd></div>
+          </dl>
+
+          <div class="source-actions">
+            <form method="post" action="/sources/{{ source.source_key }}/run">
+              <button type="submit" {% if source.running_run_id or not source.enabled %}disabled{% endif %}>Run</button>
+            </form>
+            <form method="post" action="/sources/{{ source.source_key }}/retry">
+              <button type="submit" {% if source.running_run_id or not source.last_failure_run_id or not source.enabled %}disabled{% endif %}>Retry failed</button>
+            </form>
+            {% if source.running_run_id %}
+            <form method="post" action="/sources/runs/{{ source.running_run_id }}/cancel">
+              <button class="danger" type="submit">Cancel</button>
+            </form>
+            {% endif %}
+          </div>
+
+          {% if source.freshness %}
+          <div class="freshness-list">
+            {% for metric in source.freshness %}
+            <div>
+              <span>{{ metric.metric_key }}</span>
+              <strong>{{ metric.row_count }}</strong>
+              <small>{{ metric.latest_collected_at or "No timestamp" }}</small>
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+
+          {% if source.last_failure_error %}
+          <p class="error-text">{{ source.last_failure_error }}</p>
+          {% endif %}
+        </article>
+        {% endfor %}
+      </section>
+
+      <section>
+        <div class="section-head">
+          <h1>Recent Ingest Runs</h1>
+          <span>{{ recent_runs|length }} runs</span>
+        </div>
+        <div class="source-run-list">
+          {% for run in recent_runs %}
+          <article class="run-card">
+            <div class="run-title">
+              <strong>{{ run.display_name }}</strong>
+              <div class="run-actions">
+                <span>{{ run.status }}</span>
+                {% if run.status in ["queued", "running"] %}
+                <form method="post" action="/sources/runs/{{ run.run_id }}/cancel">
+                  <button class="danger compact" type="submit">Cancel</button>
+                </form>
+                {% endif %}
+              </div>
+            </div>
+            <dl class="source-facts">
+              <div><dt>Run</dt><dd>{{ run.run_id }}</dd></div>
+              <div><dt>Trigger</dt><dd>{{ run.trigger }}</dd></div>
+              <div><dt>Started</dt><dd>{{ run.started_at or "Pending" }}</dd></div>
+              <div><dt>Finished</dt><dd>{{ run.finished_at or "-" }}</dd></div>
+            </dl>
+            {% if run.error_summary %}
+            <p class="error-text">{{ run.error_summary }}</p>
+            {% endif %}
+            <div
+              hx-get="/sources/runs/{{ run.run_id }}/logs"
+              hx-trigger="load{% if run.status in ['queued', 'running'] %}, every 3s{% endif %}"
+              hx-swap="outerHTML">
+              {% set logs = log_tails.get(run.run_id|string) %}
+              {% if log_tails.get(run.run_id|string) %}
+              {% include "source_run_logs.html" with context %}
+              {% endif %}
+            </div>
+          </article>
+          {% endfor %}
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

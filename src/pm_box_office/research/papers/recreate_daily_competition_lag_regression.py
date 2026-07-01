@@ -1039,11 +1039,37 @@ RELEASE_AGE_BUCKET_ORDER = [
 ]
 
 
+OPENING_WEEKEND_GROSS_BUCKET_ORDER = [
+    "Q1_lowest_opening_weekend",
+    "Q2_lower_mid_opening_weekend",
+    "Q3_upper_mid_opening_weekend",
+    "Q4_highest_opening_weekend",
+]
+
+
 def release_age_bucket_key(bucket: str) -> int:
     try:
         return RELEASE_AGE_BUCKET_ORDER.index(bucket)
     except ValueError:
         return len(RELEASE_AGE_BUCKET_ORDER)
+
+
+def opening_weekend_gross_bucket_key(bucket: str) -> int:
+    try:
+        return OPENING_WEEKEND_GROSS_BUCKET_ORDER.index(bucket)
+    except ValueError:
+        return len(OPENING_WEEKEND_GROSS_BUCKET_ORDER)
+
+
+def opening_weekend_gross_bucket(value: float, cutpoints: tuple[float, float, float]) -> str:
+    q1, q2, q3 = cutpoints
+    if value <= q1:
+        return "Q1_lowest_opening_weekend"
+    if value <= q2:
+        return "Q2_lower_mid_opening_weekend"
+    if value <= q3:
+        return "Q3_upper_mid_opening_weekend"
+    return "Q4_highest_opening_weekend"
 
 
 def release_age_segment_metrics(panel_rows: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -2495,6 +2521,48 @@ def assign_competitor_pressure_quartiles(rows: list[dict[str, object]]) -> list[
     return output
 
 
+def opening_weekend_gross_by_movie(panel_rows: list[dict[str, object]]) -> dict[str, float]:
+    gross_by_movie: dict[str, float] = defaultdict(float)
+    for row in panel_rows:
+        age_days = float(row["age_days"])
+        if 0 <= age_days <= 2:
+            gross_by_movie[str(row["movie_id"])] += float(row["target_gross_usd"])
+    return dict(gross_by_movie)
+
+
+def opening_weekend_cutpoints_from_training_rows(rows: list[dict[str, object]]) -> tuple[float, float, float]:
+    train_rows, _test_rows = focused_2026_split(rows)
+    train_movie_ids = {str(row["movie_id"]) for row in train_rows}
+    gross_by_movie = opening_weekend_gross_by_movie(rows)
+    values = sorted(gross for movie_id, gross in gross_by_movie.items() if movie_id in train_movie_ids and gross > 0)
+    if not values:
+        values = sorted(gross for gross in gross_by_movie.values() if gross > 0)
+    if not values:
+        return (0.0, 0.0, 0.0)
+    return (
+        percentile(values, 0.25) or values[0],
+        percentile(values, 0.50) or values[0],
+        percentile(values, 0.75) or values[0],
+    )
+
+
+def assign_opening_weekend_gross_buckets(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    if not rows:
+        return []
+    gross_by_movie = opening_weekend_gross_by_movie(rows)
+    cutpoints = opening_weekend_cutpoints_from_training_rows(rows)
+    output = []
+    for row in rows:
+        out = dict(row)
+        opening_gross = gross_by_movie.get(str(row["movie_id"]), 0.0)
+        bucket = opening_weekend_gross_bucket(opening_gross, cutpoints)
+        out["opening_weekend_gross_usd"] = opening_gross
+        out["opening_weekend_gross_millions"] = opening_gross / 1_000_000.0
+        out["opening_weekend_gross_bucket"] = bucket
+        output.append(out)
+    return output
+
+
 def bucketed_competition_effect_rows(panel_rows: list[dict[str, object]]) -> list[dict[str, object]]:
     rows = enrich_share_targets(panel_rows)
     train_rows, test_rows = focused_2026_split(rows)
@@ -2533,6 +2601,64 @@ def bucketed_competition_effect_rows(panel_rows: list[dict[str, object]]) -> lis
                 "release_age_bucket": bucket,
                 "train_n": len(bucket_train),
                 "test_2026_n": len(bucket_test),
+                "train_r2": train_r2,
+                "holdout_rmse_logit_share": metrics.get("holdout_rmse"),
+                "holdout_mae_logit_share": metrics.get("holdout_mae"),
+                "holdout_r2_logit_share": metrics.get("holdout_r2"),
+                "directional_accuracy": metrics.get("directional_accuracy"),
+                "own_prior_share_coef": own.get("coef"),
+                "own_prior_share_p_normal_approx": own.get("p_normal_approx"),
+                "competitor_share_coef": comp.get("coef"),
+                "competitor_share_se_naive": comp.get("se_naive"),
+                "competitor_share_t_stat": comp.get("t_stat"),
+                "competitor_share_p_normal_approx": comp.get("p_normal_approx"),
+            }
+        )
+    return output
+
+
+def opening_weekend_bucket_competition_effect_rows(panel_rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    rows = assign_opening_weekend_gross_buckets(enrich_share_targets(panel_rows))
+    train_rows, test_rows = focused_2026_split(rows)
+    output = []
+    terms = ["logit_own_prior_day_share", "prior_day_competitor_market_share_ex_focal"]
+    for bucket in OPENING_WEEKEND_GROSS_BUCKET_ORDER:
+        bucket_train = [row for row in train_rows if row["opening_weekend_gross_bucket"] == bucket]
+        bucket_test = [row for row in test_rows if row["opening_weekend_gross_bucket"] == bucket]
+        if len(bucket_train) < len(terms) + 10:
+            continue
+        coef_rows, beta, train_r2, _sse = fit_model_for_target(
+            f"opening_weekend_bucket_{bucket}",
+            bucket_train,
+            terms,
+            "logit_daily_share",
+        )
+        metrics = evaluate_model_for_target(
+            f"opening_weekend_bucket_{bucket}",
+            beta,
+            terms,
+            bucket_train,
+            bucket_test,
+            target_col="logit_daily_share",
+        ) if bucket_test else {
+            "holdout_n": 0,
+            "holdout_rmse": None,
+            "holdout_mae": None,
+            "holdout_r2": None,
+            "directional_accuracy": None,
+        }
+        coef_by_term = {str(row["term"]): row for row in coef_rows}
+        comp = coef_by_term.get("prior_day_competitor_market_share_ex_focal", {})
+        own = coef_by_term.get("logit_own_prior_day_share", {})
+        opening_grosses = [float(row["opening_weekend_gross_usd"]) for row in bucket_train]
+        output.append(
+            {
+                "opening_weekend_gross_bucket": bucket,
+                "train_n": len(bucket_train),
+                "test_2026_n": len(bucket_test),
+                "train_movies": len({str(row["movie_id"]) for row in bucket_train}),
+                "test_2026_movies": len({str(row["movie_id"]) for row in bucket_test}),
+                "mean_opening_weekend_gross_usd": einav.mean(opening_grosses),
                 "train_r2": train_r2,
                 "holdout_rmse_logit_share": metrics.get("holdout_rmse"),
                 "holdout_mae_logit_share": metrics.get("holdout_mae"),
@@ -2593,6 +2719,56 @@ def exact_release_day_competition_effect_rows(
                 "competitor_share_se_naive": comp.get("se_naive"),
                 "competitor_share_t_stat": comp.get("t_stat"),
                 "competitor_share_p_normal_approx": comp.get("p_normal_approx"),
+            }
+        )
+    return output
+
+
+def opening_weekend_bucket_response_rows(panel_rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    rows = assign_opening_weekend_gross_buckets(enrich_share_targets(panel_rows))
+    train_rows, test_rows = focused_2026_split(rows)
+    terms = ["logit_own_prior_day_share", "prior_day_competitor_market_share_ex_focal"]
+    _coef_rows, beta, _train_r2, _sse = fit_model_for_target(
+        "incremental_competitor_share",
+        train_rows,
+        terms,
+        "logit_daily_share",
+    )
+    prediction_rows = focused_2026_prediction_rows(
+        "incremental_competitor_share",
+        beta,
+        terms,
+        test_rows,
+    )
+    source_lookup = {
+        (str(row["movie_id"]), str(row["box_office_date"])): row
+        for row in test_rows
+    }
+    buckets: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for pred in prediction_rows:
+        source = source_lookup[(str(pred["movie_id"]), str(pred["box_office_date"]))]
+        merged = {**source, **pred}
+        buckets[str(source["opening_weekend_gross_bucket"])].append(merged)
+    output = []
+    for bucket in sorted(buckets, key=opening_weekend_gross_bucket_key):
+        bucket_rows = buckets[bucket]
+        share_residuals = [float(row["share_residual"]) for row in bucket_rows]
+        logit_residuals = [float(row["logit_residual"]) for row in bucket_rows]
+        output.append(
+            {
+                "opening_weekend_gross_bucket": bucket,
+                "n": len(bucket_rows),
+                "movies": len({str(row["movie_id"]) for row in bucket_rows}),
+                "mean_opening_weekend_gross_usd": einav.mean(float(row["opening_weekend_gross_usd"]) for row in bucket_rows),
+                "mean_competitor_share": einav.mean(float(row["prior_day_competitor_market_share_ex_focal"]) for row in bucket_rows),
+                "mean_actual_share": einav.mean(float(row["actual_daily_share"]) for row in bucket_rows),
+                "mean_predicted_share": einav.mean(float(row["predicted_daily_share"]) for row in bucket_rows),
+                "mean_share_residual": einav.mean(share_residuals),
+                "rmse_share": rmse(share_residuals),
+                "mae_share": mae(share_residuals),
+                "rmse_logit_share": rmse(logit_residuals),
+                "mean_actual_gross_usd": einav.mean(float(row["actual_gross_usd"]) for row in bucket_rows),
+                "mean_implied_predicted_gross_usd": einav.mean(float(row["implied_predicted_gross_usd"]) for row in bucket_rows),
             }
         )
     return output
@@ -2697,6 +2873,109 @@ def write_bucket_bar_svg(
     path.write_text("\n".join(parts), encoding="utf-8")
 
 
+def write_opening_weekend_bucket_bar_svg(
+    path: Path,
+    rows: list[dict[str, object]],
+    *,
+    title: str,
+    value_col: str,
+    y_label: str,
+) -> None:
+    values = [row for row in rows if row.get(value_col) not in (None, "")]
+    if not values:
+        path.write_text("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"880\" height=\"480\"></svg>\n", encoding="utf-8")
+        return
+    values = sorted(values, key=lambda row: opening_weekend_gross_bucket_key(str(row["opening_weekend_gross_bucket"])))
+    width, height = 900, 500
+    left, right, top, bottom = 95, 35, 60, 375
+    ys = [float(row[value_col]) for row in values]
+    y_min, y_max = min(0.0, min(ys)), max(0.0, max(ys))
+    if y_min == y_max:
+        y_min -= 1.0
+        y_max += 1.0
+    bar_width = (width - left - right) / max(1, len(values)) * 0.48
+
+    def sx(index: int) -> float:
+        return left + (index + 0.5) / len(values) * (width - left - right)
+
+    def sy(value: float) -> float:
+        return bottom - (value - y_min) / (y_max - y_min) * (bottom - top)
+
+    zero_y = sy(0.0)
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        f'<text x="36" y="34" font-family="Arial" font-size="20" font-weight="700">{title}</text>',
+        f'<line x1="{left}" y1="{bottom}" x2="{width - right}" y2="{bottom}" stroke="#333"/>',
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" stroke="#333"/>',
+        f'<line x1="{left}" y1="{zero_y:.1f}" x2="{width - right}" y2="{zero_y:.1f}" stroke="#aaa" stroke-dasharray="4 4"/>',
+    ]
+    for index, row in enumerate(values):
+        value = float(row[value_col])
+        x = sx(index) - bar_width / 2
+        y = min(sy(value), zero_y)
+        h = abs(sy(value) - zero_y)
+        color = "#c15b3f" if value < 0 else "#2f6f73"
+        label = str(row["opening_weekend_gross_bucket"]).replace("_opening_weekend", "").replace("_", " ")
+        parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_width:.1f}" height="{h:.1f}" fill="{color}"/>')
+        parts.append(f'<text x="{sx(index):.1f}" y="{bottom + 21}" font-family="Arial" font-size="11" text-anchor="middle">{label}</text>')
+    parts.append(f'<text x="18" y="{(top + bottom) / 2:.1f}" font-family="Arial" font-size="12" transform="rotate(-90 18 {(top + bottom) / 2:.1f})" text-anchor="middle">{y_label}</text>')
+    parts.append("</svg>")
+    path.write_text("\n".join(parts), encoding="utf-8")
+
+
+def write_opening_weekend_response_svg(path: Path, rows: list[dict[str, object]]) -> None:
+    if not rows:
+        path.write_text("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"900\" height=\"520\"></svg>\n", encoding="utf-8")
+        return
+    values = sorted(rows, key=lambda row: opening_weekend_gross_bucket_key(str(row["opening_weekend_gross_bucket"])))
+    width, height = 930, 520
+    left, right, top, bottom = 80, 170, 68, 390
+    y_values = [float(row["mean_actual_share"]) for row in values] + [float(row["mean_predicted_share"]) for row in values]
+    y_min, y_max = 0.0, max(y_values) if y_values else 1.0
+    if y_min == y_max:
+        y_max += 1.0
+
+    def sx(index: int) -> float:
+        return left + (index + 0.5) / len(values) * (width - left - right)
+
+    def sy(value: float) -> float:
+        return bottom - (value - y_min) / (y_max - y_min) * (bottom - top)
+
+    group_width = (width - left - right) / max(1, len(values))
+    bar_width = group_width * 0.24
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="36" y="34" font-family="Arial" font-size="20" font-weight="700">2026 share by opening-weekend gross bucket</text>',
+        '<text x="36" y="55" font-family="Arial" font-size="13" fill="#555">Observed opening-weekend gross quartiles, not production-budget data</text>',
+        f'<line x1="{left}" y1="{bottom}" x2="{width - right}" y2="{bottom}" stroke="#333"/>',
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" stroke="#333"/>',
+    ]
+    for index, row in enumerate(values):
+        actual = float(row["mean_actual_share"])
+        predicted = float(row["mean_predicted_share"])
+        center = sx(index)
+        for x, value, color in (
+            (center - bar_width * 0.65, actual, "#2f6f73"),
+            (center + bar_width * 0.65, predicted, "#d49a2a"),
+        ):
+            y = sy(value)
+            parts.append(f'<rect x="{x - bar_width / 2:.1f}" y="{y:.1f}" width="{bar_width:.1f}" height="{bottom - y:.1f}" fill="{color}"/>')
+        label = str(row["opening_weekend_gross_bucket"]).replace("_opening_weekend", "").replace("_", " ")
+        parts.append(f'<text x="{center:.1f}" y="{bottom + 22}" font-family="Arial" font-size="11" text-anchor="middle">{label}</text>')
+    parts.extend(
+        [
+            f'<rect x="{width - right + 25}" y="90" width="13" height="13" fill="#2f6f73"/>',
+            f'<text x="{width - right + 45}" y="101" font-family="Arial" font-size="12">Actual share</text>',
+            f'<rect x="{width - right + 25}" y="114" width="13" height="13" fill="#d49a2a"/>',
+            f'<text x="{width - right + 45}" y="125" font-family="Arial" font-size="12">Predicted share</text>',
+        ]
+    )
+    parts.append("</svg>")
+    path.write_text("\n".join(parts), encoding="utf-8")
+
+
 def write_quartile_response_svg(path: Path, rows: list[dict[str, object]]) -> None:
     if not rows:
         path.write_text("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"920\" height=\"520\"></svg>\n", encoding="utf-8")
@@ -2790,6 +3069,8 @@ def write_response_analysis_readme(
     bucket_rows: list[dict[str, object]],
     quartile_rows: list[dict[str, object]],
     exact_day_rows: list[dict[str, object]],
+    opening_weekend_bucket_rows: list[dict[str, object]],
+    opening_weekend_response_rows: list[dict[str, object]],
 ) -> None:
     strongest = None
     if bucket_rows:
@@ -2806,9 +3087,14 @@ def write_response_analysis_readme(
                 "This analysis estimates how the prior-day competitor-share effect varies by",
                 "movie release age and by competitor-pressure quartile.",
                 "",
+                "Opening-weekend-gross buckets are quartiles of observed first-three-day gross.",
+                "They are a scale/marketability proxy, not production-budget data.",
+                "",
                 f"Release-age bucket rows: {len(bucket_rows)}",
                 f"Competition quartile response rows: {len(quartile_rows)}",
                 f"Exact release-day rows: {len(exact_day_rows)}",
+                f"Opening-weekend bucket rows: {len(opening_weekend_bucket_rows)}",
+                f"Opening-weekend response rows: {len(opening_weekend_response_rows)}",
                 f"Most negative bucket coefficient: {strongest['release_age_bucket'] if strongest else ''} {strongest['competitor_share_coef'] if strongest else ''}",
             ]
         )
@@ -2823,6 +3109,8 @@ def write_response_analysis_outputs(out_dir: Path, panel_rows: list[dict[str, ob
     bucket_rows = bucketed_competition_effect_rows(panel_rows)
     exact_day_rows = exact_release_day_competition_effect_rows(panel_rows)
     quartile_rows = competition_quartile_response_rows(panel_rows)
+    opening_weekend_bucket_rows = opening_weekend_bucket_competition_effect_rows(panel_rows)
+    opening_weekend_response_rows = opening_weekend_bucket_response_rows(panel_rows)
     einav.write_csv(
         response_dir / "release_age_bucket_competition_effects.csv",
         bucket_rows,
@@ -2878,6 +3166,48 @@ def write_response_analysis_outputs(out_dir: Path, panel_rows: list[dict[str, ob
             "mean_implied_predicted_gross_usd",
         ],
     )
+    einav.write_csv(
+        response_dir / "opening_weekend_gross_bucket_competition_effects.csv",
+        opening_weekend_bucket_rows,
+        [
+            "opening_weekend_gross_bucket",
+            "train_n",
+            "test_2026_n",
+            "train_movies",
+            "test_2026_movies",
+            "mean_opening_weekend_gross_usd",
+            "train_r2",
+            "holdout_rmse_logit_share",
+            "holdout_mae_logit_share",
+            "holdout_r2_logit_share",
+            "directional_accuracy",
+            "own_prior_share_coef",
+            "own_prior_share_p_normal_approx",
+            "competitor_share_coef",
+            "competitor_share_se_naive",
+            "competitor_share_t_stat",
+            "competitor_share_p_normal_approx",
+        ],
+    )
+    einav.write_csv(
+        response_dir / "opening_weekend_gross_bucket_response.csv",
+        opening_weekend_response_rows,
+        [
+            "opening_weekend_gross_bucket",
+            "n",
+            "movies",
+            "mean_opening_weekend_gross_usd",
+            "mean_competitor_share",
+            "mean_actual_share",
+            "mean_predicted_share",
+            "mean_share_residual",
+            "rmse_share",
+            "mae_share",
+            "rmse_logit_share",
+            "mean_actual_gross_usd",
+            "mean_implied_predicted_gross_usd",
+        ],
+    )
     write_bucket_bar_svg(
         response_dir / "figure_competitor_effect_by_release_age_bucket.svg",
         bucket_rows,
@@ -2894,11 +3224,31 @@ def write_response_analysis_outputs(out_dir: Path, panel_rows: list[dict[str, ob
     )
     write_quartile_response_svg(response_dir / "figure_response_by_competition_quartile.svg", quartile_rows)
     write_exact_day_effect_svg(response_dir / "figure_exact_day_competitor_coef.svg", exact_day_rows)
+    write_opening_weekend_bucket_bar_svg(
+        response_dir / "figure_competitor_effect_by_opening_weekend_gross_bucket.svg",
+        opening_weekend_bucket_rows,
+        title="Competitor-share coefficient by opening-weekend gross bucket",
+        value_col="competitor_share_coef",
+        y_label="Coefficient on prior-day competitor share",
+    )
+    write_opening_weekend_bucket_bar_svg(
+        response_dir / "figure_oos_rmse_by_opening_weekend_gross_bucket.svg",
+        opening_weekend_bucket_rows,
+        title="2026 OOS RMSE by opening-weekend gross bucket",
+        value_col="holdout_rmse_logit_share",
+        y_label="RMSE logit daily share",
+    )
+    write_opening_weekend_response_svg(
+        response_dir / "figure_response_by_opening_weekend_gross_bucket.svg",
+        opening_weekend_response_rows,
+    )
     write_response_analysis_readme(
         response_dir / "README.txt",
         bucket_rows=bucket_rows,
         quartile_rows=quartile_rows,
         exact_day_rows=exact_day_rows,
+        opening_weekend_bucket_rows=opening_weekend_bucket_rows,
+        opening_weekend_response_rows=opening_weekend_response_rows,
     )
 
 

@@ -1,0 +1,2 @@
+<pre class="log-tail">{% if logs %}{% for log in logs %}[{{ log.stream }}] {{ log.line }}
+{% endfor %}{% else %}No log lines yet.{% endif %}</pre>

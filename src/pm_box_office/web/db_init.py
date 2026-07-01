@@ -6,6 +6,7 @@ import threading
 from typing import Any
 
 from pm_box_office.sources.amc import db
+from pm_box_office.orchestration import repository
 
 
 _initialized = False
@@ -20,4 +21,6 @@ def ensure_initialized(conn: Any) -> None:
         if _initialized:
             return
         db.initialize_amc_database(conn)
+        repository.initialize_orchestration_database(conn)
+        repository.seed_sources(conn)
         _initialized = True

@@ -673,7 +673,48 @@ def upsert_movie(conn: Any, row: MovieDailyRow) -> int:
     movie_id = conn.execute(
         "SELECT movie_id FROM movies WHERE movie_url = %s", (row.movie_url,)
     ).fetchone()[0]
+    upsert_movie_source_id(
+        conn,
+        movie_id=int(movie_id),
+        source="the_numbers",
+        source_movie_id=row.movie_url,
+        source_title=row.title,
+    )
     return int(movie_id)
+
+
+def upsert_movie_source_id(
+    conn: Any,
+    *,
+    movie_id: int,
+    source: str,
+    source_movie_id: str,
+    source_title: str,
+) -> None:
+    if not relation_exists(conn, "movie_source_ids"):
+        return
+    conn.execute(
+        """
+        INSERT INTO movie_source_ids (
+            movie_id, source, source_movie_id, source_title,
+            match_status, match_method, match_score, matched_at
+        )
+        VALUES (%s, %s, %s, %s, 'matched', 'source_primary_key', 1.0, CURRENT_TIMESTAMP)
+        ON CONFLICT(source, source_movie_id) DO UPDATE SET
+            movie_id = excluded.movie_id,
+            source_title = excluded.source_title,
+            match_status = excluded.match_status,
+            match_method = excluded.match_method,
+            match_score = excluded.match_score,
+            matched_at = excluded.matched_at
+        """,
+        (movie_id, source, source_movie_id, source_title),
+    )
+
+
+def relation_exists(conn: Any, relation_name: str) -> bool:
+    row = conn.execute("SELECT to_regclass(%s)", (relation_name,)).fetchone()
+    return bool(row and row[0])
 
 
 def upsert_release_run(conn: Any, *, movie_id: int, movie_url: str) -> int:

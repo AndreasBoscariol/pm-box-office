@@ -113,6 +113,8 @@ def initialize_amc_database(conn: Any) -> None:
             source_movie_id TEXT NOT NULL,
             source_title TEXT,
             match_status TEXT NOT NULL DEFAULT 'unmatched',
+            match_method TEXT,
+            match_score DOUBLE PRECISION,
             matched_at TIMESTAMPTZ,
             PRIMARY KEY (source, source_movie_id)
         );
@@ -269,6 +271,13 @@ def initialize_amc_database(conn: Any) -> None:
         ALTER TABLE movies
             ADD COLUMN IF NOT EXISTS release_date DATE,
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;
+
+        ALTER TABLE movie_source_ids
+            ADD COLUMN IF NOT EXISTS source_title TEXT,
+            ADD COLUMN IF NOT EXISTS match_status TEXT DEFAULT 'unmatched',
+            ADD COLUMN IF NOT EXISTS match_method TEXT,
+            ADD COLUMN IF NOT EXISTS match_score DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS matched_at TIMESTAMPTZ;
 
         INSERT INTO amc_movies (amc_movie_id, amc_movie_name, first_seen_at, last_seen_at, active)
         SELECT DISTINCT amc_movie_id, amc_movie_name, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, TRUE

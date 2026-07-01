@@ -484,6 +484,23 @@ class DailyCompetitionLagRegressionTests(unittest.TestCase):
         self.assertEqual("Q1", assigned[0]["competitor_pressure_quartile_label"])
         self.assertEqual("Q4", assigned[-1]["competitor_pressure_quartile_label"])
 
+    def test_opening_weekend_gross_buckets_use_first_three_release_days(self) -> None:
+        rows = [
+            {"movie_id": "1", "box_office_date": "2025-01-01", "target_gross_usd": 100.0, "age_days": 0.0},
+            {"movie_id": "1", "box_office_date": "2025-01-02", "target_gross_usd": 80.0, "age_days": 1.0},
+            {"movie_id": "1", "box_office_date": "2025-01-03", "target_gross_usd": 60.0, "age_days": 2.0},
+            {"movie_id": "1", "box_office_date": "2025-01-04", "target_gross_usd": 40.0, "age_days": 3.0},
+            {"movie_id": "2", "box_office_date": "2025-01-01", "target_gross_usd": 10.0, "age_days": 0.0},
+        ]
+
+        gross_by_movie = recreate.opening_weekend_gross_by_movie(rows)
+        assigned = recreate.assign_opening_weekend_gross_buckets(rows)
+
+        self.assertEqual(240.0, gross_by_movie["1"])
+        self.assertEqual(10.0, gross_by_movie["2"])
+        self.assertEqual(240.0, assigned[0]["opening_weekend_gross_usd"])
+        self.assertIn(assigned[0]["opening_weekend_gross_bucket"], recreate.OPENING_WEEKEND_GROSS_BUCKET_ORDER)
+
     def test_bucketed_competition_effect_rows_include_expected_fields(self) -> None:
         rows = []
         for index in range(12):
@@ -542,6 +559,8 @@ class DailyCompetitionLagRegressionTests(unittest.TestCase):
         bucket_rows = recreate.bucketed_competition_effect_rows(rows)
         quartile_rows = recreate.competition_quartile_response_rows(rows)
         exact_rows = recreate.exact_release_day_competition_effect_rows(rows, min_train_n=4)
+        opening_bucket_rows = recreate.opening_weekend_bucket_competition_effect_rows(rows)
+        opening_response_rows = recreate.opening_weekend_bucket_response_rows(rows)
 
         self.assertEqual(["days_1_3"], [row["release_age_bucket"] for row in bucket_rows])
         self.assertIn("competitor_share_coef", bucket_rows[0])
@@ -549,6 +568,10 @@ class DailyCompetitionLagRegressionTests(unittest.TestCase):
         self.assertIn("mean_actual_share", quartile_rows[0])
         self.assertTrue(exact_rows)
         self.assertIn("release_age_day", exact_rows[0])
+        self.assertTrue(opening_bucket_rows)
+        self.assertIn("opening_weekend_gross_bucket", opening_bucket_rows[0])
+        self.assertTrue(opening_response_rows)
+        self.assertIn("mean_opening_weekend_gross_usd", opening_response_rows[0])
 
 
 if __name__ == "__main__":
