@@ -18,6 +18,14 @@ class ForecastRouteTests(unittest.TestCase):
 
         self.assertEqual("forecasts.html", response.template.name)
         self.assertIn("selected_movie_id", response.context)
+        template_source = response.template.environment.loader.get_source(  # type: ignore[union-attr]
+            response.template.environment,
+            "forecasts.html",
+        )[0]
+        self.assertIn('id="latest-model"', template_source)
+        self.assertIn("latest.model", template_source)
+        self.assertIn('id="target-selector"', template_source)
+        self.assertIn("Opening Window", template_source)
 
     def test_movie_search_returns_service_candidates(self) -> None:
         conn = Mock()
@@ -51,6 +59,11 @@ class ForecastRouteTests(unittest.TestCase):
             ],
             "latest_snapshot": {"status": "ok"},
             "chart_svg": "<svg></svg>",
+            "target_type": "3_day",
+            "target_days": 3,
+            "target_start_date": "2026-07-03",
+            "target_end_date": "2026-07-05",
+            "deployment_status": "production",
         }
         with (
             patch.object(forecasts, "connect_database", return_value=conn),
@@ -61,9 +74,47 @@ class ForecastRouteTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         body = __import__("json").loads(response.body)
         self.assertEqual("Example Movie", body["movie"]["title"])
-        self.assertEqual({"bop_days": 1, "wiki_days": 1, "competition_days": 1, "forecast_days": 1}, body["feature_availability"])
+        self.assertEqual("3_day", body["target_type"])
+        self.assertEqual("production", body["deployment_status"])
+        self.assertEqual(
+            {
+                "bop_days": 1,
+                "wiki_days": 1,
+                "competition_days": 1,
+                "amc_days": 0,
+                "actual_days": 0,
+                "forecast_days": 1,
+            },
+            body["feature_availability"],
+        )
         conn.rollback.assert_called_once()
         conn.close.assert_called_once()
+
+    def test_movie_forecast_endpoint_preserves_live_selected_model(self) -> None:
+        conn = Mock()
+        payload = {
+            "movie": {"movie_id": 10, "title": "Example Movie"},
+            "snapshots": [
+                {
+                    "status": "ok",
+                    "model": "bop_residual_wiki_snapshot",
+                    "bop_forecast_available": True,
+                    "wiki_available": True,
+                    "competition_available": True,
+                }
+            ],
+            "latest_snapshot": {"status": "ok", "model": "bop_residual_wiki_snapshot"},
+            "chart_svg": "<svg></svg>",
+        }
+        with (
+            patch.object(forecasts, "connect_database", return_value=conn),
+            patch.object(forecasts.forecast_service, "forecast_movie", return_value=payload),
+        ):
+            response = forecasts.movie_forecast(10)
+
+        body = __import__("json").loads(response.body)
+        self.assertEqual("bop_residual_wiki_snapshot", body["latest_snapshot"]["model"])
+        self.assertEqual("bop_residual_wiki_snapshot", body["snapshots"][0]["model"])
 
 
 if __name__ == "__main__":

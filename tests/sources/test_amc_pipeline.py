@@ -994,6 +994,82 @@ class AmcPipelinePostgresTests(unittest.TestCase):
         self.assertAlmostEqual(10.0, health["eta_minutes"])
         self.assertAlmostEqual(10.0, health["due_eta_minutes"])
 
+    def test_mark_task_failed_can_extend_attempt_budget_for_backoff(self) -> None:
+        campaign_id = db.ensure_campaign(self.conn, dt.date(2026, 7, 1))
+        run_id = db.create_run(self.conn, campaign_id=campaign_id, run_type="seat_collection")
+        now = db.utc_now()
+        row = self.conn.execute(
+            """
+            INSERT INTO collection_tasks (
+                run_id, task_type, scheduled_for, status, priority, attempt_count,
+                max_attempts, available_after
+            ) VALUES (%s, 'collect_seat_snapshot', %s, 'running', 5, 3, 3, %s)
+            RETURNING task_id
+            """,
+            (run_id, now, now),
+        ).fetchone()
+
+        db.mark_task_failed(
+            self.conn,
+            int(row[0]),
+            exc=ValueError("Could not find showtime.seatingLayout.seats in AMC RSC payload"),
+            retry_delay_seconds=900,
+            minimum_max_attempts=6,
+        )
+
+        task_row = self.conn.execute(
+            """
+            SELECT status, attempt_count, max_attempts, available_after, completed_at
+            FROM collection_tasks
+            WHERE task_id = %s
+            """,
+            (int(row[0]),),
+        ).fetchone()
+
+        self.assertEqual("retry", task_row[0])
+        self.assertEqual(3, int(task_row[1]))
+        self.assertEqual(6, int(task_row[2]))
+        self.assertGreaterEqual(db.ensure_utc(task_row[3]), now + dt.timedelta(seconds=890))
+        self.assertIsNone(task_row[4])
+
+    def test_active_seat_throttle_blocks_seat_claims_across_workers(self) -> None:
+        campaign_id = db.ensure_campaign(self.conn, dt.date(2026, 7, 1))
+        run_id = db.create_run(self.conn, campaign_id=campaign_id, run_type="seat_collection")
+        now = db.utc_now()
+        self.conn.executemany(
+            """
+            INSERT INTO collection_tasks (
+                run_id, task_type, scheduled_for, status, priority, available_after
+            ) VALUES (%s, %s, %s, 'queued', 5, %s)
+            """,
+            [
+                (run_id, "collect_seat_snapshot", now, now),
+                (run_id, "collect_theatre_showtimes", now, now),
+            ],
+        )
+        blocked_until = db.extend_throttle(
+            self.conn,
+            "seat_collection",
+            delay_seconds=75,
+            reason="test shared backoff",
+            now=now,
+        )
+        self.conn.commit()
+
+        claimed = db.claim_due_tasks(self.conn, worker_id="worker-1", limit=10, now=now + dt.timedelta(seconds=10))
+
+        self.assertEqual(["collect_theatre_showtimes"], [task.task_type for task in claimed])
+        self.assertEqual(blocked_until, db.active_throttle_until(self.conn, "seat_collection", now=now))
+
+        claimed_after_backoff = db.claim_due_tasks(
+            self.conn,
+            worker_id="worker-2",
+            limit=10,
+            now=blocked_until + dt.timedelta(seconds=1),
+        )
+
+        self.assertEqual(["collect_seat_snapshot"], [task.task_type for task in claimed_after_backoff])
+
 
 if __name__ == "__main__":
     unittest.main()

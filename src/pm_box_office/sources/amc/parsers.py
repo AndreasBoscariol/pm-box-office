@@ -49,6 +49,21 @@ class SeatFill:
     raw_cache_path: str | None = None
 
 
+class SeatMapUnavailable(ValueError):
+    """Raised when AMC explicitly has no reserved seat map for a showtime."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attribute_names: Iterable[str] = (),
+        raw_cache_path: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.attribute_names = tuple(attribute_names)
+        self.raw_cache_path = raw_cache_path
+
+
 class ApolloDataParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=False)
@@ -422,6 +437,12 @@ def extract_rsc_seat_fill(
 ) -> SeatFill:
     showtime = extract_showtime_from_rsc(rsc_text)
     seating_layout = showtime.get("seatingLayout")
+    if seating_layout is None:
+        attribute_names = extract_rsc_attribute_names(showtime)
+        raise SeatMapUnavailable(
+            "AMC RSC payload has no reserved seat map for this showtime",
+            attribute_names=attribute_names,
+        )
     seats = seating_layout.get("seats") if isinstance(seating_layout, dict) else None
     if not isinstance(seats, list):
         raise ValueError("Could not find showtime.seatingLayout.seats in AMC RSC payload")
@@ -434,6 +455,18 @@ def extract_rsc_seat_fill(
         ),
         parse_method="rsc",
     )
+
+
+def extract_rsc_attribute_names(showtime: JsonObject) -> list[str]:
+    names: list[str] = []
+    for attribute in showtime.get("attributes") or []:
+        if isinstance(attribute, dict):
+            name = attribute.get("name") or attribute.get("title") or attribute.get("label")
+            if name:
+                names.append(str(name))
+        elif isinstance(attribute, str):
+            names.append(attribute)
+    return names
 
 
 def extract_showtime_from_rsc(rsc_text: str) -> JsonObject:
@@ -575,13 +608,18 @@ def fetch_rsc_seat_fill(
 ) -> SeatFill:
     rsc_url = current_showtime_seats_rsc_url(showtime_id)
     rsc_text, rsc_cache_path = fetch_text_result(fetcher, rsc_url, live=True)
-    return replace(
-        extract_rsc_seat_fill(
+    try:
+        fill = extract_rsc_seat_fill(
             rsc_text,
             theatre_slug=theatre_slug,
             date=date,
             showtime_id=showtime_id,
-        ),
+        )
+    except SeatMapUnavailable as exc:
+        exc.raw_cache_path = rsc_cache_path
+        raise
+    return replace(
+        fill,
         raw_cache_path=rsc_cache_path,
     )
 
@@ -605,6 +643,20 @@ def fetch_seat_fill(
             )
         except Exception as exc:
             rsc_error = exc
+            if isinstance(exc, SeatMapUnavailable):
+                diagnostics.log_backoff_event(
+                    "seat_map_unavailable_non_reserved",
+                    url=current_showtime_seats_rsc_url(showtime_id),
+                    url_kind="rsc",
+                    theatre_slug=theatre_slug,
+                    exhibition_date=date,
+                    showtime_id=showtime_id,
+                    attribute_names=list(exc.attribute_names),
+                    cache_path=exc.raw_cache_path,
+                    error_type=type(exc).__name__,
+                    error_message=diagnostics.short_error(exc),
+                )
+                raise
             diagnostics.log_backoff_event(
                 "rsc_missing_seats",
                 url=current_showtime_seats_rsc_url(showtime_id),

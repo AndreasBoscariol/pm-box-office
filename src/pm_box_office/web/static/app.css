@@ -498,6 +498,29 @@ h2 {
   color: #5d6b75;
 }
 
+.target-selector {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 8px;
+}
+
+.target-tab {
+  min-height: 30px;
+  border: 1px solid #b9c5cc;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #21313a;
+  font-size: 13px;
+}
+
+.target-tab.active {
+  border-color: #2f6f73;
+  background: #e7f1f0;
+  color: #174548;
+  font-weight: 700;
+}
+
 .forecast-chart-wrap {
   margin: 12px 0 16px;
   border: 1px solid #d5dde2;
@@ -521,13 +544,21 @@ h2 {
 
 .forecast-row {
   display: grid;
-  grid-template-columns: 64px 112px 120px 160px 120px minmax(150px, 1fr) 150px;
+  grid-template-columns: 44px 98px 108px 138px 92px 120px 132px minmax(132px, 1fr) 136px;
   align-items: center;
   gap: 10px;
   min-height: 40px;
   padding: 0 12px;
   border-top: 1px solid #edf1f3;
   font-size: 13px;
+}
+
+.forecast-row small {
+  display: block;
+  margin-top: 2px;
+  color: #5d6b75;
+  font-size: 11px;
+  line-height: 1.2;
 }
 
 .forecast-row:first-child,

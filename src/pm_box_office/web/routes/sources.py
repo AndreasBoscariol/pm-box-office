@@ -18,7 +18,7 @@ from pm_box_office.web.db_init import ensure_initialized
 
 WEB_ROOT = Path(__file__).resolve().parents[1]
 router = APIRouter()
-HIDDEN_SOURCE_KEYS = {"amc_worker"}
+HIDDEN_SOURCE_KEYS = {"amc_worker", "social_x"}
 templates = Jinja2Templates(
     env=Environment(
         loader=FileSystemLoader(str(WEB_ROOT / "templates")),

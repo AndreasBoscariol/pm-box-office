@@ -23,8 +23,11 @@ class ForecastActualRow:
     source_movie_title: str
     forecast_metric: str
     source_context: str
+    published_date: dt.date | None
     target_start_date: dt.date
     target_end_date: dt.date
+    lead_days: int | None
+    lead_bucket: str
     range_low_usd: float
     range_high_usd: float
     midpoint_usd: float
@@ -45,9 +48,12 @@ class SummaryMetrics:
     mean_actual_usd: float
     mean_midpoint_usd: float
     pearson_correlation: float | None
+    r2_gross: float | None
+    mse_usd: float
     mae_usd: float
     rmse_usd: float
     mape: float | None
+    accuracy_pct: float | None
     mean_signed_error_usd: float
     interval_coverage: float
 
@@ -99,8 +105,10 @@ def fetch_forecast_actual_rows(
             p.source_movie_title,
             p.forecast_metric,
             p.source_context,
+            a.discovered_date::date AS published_date,
             p.target_start_date::date,
             p.target_end_date::date,
+            (p.target_start_date::date - a.discovered_date::date) AS lead_days,
             p.range_low_usd,
             p.range_high_usd,
             SUM(dbo.gross_usd)::double precision AS actual_usd,
@@ -133,6 +141,7 @@ def fetch_forecast_actual_rows(
             p.source_movie_title,
             p.forecast_metric,
             p.source_context,
+            a.discovered_date,
             p.target_start_date,
             p.target_end_date,
             p.range_low_usd,
@@ -146,10 +155,13 @@ def fetch_forecast_actual_rows(
 
 
 def build_forecast_actual_row(row: Any) -> ForecastActualRow:
-    low = float(row[11])
-    high = float(row[12])
+    published_date = coerce_optional_date(row[9])
+    target_start_date = coerce_date(row[10])
+    lead_days = int(row[12]) if row[12] is not None else None
+    low = float(row[13])
+    high = float(row[14])
     midpoint = (low + high) / 2.0
-    actual = float(row[13])
+    actual = float(row[15])
     signed_error = midpoint - actual
     absolute_error = abs(signed_error)
     percentage_error = signed_error / actual if actual else None
@@ -164,8 +176,11 @@ def build_forecast_actual_row(row: Any) -> ForecastActualRow:
         source_movie_title=str(row[6]),
         forecast_metric=str(row[7]),
         source_context=str(row[8]),
-        target_start_date=coerce_date(row[9]),
-        target_end_date=coerce_date(row[10]),
+        published_date=published_date,
+        target_start_date=target_start_date,
+        target_end_date=coerce_date(row[11]),
+        lead_days=lead_days,
+        lead_bucket=lead_bucket_for_days(lead_days),
         range_low_usd=low,
         range_high_usd=high,
         midpoint_usd=midpoint,
@@ -186,9 +201,11 @@ def summarize_rows(label: str, rows: Iterable[ForecastActualRow]) -> SummaryMetr
     forecasts = [row.midpoint_usd for row in row_list]
     absolute_errors = [row.absolute_error_usd for row in row_list]
     signed_errors = [row.signed_error_usd for row in row_list]
+    squared_errors = [error**2 for error in signed_errors]
     absolute_percentage_errors = [
         row.absolute_percentage_error for row in row_list if row.absolute_percentage_error is not None
     ]
+    mape = mean(absolute_percentage_errors) if absolute_percentage_errors else None
     return SummaryMetrics(
         label=label,
         row_count=len(row_list),
@@ -197,9 +214,12 @@ def summarize_rows(label: str, rows: Iterable[ForecastActualRow]) -> SummaryMetr
         mean_actual_usd=mean(actuals),
         mean_midpoint_usd=mean(forecasts),
         pearson_correlation=pearson_correlation(forecasts, actuals),
+        r2_gross=r2_score(actuals, forecasts),
+        mse_usd=mean(squared_errors),
         mae_usd=mean(absolute_errors),
-        rmse_usd=math.sqrt(mean([error**2 for error in signed_errors])),
-        mape=mean(absolute_percentage_errors) if absolute_percentage_errors else None,
+        rmse_usd=math.sqrt(mean(squared_errors)),
+        mape=mape,
+        accuracy_pct=1.0 - mape if mape is not None else None,
         mean_signed_error_usd=mean(signed_errors),
         interval_coverage=mean([1.0 if row.interval_hit else 0.0 for row in row_list]),
     )
@@ -210,6 +230,7 @@ def grouped_summaries(rows: list[ForecastActualRow]) -> list[SummaryMetrics]:
     for field_name, label in (
         ("forecast_metric", "forecast_metric"),
         ("source_context", "source_context"),
+        ("lead_bucket", "lead_bucket"),
     ):
         values = sorted({getattr(row, field_name) for row in rows})
         for value in values:
@@ -241,10 +262,43 @@ def pearson_correlation(xs: list[float], ys: list[float]) -> float | None:
     return numerator / denominator
 
 
+def r2_score(actuals: list[float], predictions: list[float]) -> float | None:
+    if len(actuals) != len(predictions):
+        raise ValueError("r2 inputs must have equal length")
+    if len(actuals) < 2:
+        return None
+    actual_mean = mean(actuals)
+    total = sum((actual - actual_mean) ** 2 for actual in actuals)
+    if total == 0:
+        return None
+    residual = sum((actual - prediction) ** 2 for actual, prediction in zip(actuals, predictions))
+    return 1.0 - residual / total
+
+
+def lead_bucket_for_days(lead_days: int | None) -> str:
+    if lead_days is None:
+        return "missing_lead"
+    if lead_days < 0:
+        return "after_open"
+    if lead_days <= 2:
+        return "0_2d"
+    if lead_days <= 7:
+        return "3_7d"
+    if lead_days <= 14:
+        return "8_14d"
+    return "15d_plus"
+
+
 def coerce_date(value: Any) -> dt.date:
     if isinstance(value, dt.date):
         return value
     return dt.date.fromisoformat(str(value))
+
+
+def coerce_optional_date(value: Any) -> dt.date | None:
+    if value is None:
+        return None
+    return coerce_date(value)
 
 
 def format_usd(value: float) -> str:
@@ -271,9 +325,12 @@ def print_summary(summary: SummaryMetrics) -> None:
     print(f"  mean actual: {format_usd(summary.mean_actual_usd)}")
     print(f"  mean midpoint forecast: {format_usd(summary.mean_midpoint_usd)}")
     print(f"  Pearson r: {format_float(summary.pearson_correlation)}")
+    print(f"  R2 gross: {format_float(summary.r2_gross)}")
+    print(f"  MSE: {format_usd(summary.mse_usd)}")
     print(f"  MAE: {format_usd(summary.mae_usd)}")
     print(f"  RMSE: {format_usd(summary.rmse_usd)}")
     print(f"  MAPE: {format_percent(summary.mape)}")
+    print(f"  accuracy: {format_percent(summary.accuracy_pct)}")
     print(f"  mean signed error: {format_usd(summary.mean_signed_error_usd)}")
     print(f"  interval coverage: {format_percent(summary.interval_coverage)}")
 

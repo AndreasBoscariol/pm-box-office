@@ -182,6 +182,31 @@ LEGACY_STANDALONE_HEADING_HTML = """
 """
 
 
+LONG_RANGE_FORECAST_HTML = """
+<html>
+  <head>
+    <meta property="article:published_time" content="2026-06-19T12:00:00-04:00" />
+  </head>
+  <body>
+    <h1>Long Range Forecast: MINIONS &amp; MONSTERS Set to Dominate July Fourth Long Weekend</h1>
+    <div class="entry-content">
+      <p>Long Range Forecast - July 1, 2026</p>
+      <p>
+        <strong><em>Minions &amp; Monsters</em></strong> | Universal<br>
+        Domestic Opening Weekend Range: $75M - $85M (3-Day); $90M - $110M (5-Day)<br>
+        Domestic Total Range: $240M - $310M
+      </p>
+      <p>
+        <strong><em>Counterprogramming Movie</em></strong><br>
+        Opening Weekend Range: $8 - 12 million<br>
+        Domestic Total Range: $20 - $35 million
+      </p>
+    </div>
+  </body>
+</html>
+"""
+
+
 RSS_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"
   xmlns:dc="http://purl.org/dc/elements/1.1/"
@@ -323,8 +348,14 @@ class BoxofficeProParserTests(unittest.TestCase):
             articles = ingest.discover_articles(fetcher, args)
 
         self.assertEqual([ingest.FORECAST_RSS_URL], fetcher.urls)
-        self.assertEqual(1, len(articles))
-        self.assertIn("MINIONS", articles[0].title)
+        self.assertEqual(2, len(articles))
+        self.assertEqual(
+            [
+                "Long Range Forecast: Summer Rolls On",
+                "Weekend Preview: MINIONS & MONSTERS Set to Lead July 4 Weekend",
+            ],
+            [article.title for article in articles],
+        )
 
     def test_auto_discovery_adds_archive_when_start_date_predates_rss_window_and_dedupes(self) -> None:
         class FixtureFetcher:
@@ -358,8 +389,63 @@ class BoxofficeProParserTests(unittest.TestCase):
             [
                 "https://www.boxofficepro.com/weekend-preview-backrooms-poised-to-become-biggest-box-office-surprise-of-2026/",
                 "https://www.boxofficepro.com/weekend-preview-scary-movie-to-scare-up-big-laughs-and-big-grosses/",
+                "https://www.boxofficepro.com/long-range-forecast-summer-rolls-on/",
                 "https://www.boxofficepro.com/weekend-preview-minions-monsters-set-to-lead-july-4-weekend/",
             ],
+            [article.article_url for article in articles],
+        )
+
+    def test_full_refresh_args_force_all_archive_and_rss_settings(self) -> None:
+        parser = ingest.build_arg_parser()
+        args = parser.parse_args(["--full-refresh"])
+
+        ingest.configure_full_refresh_args(args)
+
+        self.assertTrue(args.refresh)
+        self.assertEqual("auto", args.discovery)
+        self.assertEqual(ingest.FULL_REFRESH_START_DATE, args.start_date)
+        self.assertEqual(ingest.FULL_REFRESH_END_DATE, args.end_date)
+        self.assertEqual(ingest.FULL_REFRESH_MAX_PAGES, args.max_pages)
+
+    def test_full_refresh_discovery_uses_rss_and_archive_even_when_rss_covers_dates(self) -> None:
+        class FixtureFetcher:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
+            def get(self, url: str):
+                self.urls.append(url)
+                if url == ingest.FORECAST_RSS_URL:
+                    return RSS_XML, Path("feed.xml"), False
+                if url == ingest.archive_url(1):
+                    return ARCHIVE_HTML_WITH_RSS_DUPLICATE, Path("archive.html"), False
+                return "<html><body></body></html>", Path("empty.html"), False
+
+        args = type(
+            "Args",
+            (),
+            {
+                "full_refresh": True,
+                "refresh": False,
+                "discovery": "rss",
+                "max_pages": 2,
+                "start_date": ingest.dt.date(2026, 6, 10),
+                "end_date": ingest.dt.date(2026, 7, 10),
+                "max_articles": None,
+            },
+        )()
+        ingest.configure_full_refresh_args(args)
+        fetcher = FixtureFetcher()
+
+        with redirect_stderr(io.StringIO()):
+            articles = ingest.discover_articles(fetcher, args)
+
+        self.assertEqual([ingest.FORECAST_RSS_URL, ingest.archive_url(1), ingest.archive_url(2)], fetcher.urls)
+        self.assertIn(
+            "https://www.boxofficepro.com/weekend-preview-backrooms-poised-to-become-biggest-box-office-surprise-of-2026/",
+            [article.article_url for article in articles],
+        )
+        self.assertIn(
+            "https://www.boxofficepro.com/long-range-forecast-summer-rolls-on/",
             [article.article_url for article in articles],
         )
 
@@ -565,6 +651,91 @@ class BoxofficeProParserTests(unittest.TestCase):
         self.assertEqual("2023-12-22", predictions[0].target_start_date)
         self.assertEqual("2023-12-25", predictions[0].target_end_date)
         self.assertEqual("legacy_forecast_heading", predictions[0].source_context)
+
+    def test_long_range_forecast_text_extracts_opening_and_total_ranges(self) -> None:
+        article, predictions, rejected = ingest.parse_article(
+            LONG_RANGE_FORECAST_HTML,
+            article_url="https://www.boxofficepro.com/long-range-forecast-minions-monsters/",
+        )
+
+        self.assertEqual("long_range_forecast", article.article_type)
+        self.assertEqual([], rejected)
+        self.assertEqual(5, len(predictions))
+
+        minions_opening = predictions[0]
+        self.assertEqual("Minions & Monsters", minions_opening.source_movie_title)
+        self.assertEqual("Universal", minions_opening.distributor)
+        self.assertEqual("domestic_opening_weekend", minions_opening.forecast_metric)
+        self.assertEqual(75_000_000, minions_opening.range_low_usd)
+        self.assertEqual(85_000_000, minions_opening.range_high_usd)
+        self.assertEqual("2026-07-01", minions_opening.target_start_date)
+        self.assertEqual("2026-07-03", minions_opening.target_end_date)
+        self.assertEqual("generic_forecast_range", minions_opening.source_context)
+        self.assertEqual(ingest.GENERIC_FORECAST_PARSER_VERSION, minions_opening.parser_version)
+
+        minions_five_day = predictions[1]
+        self.assertEqual("domestic_opening_weekend", minions_five_day.forecast_metric)
+        self.assertEqual(90_000_000, minions_five_day.range_low_usd)
+        self.assertEqual(110_000_000, minions_five_day.range_high_usd)
+        self.assertEqual("2026-07-01", minions_five_day.target_start_date)
+        self.assertEqual("2026-07-05", minions_five_day.target_end_date)
+
+        minions_total = predictions[2]
+        self.assertEqual("domestic_total", minions_total.forecast_metric)
+        self.assertEqual(240_000_000, minions_total.range_low_usd)
+        self.assertEqual(310_000_000, minions_total.range_high_usd)
+        self.assertIsNone(minions_total.target_start_date)
+
+        counterprogramming = predictions[3]
+        self.assertEqual("Counterprogramming Movie", counterprogramming.source_movie_title)
+        self.assertEqual("Unknown", counterprogramming.distributor)
+        self.assertEqual("domestic_opening_weekend", counterprogramming.forecast_metric)
+        self.assertEqual(8_000_000, counterprogramming.range_low_usd)
+        self.assertEqual(12_000_000, counterprogramming.range_high_usd)
+
+    def test_parse_workers_above_one_requires_offline_mode(self) -> None:
+        args = ingest.build_arg_parser().parse_args(["--parse-workers", "2", "--dry-run"])
+
+        with self.assertRaisesRegex(SystemExit, "--parse-workers greater than 1 requires --offline"):
+            ingest.validate_args(args)
+
+    def test_cached_articles_parse_concurrently_in_input_order(self) -> None:
+        articles = [
+            ingest.ArchiveArticle(
+                article_url="https://www.boxofficepro.com/weekend-preview-sample/",
+                title="Weekend Preview: July 3 - 5, 2026",
+                author=None,
+                published_date="2026-07-01",
+                article_type="weekend_preview",
+                source_url=ingest.FORECAST_ARCHIVE_URL,
+            ),
+            ingest.ArchiveArticle(
+                article_url="https://www.boxofficepro.com/long-range-forecast-minions-monsters/",
+                title="Long Range Forecast: MINIONS & MONSTERS",
+                author=None,
+                published_date="2026-06-19",
+                article_type="long_range_forecast",
+                source_url=ingest.FORECAST_ARCHIVE_URL,
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp)
+            ingest.cache_path_for_url(cache_dir, articles[0].article_url).write_text(
+                WEEKEND_ARTICLE_HTML,
+                encoding="utf-8",
+            )
+            ingest.cache_path_for_url(cache_dir, articles[1].article_url).write_text(
+                LONG_RANGE_FORECAST_HTML,
+                encoding="utf-8",
+            )
+
+            results = ingest.parse_cached_articles_concurrently(articles, cache_dir=cache_dir, workers=2)
+
+        self.assertEqual([article.article_url for article in articles], [result.archive_article.article_url for result in results])
+        self.assertEqual("weekend_preview", results[0].article.article_type)
+        self.assertEqual(4, len(results[0].predictions))
+        self.assertEqual("long_range_forecast", results[1].article.article_type)
+        self.assertEqual(5, len(results[1].predictions))
 
     def test_fetcher_caches_successful_http_response(self) -> None:
         class Response:

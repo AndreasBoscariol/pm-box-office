@@ -31,12 +31,30 @@ class OrchestrationRepositoryTests(unittest.TestCase):
     def test_movie_dependent_sources_require_movies(self) -> None:
         with self.assertRaises(repository.SourceDependencyError):
             repository.create_run(self.conn, source_key="wikipedia", trigger="manual")
+        with self.assertRaises(repository.SourceDependencyError):
+            repository.create_run(self.conn, source_key="rotten_tomatoes", trigger="manual")
 
         self.conn.execute("CREATE TABLE movies (movie_id BIGINT PRIMARY KEY)")
         self.conn.execute("INSERT INTO movies (movie_id) VALUES (1)")
         run_id = repository.create_run(self.conn, source_key="wikipedia", trigger="manual")
+        rt_run_id = repository.create_run(self.conn, source_key="rotten_tomatoes", trigger="manual")
 
         self.assertIsNotNone(run_id)
+        self.assertIsNotNone(rt_run_id)
+
+    def test_seed_sources_registers_rotten_tomatoes(self) -> None:
+        row = self.conn.execute(
+            """
+            SELECT display_name, command, requires_movies
+            FROM ingest_sources
+            WHERE source_key = 'rotten_tomatoes'
+            """
+        ).fetchone()
+
+        self.assertEqual(
+            ("Rotten Tomatoes Critics", "pm_box_office.sources.rotten_tomatoes.ingest", True),
+            tuple(row),
+        )
 
     def test_log_tail_returns_oldest_to_newest_with_limit(self) -> None:
         run_id = repository.create_run(self.conn, source_key="the_numbers", trigger="manual")
@@ -50,4 +68,3 @@ class OrchestrationRepositoryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

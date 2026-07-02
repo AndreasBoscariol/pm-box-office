@@ -993,6 +993,26 @@ def select_candidate_movies(
             """
         )
         params.extend([snapshot_date - dt.timedelta(days=active_days), snapshot_date])
+    if relation_exists(conn, "boxofficepro_weekend_predictions"):
+        selects.append(
+            """
+            SELECT DISTINCT
+                m.movie_id,
+                m.movie_url,
+                COALESCE(m.title, p.source_movie_title) AS title,
+                COALESCE(m.release_year, EXTRACT(YEAR FROM p.target_start_date)::integer) AS release_year,
+                COALESCE(m.release_date, p.target_start_date)::text AS release_date
+            FROM boxofficepro_weekend_predictions p
+            JOIN movies m ON m.movie_id = p.matched_movie_id
+            WHERE p.forecast_metric = 'domestic_opening_weekend'
+              AND p.target_start_date BETWEEN %s AND %s
+              AND p.matched_movie_id IS NOT NULL
+              AND p.source_movie_title NOT ILIKE '%%untitled%%'
+              AND p.source_movie_title NOT ILIKE '%%re-release%%'
+              AND COALESCE(m.title, p.source_movie_title) NOT ILIKE '%%re-release%%'
+            """
+        )
+        params.extend([snapshot_date, snapshot_date + dt.timedelta(days=lookahead_days)])
     if not selects:
         return []
     sql = " UNION ".join(selects) + " ORDER BY release_date NULLS LAST, title"
@@ -1256,7 +1276,42 @@ def match_imdb_title(
     return ImdbMatch(movie.movie_id, None, "not_found", "title_year", None, "No IMDb title matched title/year")
 
 
-def upsert_imdb_match(conn: Any, match: ImdbMatch) -> None:
+def load_movie_id_for_imdb_tconst(conn: Any, tconst: str) -> int | None:
+    row = conn.execute(
+        """
+        SELECT movie_id
+        FROM movie_imdb_titles
+        WHERE tconst = %s
+          AND match_status IN ('matched', 'manual_override')
+        """,
+        (tconst,),
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def upsert_imdb_match(conn: Any, match: ImdbMatch) -> bool:
+    stored_match = match
+    if match.tconst:
+        existing_movie_id = load_movie_id_for_imdb_tconst(conn, match.tconst)
+        if existing_movie_id is not None and existing_movie_id != match.movie_id:
+            if match.match_status == "manual_override":
+                raise ValueError(
+                    f"IMDb title {match.tconst} is already matched to movie_id {existing_movie_id}"
+                )
+            conflict_note = (
+                f"IMDb title {match.tconst} is already matched to movie_id {existing_movie_id}; "
+                "leaving this candidate unmatched"
+            )
+            if match.notes:
+                conflict_note = f"{conflict_note}; {match.notes}"
+            stored_match = ImdbMatch(
+                movie_id=match.movie_id,
+                tconst=None,
+                match_status="ambiguous",
+                match_method=match.match_method,
+                match_score=match.match_score,
+                notes=conflict_note,
+            )
     conn.execute(
         """
         INSERT INTO movie_imdb_titles (
@@ -1271,15 +1326,16 @@ def upsert_imdb_match(conn: Any, match: ImdbMatch) -> None:
             notes = excluded.notes
         """,
         (
-            match.movie_id,
-            match.tconst,
-            match.match_status,
-            match.match_method,
-            match.match_score,
+            stored_match.movie_id,
+            stored_match.tconst,
+            stored_match.match_status,
+            stored_match.match_method,
+            stored_match.match_score,
             utc_now(),
-            match.notes,
+            stored_match.notes,
         ),
     )
+    return stored_match.tconst == match.tconst and stored_match.match_status == match.match_status
 
 
 def insert_imdb_snapshot(
@@ -1525,7 +1581,7 @@ def upsert_wikidata_matches(
                 ],
                 last_seen_at=now,
             )
-            upsert_imdb_match(
+            seeded = upsert_imdb_match(
                 conn,
                 ImdbMatch(
                     movie_id=match.movie_id,
@@ -1536,7 +1592,6 @@ def upsert_wikidata_matches(
                     notes=f"qid={match.qid}; tmdb={match.tmdb_id}; letterboxd={match.letterboxd_slug}",
                 ),
             )
-            seeded = True
         if match.letterboxd_slug and existing_match_status(
             conn,
             table="movie_letterboxd_films",

@@ -274,6 +274,13 @@ def initialize_amc_database(conn: Any) -> None:
             worker_id TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS amc_throttle_state (
+            throttle_key TEXT PRIMARY KEY,
+            blocked_until TIMESTAMPTZ NOT NULL,
+            reason TEXT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE UNIQUE INDEX IF NOT EXISTS uq_collection_tasks_inventory
             ON collection_tasks(run_id, task_type, amc_theatre_id)
             WHERE task_type = 'collect_theatre_showtimes';
@@ -964,6 +971,15 @@ def claim_due_tasks(conn: Any, *, worker_id: str, limit: int = 20, now: dt.datet
             WHERE status IN ('queued', 'retry')
               AND scheduled_for <= %s
               AND available_after <= %s
+              AND (
+                  task_type <> 'collect_seat_snapshot'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM amc_throttle_state throttle
+                      WHERE throttle.throttle_key = 'seat_collection'
+                        AND throttle.blocked_until > %s
+                  )
+              )
             ORDER BY scheduled_for, priority DESC, task_id
             FOR UPDATE SKIP LOCKED
             LIMIT %s
@@ -981,12 +997,58 @@ def claim_due_tasks(conn: Any, *, worker_id: str, limit: int = 20, now: dt.datet
             t.amc_movie_id, t.scheduled_for, t.status, t.priority, t.attempt_count,
             t.max_attempts
         """,
-        (timestamp, timestamp, limit, timestamp, timestamp, worker_id),
+        (timestamp, timestamp, timestamp, limit, timestamp, timestamp, worker_id),
     ).fetchall()
     tasks = [collection_task_from_row(row) for row in rows]
     for run_id in {task.run_id for task in tasks}:
         refresh_run_counters(conn, run_id)
     return tasks
+
+
+def active_throttle_until(
+    conn: Any,
+    throttle_key: str,
+    *,
+    now: dt.datetime | None = None,
+) -> dt.datetime | None:
+    timestamp = now or utc_now()
+    row = conn.execute(
+        """
+        SELECT blocked_until
+        FROM amc_throttle_state
+        WHERE throttle_key = %s
+          AND blocked_until > %s
+        """,
+        (throttle_key, timestamp),
+    ).fetchone()
+    if not row:
+        return None
+    return ensure_utc(row[0])
+
+
+def extend_throttle(
+    conn: Any,
+    throttle_key: str,
+    *,
+    delay_seconds: int,
+    reason: str,
+    now: dt.datetime | None = None,
+) -> dt.datetime:
+    timestamp = now or utc_now()
+    blocked_until = timestamp + dt.timedelta(seconds=delay_seconds)
+    row = conn.execute(
+        """
+        INSERT INTO amc_throttle_state (throttle_key, blocked_until, reason, updated_at)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (throttle_key) DO UPDATE SET
+            blocked_until = GREATEST(amc_throttle_state.blocked_until, excluded.blocked_until),
+            reason = excluded.reason,
+            updated_at = excluded.updated_at
+        RETURNING blocked_until
+        """,
+        (throttle_key, blocked_until, reason[:1000], timestamp),
+    ).fetchone()
+    return ensure_utc(row[0])
 
 
 def campaign_queue_health(conn: Any, campaign_id: uuid.UUID) -> dict[str, Any]:
@@ -1099,29 +1161,72 @@ def mark_task_succeeded(conn: Any, task_id: int) -> uuid.UUID | None:
     return run_id
 
 
-def mark_task_failed(
+def mark_task_skipped(
     conn: Any,
     task_id: int,
     *,
-    exc: Exception,
-    retry_delay_seconds: int = 60,
+    exc: Exception | None = None,
 ) -> uuid.UUID | None:
     row = conn.execute(
         """
         UPDATE collection_tasks
-        SET status = CASE WHEN attempt_count < max_attempts THEN 'retry' ELSE 'failed' END,
-            available_after = CASE
-                WHEN attempt_count < max_attempts THEN %s
-                ELSE available_after
-            END,
-            completed_at = CASE WHEN attempt_count < max_attempts THEN NULL ELSE %s END,
+        SET status = 'succeeded',
+            completed_at = %s,
             last_error_type = %s,
             last_error_message = %s
         WHERE task_id = %s AND status = 'running'
         RETURNING run_id
         """,
         (
+            utc_now(),
+            type(exc).__name__ if exc is not None else None,
+            str(exc)[:1000] if exc is not None else None,
+            task_id,
+        ),
+    ).fetchone()
+    if not row:
+        return None
+    run_id = as_uuid(row[0])
+    refresh_run_counters(conn, run_id)
+    return run_id
+
+
+def mark_task_failed(
+    conn: Any,
+    task_id: int,
+    *,
+    exc: Exception,
+    retry_delay_seconds: int = 60,
+    minimum_max_attempts: int | None = None,
+) -> uuid.UUID | None:
+    effective_minimum_max_attempts = minimum_max_attempts or 0
+    row = conn.execute(
+        """
+        UPDATE collection_tasks
+        SET max_attempts = GREATEST(max_attempts, %s),
+            status = CASE
+                WHEN attempt_count < GREATEST(max_attempts, %s) THEN 'retry'
+                ELSE 'failed'
+            END,
+            available_after = CASE
+                WHEN attempt_count < GREATEST(max_attempts, %s) THEN %s
+                ELSE available_after
+            END,
+            completed_at = CASE
+                WHEN attempt_count < GREATEST(max_attempts, %s) THEN NULL
+                ELSE %s
+            END,
+            last_error_type = %s,
+            last_error_message = %s
+        WHERE task_id = %s AND status = 'running'
+        RETURNING run_id
+        """,
+        (
+            effective_minimum_max_attempts,
+            effective_minimum_max_attempts,
+            effective_minimum_max_attempts,
             utc_now() + dt.timedelta(seconds=retry_delay_seconds),
+            effective_minimum_max_attempts,
             utc_now(),
             type(exc).__name__,
             str(exc)[:1000],

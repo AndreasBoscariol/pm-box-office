@@ -41,7 +41,7 @@ TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 @dataclass(frozen=True)
 class CandidateMovie:
     movie_id: int
-    movie_url: str
+    movie_url: str | None
     title: str
     release_year: int | None
     release_run_id: int
@@ -428,6 +428,23 @@ def pageviews_url(language: str, page_title: str, start: dt.date, end: dt.date) 
     )
 
 
+def latest_wikimedia_pageview_date() -> dt.date:
+    """Return the newest daily pageview date expected to be complete."""
+    return dt.datetime.now(dt.UTC).date() - dt.timedelta(days=1)
+
+
+def cap_activity_window(
+    *,
+    start_date: dt.date,
+    end_date: dt.date,
+    latest_available_date: dt.date,
+) -> tuple[dt.date, dt.date, bool] | None:
+    if start_date > latest_available_date:
+        return None
+    capped_end = min(end_date, latest_available_date)
+    return start_date, capped_end, capped_end == end_date
+
+
 def select_candidate_movies(
     conn: Any,
     *,
@@ -435,7 +452,8 @@ def select_candidate_movies(
     min_opening_theaters: int | None,
     movie_limit: int | None,
 ) -> list[CandidateMovie]:
-    sql = """
+    selects = [
+        """
         SELECT
             m.movie_id,
             m.movie_url,
@@ -445,19 +463,77 @@ def select_candidate_movies(
             bof.opening_date,
             bof.opening_theaters,
             bof.opening_day_gross_usd,
-            bof.opening_weekend_revenue_usd
+            bof.opening_weekend_revenue_usd,
+            0 AS source_priority
         FROM movies m
         JOIN box_office_opening_features bof ON bof.movie_id = m.movie_id
         WHERE 1 = 1
-    """
+        """
+    ]
     params: list[Any] = []
+    if relation_exists(conn, "boxofficepro_weekend_predictions"):
+        selects.append(
+            """
+            SELECT DISTINCT
+                m.movie_id,
+                m.movie_url,
+                COALESCE(m.title, p.source_movie_title) AS title,
+                COALESCE(m.release_year, EXTRACT(YEAR FROM p.target_start_date)::integer) AS release_year,
+                0 AS release_run_id,
+                p.target_start_date::text AS opening_date,
+                NULL::integer AS opening_theaters,
+                NULL::integer AS opening_day_gross_usd,
+                NULL::integer AS opening_weekend_revenue_usd,
+                1 AS source_priority
+            FROM boxofficepro_weekend_predictions p
+            JOIN movies m ON m.movie_id = p.matched_movie_id
+            WHERE p.forecast_metric = 'domestic_opening_weekend'
+              AND p.target_start_date IS NOT NULL
+              AND p.matched_movie_id IS NOT NULL
+              AND p.source_movie_title NOT ILIKE '%%untitled%%'
+              AND p.source_movie_title NOT ILIKE '%%re-release%%'
+              AND COALESCE(m.title, p.source_movie_title) NOT ILIKE '%%re-release%%'
+            """
+        )
+    sql = f"""
+        SELECT
+            movie_id,
+            movie_url,
+            title,
+            release_year,
+            release_run_id,
+            opening_date,
+            opening_theaters,
+            opening_day_gross_usd,
+            opening_weekend_revenue_usd
+        FROM (
+            SELECT DISTINCT ON (movie_id)
+                movie_id,
+                movie_url,
+                title,
+                release_year,
+                release_run_id,
+                opening_date,
+                opening_theaters,
+                opening_day_gross_usd,
+                opening_weekend_revenue_usd,
+                source_priority
+            FROM (
+                {" UNION ALL ".join(selects)}
+            ) candidate_sources
+            WHERE 1 = 1
+    """
     if release_year is not None:
-        sql += " AND m.release_year = %s"
+        sql += " AND release_year = %s"
         params.append(release_year)
     if min_opening_theaters is not None:
-        sql += " AND COALESCE(bof.opening_theaters, 0) >= %s"
+        sql += " AND COALESCE(opening_theaters, 0) >= %s"
         params.append(min_opening_theaters)
-    sql += " ORDER BY bof.opening_date, m.title"
+    sql += """
+            ORDER BY movie_id, source_priority, opening_date, title
+        ) deduped
+        ORDER BY opening_date, title
+    """
     if movie_limit is not None:
         sql += " LIMIT %s"
         params.append(movie_limit)
@@ -476,6 +552,11 @@ def select_candidate_movies(
         )
         for row in rows
     ]
+
+
+def relation_exists(conn: Any, relation_name: str) -> bool:
+    row = conn.execute("SELECT to_regclass(%s)", (relation_name,)).fetchone()
+    return bool(row and row[0])
 
 
 def state_is_completed(
@@ -902,6 +983,7 @@ def ingest_movie(
     day_start: int,
     day_end: int,
     issue_source: str,
+    latest_available_date: dt.date | None = None,
 ) -> tuple[int, int]:
     upsert_state(
         conn,
@@ -938,8 +1020,39 @@ def ingest_movie(
         return 0, 0
 
     opening_date = dt.date.fromisoformat(movie.opening_date)
-    start_date = opening_date + dt.timedelta(days=day_start)
-    end_date = opening_date + dt.timedelta(days=day_end)
+    requested_start_date = opening_date + dt.timedelta(days=day_start)
+    requested_end_date = opening_date + dt.timedelta(days=day_end)
+    latest_available = latest_available_date or latest_wikimedia_pageview_date()
+    capped_window = cap_activity_window(
+        start_date=requested_start_date,
+        end_date=requested_end_date,
+        latest_available_date=latest_available,
+    )
+    if capped_window is None:
+        details = (
+            "Requested Wikipedia activity window starts after latest available "
+            f"pageview date {latest_available.isoformat()}"
+        )
+        insert_issue(
+            conn,
+            issue_source=issue_source,
+            issue_type="wiki_activity_window_unavailable",
+            movie=movie,
+            wiki_page_id=match.page_id,
+            details=details,
+        )
+        upsert_state(
+            conn,
+            movie_id=movie.movie_id,
+            language=language,
+            day_start=day_start,
+            day_end=day_end,
+            stage="waiting_for_activity_window",
+            status="deferred",
+            last_error=details,
+        )
+        return 0, 0
+    start_date, end_date, fetched_complete_window = capped_window
 
     upsert_state(
         conn,
@@ -986,14 +1099,23 @@ def ingest_movie(
         revision_cache_path = pageview_cache_path
     fetched_at = utc_now()
     insert_revisions(conn, revisions, fetched_at=fetched_at, raw_cache_path=revision_cache_path)
+    final_stage = "completed" if fetched_complete_window else "activity_partial"
+    final_status = "completed" if fetched_complete_window else "partial"
+    final_error = None
+    if not fetched_complete_window:
+        final_error = (
+            "Fetched through latest available Wikimedia pageview date "
+            f"{latest_available.isoformat()}; requested through {requested_end_date.isoformat()}"
+        )
     upsert_state(
         conn,
         movie_id=movie.movie_id,
         language=language,
         day_start=day_start,
         day_end=day_end,
-        stage="completed",
-        status="completed",
+        stage=final_stage,
+        status=final_status,
+        last_error=final_error,
         pageviews_rows=len(pageviews),
         revision_rows=len(revisions),
     )

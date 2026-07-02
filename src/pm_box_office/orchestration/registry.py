@@ -40,6 +40,20 @@ SOURCE_DEFINITIONS: tuple[SourceDefinition, ...] = (
         requires_movies=True,
     ),
     SourceDefinition(
+        source_key="rotten_tomatoes",
+        display_name="Rotten Tomatoes Critics",
+        command="pm_box_office.sources.rotten_tomatoes.ingest",
+        requires_movies=True,
+    ),
+    SourceDefinition(
+        source_key="social_x",
+        display_name="Social X/Nitter POC",
+        command="pm_box_office.sources.social_x.ingest",
+        default_args=("--dry-run", "--movie-limit", "5"),
+        enabled=False,
+        requires_movies=True,
+    ),
+    SourceDefinition(
         source_key="amc_worker",
         display_name="AMC Worker Batch",
         command="pm_box_office.sources.amc.jobs.worker",
@@ -49,4 +63,3 @@ SOURCE_DEFINITIONS: tuple[SourceDefinition, ...] = (
 
 
 SOURCE_BY_KEY = {source.source_key: source for source in SOURCE_DEFINITIONS}
-

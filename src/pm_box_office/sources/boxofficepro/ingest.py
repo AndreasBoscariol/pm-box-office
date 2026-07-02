@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Ingest Boxoffice Pro Weekend Preview forecasts into PostgreSQL.
+"""Ingest Boxoffice Pro domestic forecast ranges into PostgreSQL.
 
-This source intentionally parses only high-confidence Weekend Preview
-"Boxoffice Podium" blocks. Older generic Boxoffice Pro prediction tables are
-dropped during initialization because they admitted too much prose garbage.
+This source keeps high-confidence Weekend Preview "Boxoffice Podium" parsing,
+legacy forecast tables, and conservative generic forecast range extraction for
+long-range/tracking articles. Older broad prediction tables are dropped during
+initialization because they admitted too much prose garbage.
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import email.utils
 import datetime as dt
 import hashlib
@@ -33,6 +35,10 @@ FORECAST_ARCHIVE_URL = f"{BASE_URL}/category/forecasts-tracking/"
 FORECAST_RSS_URL = f"{FORECAST_ARCHIVE_URL}feed/"
 DEFAULT_START_DATE = dt.date(2026, 6, 1)
 DEFAULT_END_DATE = dt.date(2026, 6, 30)
+FULL_REFRESH_START_DATE = dt.date(1900, 1, 1)
+FULL_REFRESH_END_DATE = dt.date(9999, 12, 31)
+DEFAULT_MAX_PAGES = 25
+FULL_REFRESH_MAX_PAGES = 10_000
 DEFAULT_CACHE_DIR = Path("data/raw/boxofficepro")
 DEFAULT_USER_AGENT = "pm-box-office-boxofficepro-bot/1.0 (+personal research; set --user-agent contact)"
 DEFAULT_BROWSER_USER_AGENT = (
@@ -46,6 +52,7 @@ DOMESTIC_CURRENCY = "USD"
 PARSER_VERSION = "weekend_podium_v1"
 LEGACY_TABLE_PARSER_VERSION = "legacy_table_v1"
 LEGACY_HEADING_PARSER_VERSION = "legacy_heading_v1"
+GENERIC_FORECAST_PARSER_VERSION = "generic_forecast_range_v1"
 
 
 @dataclass(frozen=True)
@@ -92,6 +99,18 @@ ForecastPrediction = WeekendPrediction
 
 
 @dataclass(frozen=True)
+class ArticleParseResult:
+    archive_article: ArchiveArticle
+    article: ArchiveArticle | None
+    predictions: list[WeekendPrediction]
+    rejected: list[RejectedBlock]
+    fetched_at: str
+    raw_cache_path: Path
+    html: str
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class MovieCandidate:
     movie_id: int
     movie_url: str | None
@@ -114,6 +133,13 @@ class MovieMatch:
 class HeadingBlock:
     level: int
     text: str
+
+
+@dataclass(frozen=True)
+class ArticleTextBlock:
+    level: int | None
+    text: str
+    in_article_content: bool
 
 
 @dataclass(frozen=True)
@@ -159,10 +185,7 @@ class HtmlFetcher:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def cache_path(self, url: str, suffix: str | None = None) -> Path:
-        if suffix is None:
-            suffix = ".xml" if is_rss_url(url) else ".html"
-        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
-        return self.cache_dir / f"{digest}{suffix}"
+        return cache_path_for_url(self.cache_dir, url, suffix=suffix)
 
     def get(self, url: str) -> tuple[str, Path, bool]:
         cache_path = self.cache_path(url)
@@ -426,7 +449,7 @@ class HtmlTextParser(HTMLParser):
 
 
 class WeekendPreviewParser(HTMLParser):
-    """Collect article headings and tables while preserving <br> boundaries."""
+    """Collect article headings, text blocks, and tables while preserving <br> boundaries."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -434,9 +457,13 @@ class WeekendPreviewParser(HTMLParser):
         self.author: str | None = None
         self.published_date: str | None = None
         self.blocks: list[HeadingBlock] = []
+        self.text_blocks: list[ArticleTextBlock] = []
+        self.article_text_blocks: list[ArticleTextBlock] = []
         self.tables: list[HtmlTable] = []
         self._capture_heading: tuple[str, int] | None = None
         self._heading_parts: list[str] = []
+        self._capture_text_tag: str | None = None
+        self._text_parts: list[str] = []
         self._in_table = False
         self._capture_cell = False
         self._table_depth = 0
@@ -444,6 +471,8 @@ class WeekendPreviewParser(HTMLParser):
         self._current_row: list[str] = []
         self._current_table: list[list[str]] = []
         self._skip_depth = 0
+        self._entry_content_depth = 0
+        self._seen_entry_content = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attrs_dict = dict(attrs)
@@ -452,6 +481,12 @@ class WeekendPreviewParser(HTMLParser):
             return
         if self._skip_depth:
             return
+        classes = set((attrs_dict.get("class") or "").split())
+        if tag in {"div", "article", "section"} and "entry-content" in classes:
+            self._seen_entry_content = True
+            self._entry_content_depth = 1
+        elif self._entry_content_depth and tag in {"div", "article", "section"}:
+            self._entry_content_depth += 1
         if tag == "time" and attrs_dict.get("datetime") and not self.published_date:
             self.published_date = parse_dateish(str(attrs_dict["datetime"]))
         elif tag == "meta":
@@ -468,6 +503,11 @@ class WeekendPreviewParser(HTMLParser):
             self._heading_parts = []
         elif tag == "br" and self._capture_heading:
             self._heading_parts.append("\n")
+        elif tag == "p" and not self._in_table:
+            self._capture_text_tag = tag
+            self._text_parts = []
+        elif tag == "br" and self._capture_text_tag:
+            self._text_parts.append("\n")
         elif tag == "table":
             self._in_table = True
             self._table_depth += 1
@@ -493,8 +533,15 @@ class WeekendPreviewParser(HTMLParser):
                 if tag == "h1" and not self.title:
                     self.title = text
                 self.blocks.append(HeadingBlock(level=self._capture_heading[1], text=text))
+                self._append_text_block(level=self._capture_heading[1], text=text)
             self._capture_heading = None
             self._heading_parts = []
+        elif self._capture_text_tag == tag:
+            text = clean_multiline_text("".join(self._text_parts))
+            if text:
+                self._append_text_block(level=None, text=text)
+            self._capture_text_tag = None
+            self._text_parts = []
         elif self._in_table and tag in {"td", "th"} and self._capture_cell:
             self._current_row.append(clean_multiline_text("".join(self._cell_parts)))
             self._capture_cell = False
@@ -511,14 +558,28 @@ class WeekendPreviewParser(HTMLParser):
                     self.tables.append(table)
                 self._in_table = False
                 self._current_table = []
+        elif self._entry_content_depth and tag in {"div", "article", "section"}:
+            self._entry_content_depth -= 1
 
     def handle_data(self, data: str) -> None:
         if self._skip_depth:
             return
         if self._capture_heading:
             self._heading_parts.append(data)
+        if self._capture_text_tag:
+            self._text_parts.append(data)
         if self._capture_cell:
             self._cell_parts.append(data)
+
+    def _append_text_block(self, *, level: int | None, text: str) -> None:
+        block = ArticleTextBlock(
+            level=level,
+            text=text,
+            in_article_content=self._entry_content_depth > 0 or not self._seen_entry_content,
+        )
+        self.text_blocks.append(block)
+        if block.in_article_content:
+            self.article_text_blocks.append(block)
 
 
 def clean_text(value: str) -> str:
@@ -557,6 +618,13 @@ def canonical_article_url(href: str) -> str:
 def is_rss_url(url: str) -> bool:
     path = urllib.parse.urlparse(url).path.rstrip("/")
     return path.endswith("/feed") or path.endswith("/rss")
+
+
+def cache_path_for_url(cache_dir: Path, url: str, suffix: str | None = None) -> Path:
+    if suffix is None:
+        suffix = ".xml" if is_rss_url(url) else ".html"
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    return cache_dir / f"{digest}{suffix}"
 
 
 def archive_url(page: int) -> str:
@@ -666,6 +734,14 @@ def is_domestic_article(article: ArchiveArticle) -> bool:
 
 def is_weekend_preview_article(article: ArchiveArticle) -> bool:
     return is_domestic_article(article) and article.article_type == "weekend_preview"
+
+
+def is_supported_domestic_forecast_article(article: ArchiveArticle) -> bool:
+    return is_domestic_article(article) and article.article_type in {
+        "weekend_preview",
+        "long_range_forecast",
+        "forecast_tracking",
+    }
 
 
 def normalize_movie_title(value: str) -> str:
@@ -817,23 +893,62 @@ def parse_article(
         article_title=title,
         published_date=published_date,
     )
-    if not predictions:
-        predictions, legacy_rejected = parse_legacy_forecast_tables(
-            parser.tables,
+    legacy_predictions, legacy_rejected = parse_legacy_forecast_tables(
+        parser.tables,
+        article_url=article_url,
+        article_title=title,
+        published_date=published_date,
+        first_row_ordinal=len(predictions) + 1,
+    )
+    predictions = append_unique_predictions(predictions, legacy_predictions)
+    rejected.extend(legacy_rejected)
+    heading_predictions, heading_rejected = parse_standalone_forecast_heading_blocks(
+        parser.blocks,
+        article_url=article_url,
+        article_title=title,
+        published_date=published_date,
+        first_row_ordinal=len(predictions) + 1,
+    )
+    predictions = append_unique_predictions(predictions, heading_predictions)
+    rejected.extend(heading_rejected)
+    if article.article_type != "weekend_preview" or not predictions:
+        text_blocks = parser.article_text_blocks or parser.text_blocks
+        generic_predictions, generic_rejected = parse_generic_forecast_text_blocks(
+            text_blocks,
             article_url=article_url,
             article_title=title,
             published_date=published_date,
+            first_row_ordinal=len(predictions) + 1,
         )
-        rejected.extend(legacy_rejected)
-    if not predictions:
-        predictions, heading_rejected = parse_standalone_forecast_heading_blocks(
-            parser.blocks,
-            article_url=article_url,
-            article_title=title,
-            published_date=published_date,
-        )
-        rejected.extend(heading_rejected)
+        predictions = append_unique_predictions(predictions, generic_predictions)
+        rejected.extend(generic_rejected)
     return article, predictions, rejected
+
+
+def append_unique_predictions(
+    existing: list[WeekendPrediction],
+    candidates: list[WeekendPrediction],
+) -> list[WeekendPrediction]:
+    deduped = list(existing)
+    seen = {prediction_identity_key(prediction) for prediction in deduped}
+    for candidate in candidates:
+        key = prediction_identity_key(candidate)
+        if key in seen:
+            continue
+        deduped.append(candidate)
+        seen.add(key)
+    return deduped
+
+
+def prediction_identity_key(prediction: WeekendPrediction) -> tuple[object, ...]:
+    return (
+        prediction.normalized_movie_title,
+        prediction.forecast_metric,
+        prediction.range_low_usd,
+        prediction.range_high_usd,
+        prediction.target_start_date,
+        prediction.target_end_date,
+    )
 
 
 def table_from_rows(rows: list[list[str]]) -> HtmlTable | None:
@@ -853,6 +968,7 @@ def parse_legacy_forecast_tables(
     article_url: str,
     article_title: str,
     published_date: str | None,
+    first_row_ordinal: int = 1,
 ) -> tuple[list[WeekendPrediction], list[RejectedBlock]]:
     predictions: list[WeekendPrediction] = []
     rejected: list[RejectedBlock] = []
@@ -863,7 +979,7 @@ def parse_legacy_forecast_tables(
             article_url=article_url,
             target_start_date=target_start,
             target_end_date=target_end,
-            first_row_ordinal=len(predictions) + 1,
+            first_row_ordinal=first_row_ordinal + len(predictions),
         )
         if parsed_table:
             predictions.extend(parsed_table)
@@ -967,6 +1083,7 @@ def parse_standalone_forecast_heading_blocks(
     article_url: str,
     article_title: str,
     published_date: str | None,
+    first_row_ordinal: int = 1,
 ) -> tuple[list[WeekendPrediction], list[RejectedBlock]]:
     predictions: list[WeekendPrediction] = []
     rejected: list[RejectedBlock] = []
@@ -988,7 +1105,7 @@ def parse_standalone_forecast_heading_blocks(
             index += 1
             continue
         target_start, target_end = target_dates_from_release_and_range(release_date, range_text, article_title)
-        row_ordinal = len(predictions) + 1
+        row_ordinal = first_row_ordinal + len(predictions)
         normalized = normalize_movie_title(title)
         forecast_metric = "domestic_opening_weekend" if re.search(r"opening", range_text, re.IGNORECASE) else "domestic_weekend"
         key_material = "|".join(
@@ -1042,11 +1159,310 @@ def target_dates_from_release_and_range(
     article_title: str,
 ) -> tuple[str, str]:
     start = dt.date.fromisoformat(release_date)
-    if re.search(r"\b(4|5)-day\b", f"{article_title} {range_text}", re.IGNORECASE):
-        end = start + dt.timedelta(days=3)
-    else:
-        end = start + dt.timedelta(days=2)
+    day_count = forecast_day_count_from_text(f"{article_title} {range_text}") or 3
+    end = start + dt.timedelta(days=day_count - 1)
     return start.isoformat(), end.isoformat()
+
+
+def forecast_day_count_from_text(value: str) -> int | None:
+    match = re.search(r"\b([345])-day\b", value, re.IGNORECASE)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def forecast_range_segments(line: str) -> list[str]:
+    if "$" not in line:
+        return []
+    parts = [clean_text(part) for part in line.split(";") if "$" in part]
+    if len(parts) <= 1:
+        return [line]
+    prefix = ""
+    if ":" in parts[0]:
+        prefix = clean_text(parts[0].split(":", 1)[0])
+    segments = [parts[0]]
+    for part in parts[1:]:
+        if generic_forecast_metric(part) is None and prefix:
+            segments.append(f"{prefix}: {part}")
+        else:
+            segments.append(part)
+    return segments
+
+
+def parse_generic_forecast_text_blocks(
+    blocks: list[ArticleTextBlock],
+    *,
+    article_url: str,
+    article_title: str,
+    published_date: str | None,
+    first_row_ordinal: int,
+) -> tuple[list[WeekendPrediction], list[RejectedBlock]]:
+    predictions: list[WeekendPrediction] = []
+    rejected: list[RejectedBlock] = []
+    release_date = forecast_date_from_text(article_title)
+    pending_title: str | None = None
+    pending_distributor: str | None = None
+    pending_context: list[str] = []
+    for block in blocks:
+        lines = [line for line in clean_multiline_text(block.text).split("\n") if line]
+        if not lines:
+            continue
+        block_predictions = parse_generic_forecast_lines(
+            lines,
+            article_url=article_url,
+            article_title=article_title,
+            published_date=published_date,
+            release_date=release_date,
+            first_row_ordinal=first_row_ordinal + len(predictions),
+        )
+        if block_predictions:
+            predictions.extend(block_predictions)
+            pending_title = None
+            pending_distributor = None
+            pending_context = []
+            continue
+        range_lines = [line for line in lines if generic_forecast_metric(line) is not None]
+        block_date = forecast_date_from_text(block.text)
+        if block_date and any("forecast" in line.lower() for line in lines) and not range_lines:
+            release_date = block_date
+            pending_title = None
+            pending_distributor = None
+            pending_context = []
+            continue
+        if range_lines and pending_title:
+            block_predictions = build_generic_forecast_predictions(
+                title=pending_title,
+                distributor=pending_distributor,
+                range_lines=range_lines,
+                raw_lines=[*pending_context, *lines],
+                article_url=article_url,
+                article_title=article_title,
+                published_date=published_date,
+                release_date=release_date,
+                first_row_ordinal=first_row_ordinal + len(predictions),
+            )
+            if block_predictions:
+                predictions.extend(block_predictions)
+                pending_title = None
+                pending_distributor = None
+                pending_context = []
+            else:
+                rejected.append(
+                    RejectedBlock(
+                        raw_text="\n".join([*pending_context, *lines]),
+                        reason="generic_forecast_block_missing_required_fields",
+                    )
+                )
+            continue
+        if len(lines) <= 2 and not range_lines:
+            title, distributor = parse_generic_identity_line(lines[-1])
+            if title and is_generic_title_candidate(title):
+                pending_title = title
+                pending_distributor = distributor
+                pending_context = lines
+    return predictions, rejected
+
+
+def parse_generic_forecast_lines(
+    lines: list[str],
+    *,
+    article_url: str,
+    article_title: str,
+    published_date: str | None,
+    release_date: str | None,
+    first_row_ordinal: int,
+) -> list[WeekendPrediction]:
+    range_lines = [line for line in lines if generic_forecast_metric(line) is not None]
+    if not range_lines:
+        return []
+    first_range_index = next(index for index, line in enumerate(lines) if generic_forecast_metric(line) is not None)
+    title_line = None
+    for candidate in reversed(lines[:first_range_index]):
+        if is_generic_context_line(candidate):
+            continue
+        title_line = candidate
+        break
+    if title_line is None:
+        return []
+    title, distributor = parse_generic_identity_line(title_line)
+    if not title or not is_generic_title_candidate(title):
+        return []
+    return build_generic_forecast_predictions(
+        title=title,
+        distributor=distributor,
+        range_lines=range_lines,
+        raw_lines=lines,
+        article_url=article_url,
+        article_title=article_title,
+        published_date=published_date,
+        release_date=release_date,
+        first_row_ordinal=first_row_ordinal,
+    )
+
+
+def build_generic_forecast_predictions(
+    *,
+    title: str,
+    distributor: str | None,
+    range_lines: list[str],
+    raw_lines: list[str],
+    article_url: str,
+    article_title: str,
+    published_date: str | None,
+    release_date: str | None,
+    first_row_ordinal: int,
+) -> list[WeekendPrediction]:
+    predictions: list[WeekendPrediction] = []
+    clean_title = clean_legacy_movie_title(title)
+    if not clean_title:
+        return []
+    distributor_value = clean_text(distributor or "Unknown")
+    parsed_release_date = release_date or forecast_date_from_text("\n".join(raw_lines)) or forecast_date_from_text(article_title)
+    for raw_range_line in range_lines:
+        for range_line in forecast_range_segments(raw_range_line):
+            forecast_metric = generic_forecast_metric(range_line)
+            if forecast_metric is None:
+                continue
+            money_range = parse_money_range(range_line)
+            if money_range is None:
+                exact_value = parse_money_value(range_line)
+                if exact_value is None:
+                    continue
+                money_range = (exact_value, exact_value)
+            target_start, target_end = generic_target_dates(
+                forecast_metric=forecast_metric,
+                release_date=parsed_release_date,
+                range_text=range_line,
+                article_title=article_title,
+            )
+            row_ordinal = first_row_ordinal + len(predictions)
+            normalized = normalize_movie_title(clean_title)
+            key_material = "|".join(
+                [
+                    article_url,
+                    str(row_ordinal),
+                    normalized,
+                    forecast_metric,
+                    str(money_range[0]),
+                    str(money_range[1]),
+                    str(target_start),
+                    str(target_end),
+                    GENERIC_FORECAST_PARSER_VERSION,
+                ]
+            )
+            predictions.append(
+                WeekendPrediction(
+                    article_url=article_url,
+                    source_movie_title=clean_title,
+                    normalized_movie_title=normalized,
+                    source_movie_id=boxofficepro_source_movie_id(
+                        market=DOMESTIC_MARKET,
+                        normalized_movie_title=normalized,
+                        target_start_date=target_start,
+                    ),
+                    distributor=distributor_value,
+                    release_status=generic_release_status(forecast_metric),
+                    source_rank=None,
+                    market=DOMESTIC_MARKET,
+                    currency=DOMESTIC_CURRENCY,
+                    forecast_metric=forecast_metric,
+                    range_low_usd=money_range[0],
+                    range_high_usd=money_range[1],
+                    showtime_market_share_pct=None,
+                    target_start_date=target_start,
+                    target_end_date=target_end,
+                    raw_forecast_text="\n".join(raw_lines),
+                    source_context="generic_forecast_range",
+                    parser_version=GENERIC_FORECAST_PARSER_VERSION,
+                    row_ordinal=row_ordinal,
+                    source_row_key=hashlib.sha256(key_material.encode("utf-8")).hexdigest(),
+                )
+            )
+    return predictions
+
+def parse_generic_identity_line(value: str) -> tuple[str | None, str | None]:
+    text = strip_wildcard_title_prefix(clean_text(value))
+    if not text:
+        return None, None
+    if "|" in text:
+        title, distributor = text.split("|", 1)
+        title = clean_text(title)
+        distributor = clean_text(distributor)
+        return title or None, distributor or None
+    rank, title = parse_rank_title(text)
+    _ = rank
+    return title or None, None
+
+
+def generic_forecast_metric(line: str) -> str | None:
+    normalized = clean_text(line).lower().replace("&", " and ")
+    if "$" not in normalized:
+        return None
+    if "domestic total range" in normalized or "domestic total forecast" in normalized:
+        return "domestic_total"
+    if "opening weekend range" in normalized or "opening weekend forecast" in normalized:
+        return "domestic_opening_weekend"
+    if "second weekend range" in normalized:
+        return "domestic_weekend"
+    if re.search(r"\b(?:\d+-day\s+)?weekend\s+(?:range|forecast)\b", normalized):
+        return "domestic_weekend"
+    return None
+
+
+def generic_target_dates(
+    *,
+    forecast_metric: str,
+    release_date: str | None,
+    range_text: str,
+    article_title: str,
+) -> tuple[str | None, str | None]:
+    if release_date is None or forecast_metric == "domestic_total":
+        return None, None
+    release = dt.date.fromisoformat(release_date)
+    primary_range_text = range_text.split(";", 1)[0]
+    text = f"{article_title} {primary_range_text}"
+    day_count = forecast_day_count_from_text(text) or 3
+    return release.isoformat(), (release + dt.timedelta(days=day_count - 1)).isoformat()
+
+
+def generic_release_status(forecast_metric: str) -> str:
+    if forecast_metric == "domestic_opening_weekend":
+        return "NEW"
+    if forecast_metric == "domestic_total":
+        return "LIFETIME"
+    return "UNKNOWN"
+
+
+def is_generic_context_line(line: str) -> bool:
+    normalized = normalize_header(line)
+    if re.search(r"\|\s*(?:new|week\s+\d+)\b", line, flags=re.IGNORECASE):
+        return True
+    return normalized in {
+        "forecast ranges",
+        "weekend forecast",
+        "pros",
+        "cons",
+    }
+
+
+def is_generic_title_candidate(title: str) -> bool:
+    normalized = normalize_header(title)
+    if not normalized:
+        return False
+    if normalized in {
+        "forecast ranges",
+        "weekend forecast",
+        "pros",
+        "cons",
+        "domestic total range",
+        "opening weekend range",
+    }:
+        return False
+    if any(word in normalized.split() for word in {"subscribe", "newsletter", "forecasting"}):
+        return False
+    if "forecast" in normalized:
+        return False
+    return len(title) <= 120
 
 
 def legacy_table_indexes(headers: list[str]) -> dict[str, int] | None:
@@ -2110,7 +2526,130 @@ def article_already_parsed(conn: Any, article_url: str) -> bool:
     return row is not None
 
 
+def parse_cached_article(archive_article: ArchiveArticle, *, cache_dir: Path) -> ArticleParseResult:
+    cache_path = cache_path_for_url(cache_dir, archive_article.article_url)
+    fetched_at = dt.datetime.now(dt.UTC).isoformat()
+    if not cache_path.exists():
+        return ArticleParseResult(
+            archive_article=archive_article,
+            article=None,
+            predictions=[],
+            rejected=[],
+            fetched_at=fetched_at,
+            raw_cache_path=cache_path,
+            html="",
+            error=(
+                f"Cache miss in offline parallel parse mode: {archive_article.article_url}\n"
+                f"Expected cached HTML at: {cache_path}"
+            ),
+        )
+    html = cache_path.read_text(encoding="utf-8")
+    article, predictions, rejected = parse_article(
+        html,
+        article_url=archive_article.article_url,
+        fallback=archive_article,
+    )
+    return ArticleParseResult(
+        archive_article=archive_article,
+        article=article,
+        predictions=predictions,
+        rejected=rejected,
+        fetched_at=fetched_at,
+        raw_cache_path=cache_path,
+        html=html,
+    )
+
+
+def parse_cached_articles_concurrently(
+    articles: list[ArchiveArticle],
+    *,
+    cache_dir: Path,
+    workers: int,
+) -> list[ArticleParseResult]:
+    results_by_index: dict[int, ArticleParseResult] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(parse_cached_article, article, cache_dir=cache_dir): index
+            for index, article in enumerate(articles)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            index = futures[future]
+            results_by_index[index] = future.result()
+    return [results_by_index[index] for index in range(len(articles))]
+
+
+def import_article_parse_result(
+    conn: Any,
+    result: ArticleParseResult,
+    *,
+    issue_source: str,
+) -> tuple[int, int]:
+    if result.error is not None:
+        upsert_article(
+            conn,
+            result.archive_article,
+            status="article_page_unavailable",
+            fetched_at=result.fetched_at,
+            raw_cache_path=result.raw_cache_path,
+            html="",
+        )
+        insert_issue(
+            conn,
+            issue_source=issue_source,
+            issue_type="article_page_unavailable",
+            article_url=result.archive_article.article_url,
+            source_movie_title=None,
+            details=result.error,
+        )
+        conn.commit()
+        return 1, 0
+    if result.article is None:
+        raise RuntimeError("successful article parse result is missing article")
+    article_id = upsert_article(
+        conn,
+        result.article,
+        status="parsed",
+        fetched_at=result.fetched_at,
+        raw_cache_path=result.raw_cache_path,
+        html=result.html,
+    )
+    predictions = match_predictions(conn, result.predictions)
+    clear_article_issues(conn, issue_source=issue_source, article_url=result.article.article_url)
+    for rejected_block in result.rejected:
+        insert_issue(
+            conn,
+            issue_source=issue_source,
+            issue_type="rejected_weekend_block",
+            article_url=result.article.article_url,
+            source_movie_title=None,
+            details=f"{rejected_block.reason}: {rejected_block.raw_text}",
+        )
+    if not predictions:
+        insert_issue(
+            conn,
+            issue_source=issue_source,
+            issue_type="no_weekend_predictions_parsed",
+            article_url=result.article.article_url,
+            source_movie_title=None,
+            details=f"No high-confidence forecast blocks parsed from {result.article.title}",
+        )
+    insert_predictions(
+        conn,
+        article_id,
+        predictions,
+        fetched_at=result.fetched_at,
+        raw_cache_path=result.raw_cache_path,
+    )
+    conn.commit()
+    return 1, len(predictions)
+
+
+def concurrent_cached_article_parsing_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "offline", False)) and int(getattr(args, "parse_workers", 1)) > 1
+
+
 def run(args: argparse.Namespace) -> int:
+    configure_full_refresh_args(args)
     validate_args(args)
     archive_urls = [archive_url(page) for page in range(1, args.max_pages + 1)]
     if args.print_cache_paths:
@@ -2151,8 +2690,9 @@ def run(args: argparse.Namespace) -> int:
         imported_articles = 0
         imported_predictions = 0
         skipped_articles = 0
+        import_articles: list[ArchiveArticle] = []
         for index, archive_article in enumerate(articles, start=1):
-            if not is_weekend_preview_article(archive_article):
+            if not is_supported_domestic_forecast_article(archive_article):
                 continue
             if not args.refresh and article_already_parsed(conn, archive_article.article_url):
                 skipped_articles += 1
@@ -2160,68 +2700,66 @@ def run(args: argparse.Namespace) -> int:
                 continue
             upsert_article(conn, archive_article, status="discovered")
             conn.commit()
-            print(f"Reading article {index}/{len(articles)} {archive_article.title}", file=sys.stderr)
-            try:
-                html, cache_path, _fetched = fetcher.get(archive_article.article_url)
-            except FetchBlocked as exc:
-                fetched_at = dt.datetime.now(dt.UTC).isoformat()
-                upsert_article(
-                    conn,
-                    archive_article,
-                    status="article_page_unavailable",
-                    fetched_at=fetched_at,
-                    raw_cache_path=fetcher.cache_path(archive_article.article_url),
-                    html="",
-                )
-                insert_issue(
-                    conn,
-                    issue_source=args.issue_source,
-                    issue_type="article_page_unavailable",
-                    article_url=archive_article.article_url,
-                    source_movie_title=None,
-                    details=str(exc),
-                )
-                conn.commit()
-                imported_articles += 1
-                continue
-            fetched_at = dt.datetime.now(dt.UTC).isoformat()
-            article, predictions, rejected = parse_article(
-                html,
-                article_url=archive_article.article_url,
-                fallback=archive_article,
+            import_articles.append(archive_article)
+        if concurrent_cached_article_parsing_enabled(args):
+            print(
+                f"Reading and parsing {len(import_articles)} cached articles with {args.parse_workers} workers.",
+                file=sys.stderr,
             )
-            article_id = upsert_article(
-                conn,
-                article,
-                status="parsed",
-                fetched_at=fetched_at,
-                raw_cache_path=cache_path,
-                html=html,
+            results = parse_cached_articles_concurrently(
+                import_articles,
+                cache_dir=args.cache_dir,
+                workers=args.parse_workers,
             )
-            predictions = match_predictions(conn, predictions)
-            clear_article_issues(conn, issue_source=args.issue_source, article_url=article.article_url)
-            for rejected_block in rejected:
-                insert_issue(
-                    conn,
-                    issue_source=args.issue_source,
-                    issue_type="rejected_weekend_block",
-                    article_url=article.article_url,
-                    source_movie_title=None,
-                    details=f"{rejected_block.reason}: {rejected_block.raw_text}",
+            for index, result in enumerate(results, start=1):
+                print(
+                    f"Importing parsed article {index}/{len(results)} {result.archive_article.title}",
+                    file=sys.stderr,
                 )
-            if not predictions:
-                insert_issue(
+                article_count, prediction_count = import_article_parse_result(
                     conn,
+                    result,
                     issue_source=args.issue_source,
-                    issue_type="no_weekend_predictions_parsed",
-                    article_url=article.article_url,
-                    source_movie_title=None,
-                    details=f"No high-confidence Weekend Preview blocks parsed from {article.title}",
                 )
-            insert_predictions(conn, article_id, predictions, fetched_at=fetched_at, raw_cache_path=cache_path)
-            conn.commit()
-            imported_articles += 1
-            imported_predictions += len(predictions)
+                imported_articles += article_count
+                imported_predictions += prediction_count
+        else:
+            for index, archive_article in enumerate(import_articles, start=1):
+                print(f"Reading article {index}/{len(import_articles)} {archive_article.title}", file=sys.stderr)
+                try:
+                    html, cache_path, _fetched = fetcher.get(archive_article.article_url)
+                    article, predictions, rejected = parse_article(
+                        html,
+                        article_url=archive_article.article_url,
+                        fallback=archive_article,
+                    )
+                    result = ArticleParseResult(
+                        archive_article=archive_article,
+                        article=article,
+                        predictions=predictions,
+                        rejected=rejected,
+                        fetched_at=dt.datetime.now(dt.UTC).isoformat(),
+                        raw_cache_path=cache_path,
+                        html=html,
+                    )
+                except FetchBlocked as exc:
+                    result = ArticleParseResult(
+                        archive_article=archive_article,
+                        article=None,
+                        predictions=[],
+                        rejected=[],
+                        fetched_at=dt.datetime.now(dt.UTC).isoformat(),
+                        raw_cache_path=fetcher.cache_path(archive_article.article_url),
+                        html="",
+                        error=str(exc),
+                    )
+                article_count, prediction_count = import_article_parse_result(
+                    conn,
+                    result,
+                    issue_source=args.issue_source,
+                )
+                imported_articles += article_count
+                imported_predictions += prediction_count
         print(
             f"Imported {imported_articles} articles and {imported_predictions} weekend predictions; "
             f"skipped {skipped_articles} parsed articles.",
@@ -2231,6 +2769,17 @@ def run(args: argparse.Namespace) -> int:
         fetcher.close()
         conn.close()
     return 0
+
+
+def configure_full_refresh_args(args: argparse.Namespace) -> None:
+    if not getattr(args, "full_refresh", False):
+        return
+    args.refresh = True
+    args.discovery = "auto"
+    args.start_date = FULL_REFRESH_START_DATE
+    args.end_date = FULL_REFRESH_END_DATE
+    if getattr(args, "max_pages", None) == DEFAULT_MAX_PAGES:
+        args.max_pages = FULL_REFRESH_MAX_PAGES
 
 
 def discovery_urls_for_dry_run(args: argparse.Namespace, archive_urls: list[str]) -> list[str]:
@@ -2287,13 +2836,13 @@ def discover_archive_articles(fetcher: HtmlFetcher, args: argparse.Namespace) ->
         for article in page_articles:
             if article.published_date is None:
                 page_all_older = False
-                if is_weekend_preview_article(article):
+                if is_supported_domestic_forecast_article(article):
                     articles_by_url.setdefault(article.article_url, article)
                 continue
             published = dt.date.fromisoformat(article.published_date)
             if published >= args.start_date:
                 page_all_older = False
-            if not is_weekend_preview_article(article):
+            if not is_supported_domestic_forecast_article(article):
                 continue
             if args.start_date <= published <= args.end_date:
                 page_has_in_window = True
@@ -2310,7 +2859,7 @@ def discover_archive_articles(fetcher: HtmlFetcher, args: argparse.Namespace) ->
 def filter_discovered_articles(articles: list[ArchiveArticle], args: argparse.Namespace) -> list[ArchiveArticle]:
     filtered: list[ArchiveArticle] = []
     for article in articles:
-        if not is_weekend_preview_article(article):
+        if not is_supported_domestic_forecast_article(article):
             continue
         if article.published_date is None:
             filtered.append(article)
@@ -2355,6 +2904,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--discovery must be one of: auto, rss, archive")
     if args.fetch_mode not in {"auto", "http", "browser"}:
         raise SystemExit("--fetch-mode must be one of: auto, http, browser")
+    if args.parse_workers < 1:
+        raise SystemExit("--parse-workers must be at least 1")
+    if args.parse_workers > 1 and not args.offline:
+        raise SystemExit("--parse-workers greater than 1 requires --offline so no network fetcher is shared")
     if args.delay_seconds < MIN_DELAY_SECONDS and not args.offline and not args.dry_run:
         raise SystemExit(f"--delay-seconds must be at least {MIN_DELAY_SECONDS:g}")
     if args.fetch_mode in {"auto", "http"} and "bot" not in args.user_agent.lower() and not args.offline and not args.dry_run:
@@ -2362,7 +2915,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Import Boxoffice Pro Weekend Preview forecasts.")
+    parser = argparse.ArgumentParser(description="Import Boxoffice Pro domestic forecast ranges.")
     parser.add_argument("--start-date", type=parse_date_arg, default=DEFAULT_START_DATE)
     parser.add_argument("--end-date", type=parse_date_arg, default=DEFAULT_END_DATE)
     parser.add_argument(
@@ -2396,7 +2949,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Fetch method. auto tries HTTP first, then Playwright browser fallback on HTTP 403.",
     )
     parser.add_argument("--refresh", action="store_true", help="Reparse even when article status is parsed.")
+    parser.add_argument(
+        "--full-refresh",
+        action="store_true",
+        help=(
+            "Reparse every supported domestic forecast article from RSS and the full archive. "
+            "Overrides discovery, date range, refresh, and the default archive page cap."
+        ),
+    )
     parser.add_argument("--offline", action="store_true", help="Require all pages to exist in cache.")
+    parser.add_argument(
+        "--parse-workers",
+        type=int,
+        default=1,
+        help="Concurrent cached article read/parse workers. Values above 1 require --offline.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print discovery URLs and exit.")
     parser.add_argument(
         "--print-cache-paths",
@@ -2409,7 +2976,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=[],
         help="Extra article URL to include when printing cache paths. May be repeated.",
     )
-    parser.add_argument("--max-pages", type=int, default=25, help="Maximum archive pages to inspect.")
+    parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES, help="Maximum archive pages to inspect.")
     parser.add_argument("--max-articles", type=int, help="Optional cap for smoke tests after archive discovery.")
     parser.add_argument("--issue-source", default="boxofficepro_weekend_import", help="Label used for import issues.")
     return parser

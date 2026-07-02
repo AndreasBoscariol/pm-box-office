@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import datetime as dt
 import tempfile
 import unittest
 from pathlib import Path
@@ -90,6 +91,26 @@ def insert_movie_fixture(conn) -> None:
             ("2026-05-04", 400, 2800, 0),
         ],
     )
+
+
+class WikipediaWindowTests(unittest.TestCase):
+    def test_cap_activity_window_limits_future_dates_without_losing_available_days(self) -> None:
+        capped = ingest.cap_activity_window(
+            start_date=dt.date(2026, 4, 30),
+            end_date=dt.date(2026, 5, 3),
+            latest_available_date=dt.date(2026, 5, 1),
+        )
+
+        self.assertEqual((dt.date(2026, 4, 30), dt.date(2026, 5, 1), False), capped)
+
+    def test_cap_activity_window_defers_when_no_pageview_days_can_exist_yet(self) -> None:
+        self.assertIsNone(
+            ingest.cap_activity_window(
+                start_date=dt.date(2026, 5, 2),
+                end_date=dt.date(2026, 5, 3),
+                latest_available_date=dt.date(2026, 5, 1),
+            )
+        )
 
 
 class WikipediaIngestTests(unittest.TestCase):
@@ -218,6 +239,119 @@ class WikipediaIngestTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual((60, 2, 2, 3), row)
 
+    def test_ingest_movie_fetches_pageviews_and_paper_activity_with_capped_window(self) -> None:
+        class FixtureJsonFetcher:
+            def __init__(self, cache_path: Path) -> None:
+                self.cache_path = cache_path
+                self.urls: list[str] = []
+
+            def get_json(self, url: str):
+                self.urls.append(url)
+                if "list=search" in url:
+                    return {
+                        "query": {
+                            "search": [
+                                {
+                                    "ns": 0,
+                                    "title": "Sample Movie",
+                                    "snippet": "2026 film",
+                                    "pageid": 123,
+                                    "size": 100,
+                                }
+                            ]
+                        }
+                    }, self.cache_path, False
+                if "metrics/pageviews" in url:
+                    return {
+                        "items": [
+                            {"timestamp": "2026043000", "views": 10, "access": "all-access", "agent": "user"},
+                            {"timestamp": "2026050100", "views": 20, "access": "all-access", "agent": "user"},
+                        ]
+                    }, self.cache_path, False
+                if "prop=revisions" in url:
+                    return {
+                        "query": {
+                            "pages": {
+                                "123": {
+                                    "revisions": [
+                                        {
+                                            "revid": 1,
+                                            "timestamp": "2026-04-30T01:00:00Z",
+                                            "user": "Alice",
+                                            "userid": 11,
+                                        },
+                                        {
+                                            "revid": 2,
+                                            "timestamp": "2026-05-01T01:00:00Z",
+                                            "user": "Alice",
+                                            "userid": 11,
+                                            "parentid": 1,
+                                        },
+                                        {
+                                            "revid": 3,
+                                            "timestamp": "2026-05-01T02:00:00Z",
+                                            "user": "Bob",
+                                            "userid": 22,
+                                            "parentid": 2,
+                                        },
+                                        {
+                                            "revid": 4,
+                                            "timestamp": "2026-05-01T03:00:00Z",
+                                            "user": "HelpfulBot",
+                                            "userid": 33,
+                                            "parentid": 3,
+                                        },
+                                    ]
+                                }
+                            }
+                        }
+                    }, self.cache_path, False
+                raise AssertionError(url)
+
+        movie = ingest.select_candidate_movies(
+            self.conn,
+            release_year=None,
+            min_opening_theaters=None,
+            movie_limit=None,
+        )[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "response.json"
+            cache.write_text("{}", encoding="utf-8")
+            fetcher = FixtureJsonFetcher(cache)
+
+            pageview_count, revision_count = ingest.ingest_movie(
+                self.conn,
+                fetcher,  # type: ignore[arg-type]
+                movie=movie,
+                language="en",
+                day_start=-1,
+                day_end=2,
+                issue_source="test",
+                latest_available_date=dt.date(2026, 5, 1),
+            )
+
+        self.assertEqual(2, pageview_count)
+        self.assertEqual(4, revision_count)
+        self.assertTrue(
+            any(url.endswith("/20260430/20260501") for url in fetcher.urls if "metrics/pageviews" in url)
+        )
+        self.assertTrue(any("rvend=2026-05-01T23%3A59%3A59Z" in url for url in fetcher.urls))
+        self.assertEqual(2, self.conn.execute("SELECT COUNT(*) FROM wiki_pageviews_daily").fetchone()[0])
+        self.assertEqual(4, self.conn.execute("SELECT COUNT(*) FROM wiki_revisions").fetchone()[0])
+        state = self.conn.execute(
+            "SELECT status, pageviews_rows, revision_rows, last_error FROM wiki_ingest_state"
+        ).fetchone()
+        self.assertEqual(("partial", 2, 4), state[:3])
+        self.assertIn("latest available Wikimedia pageview date 2026-05-01", state[3])
+        row = self.conn.execute(
+            """
+            SELECT V, U, R, E
+            FROM wiki_movie_time_features
+            WHERE movie_id = 1 AND movie_time_day = 0
+            """
+        ).fetchone()
+        self.assertEqual((30, 2, 2, 3), row)
+
     def test_resume_helpers_and_reset_failed(self) -> None:
         self.assertFalse(
             ingest.state_is_completed(
@@ -270,6 +404,56 @@ class WikipediaIngestTests(unittest.TestCase):
             movie_limit=None,
         )
         self.assertEqual([], rows)
+
+    def test_candidate_selection_includes_boxofficepro_prerelease_movies(self) -> None:
+        self.conn.execute("ALTER TABLE movies ALTER COLUMN movie_url DROP NOT NULL")
+        self.conn.execute(
+            """
+            INSERT INTO movies (movie_id, movie_url, title, release_year)
+            VALUES (2, NULL, 'Young Washington', 2026)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE boxofficepro_weekend_predictions (
+                source_movie_title TEXT NOT NULL,
+                forecast_metric TEXT NOT NULL,
+                target_start_date DATE,
+                matched_movie_id BIGINT REFERENCES movies(movie_id)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO boxofficepro_weekend_predictions (
+                source_movie_title, forecast_metric, target_start_date, matched_movie_id
+            ) VALUES (
+                'Young Washington', 'domestic_opening_weekend', '2026-07-03', 2
+            )
+            """
+        )
+
+        rows = ingest.select_candidate_movies(
+            self.conn,
+            release_year=2026,
+            min_opening_theaters=None,
+            movie_limit=None,
+        )
+
+        by_title = {row.title: row for row in rows}
+        self.assertIn("Sample Movie (2026)", by_title)
+        self.assertIn("Young Washington", by_title)
+        self.assertIsNone(by_title["Young Washington"].movie_url)
+        self.assertEqual("2026-07-03", by_title["Young Washington"].opening_date)
+        self.assertEqual(0, by_title["Young Washington"].release_run_id)
+
+        rows = ingest.select_candidate_movies(
+            self.conn,
+            release_year=2026,
+            min_opening_theaters=3000,
+            movie_limit=None,
+        )
+        self.assertNotIn("Young Washington", {row.title for row in rows})
 
 
 if __name__ == "__main__":

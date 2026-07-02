@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from pm_box_office.models import evaluate_boxofficepro
 from pm_box_office.models import train
-from pm_box_office.research.papers import recreate_competitive_dynamics
+from pm_box_office.models.opening_weekend import backtest as opening_forecast_backtest
+from pm_box_office.research.papers import recreate_day_by_day_opening_weekend
 from pm_box_office.sources.amc import collect
 from pm_box_office.sources.amc.jobs import worker
+from pm_box_office.sources.social_x import ingest as social_x
 from pm_box_office.sources.the_numbers import ingest as the_numbers
 from pm_box_office.sources.wikipedia import ingest as wikipedia
 
@@ -17,10 +18,11 @@ class CliDatabaseArgTests(unittest.TestCase):
             collect.build_parser(),
             worker.build_parser(),
             train.build_parser(),
-            evaluate_boxofficepro.build_parser(),
-            recreate_competitive_dynamics.build_parser(),
+            opening_forecast_backtest.build_parser(),
+            recreate_day_by_day_opening_weekend.build_parser(),
             the_numbers.build_arg_parser(),
             wikipedia.build_parser(),
+            social_x.build_parser(),
         ]
         for parser in parsers:
             with self.subTest(prog=parser.prog):

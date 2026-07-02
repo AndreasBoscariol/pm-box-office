@@ -15,9 +15,11 @@ from pm_box_office.sources.amc import db
 from pm_box_office.sources.amc.client import DEFAULT_CACHE_DIR, DEFAULT_USER_AGENT, HtmlFetcher
 from pm_box_office.sources.amc.diagnostics import diagnostics_context, log_backoff_event, short_error
 from pm_box_office.sources.amc.jobs import handlers, queue
+from pm_box_office.sources.amc.parsers import SeatMapUnavailable
 
 
 LOGGER = logging.getLogger("amc.worker")
+DATABASE_INIT_LOCK_KEY = "amc_database_initialize"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,9 +52,9 @@ def run_worker(args: argparse.Namespace) -> int:
         user_agent=args.user_agent,
     )
     try:
-        db.initialize_amc_database(conn)
-        conn.commit()
+        initialize_worker_database(conn)
         LOGGER.info("worker started worker_id=%s limit=%s", args.worker_id, args.limit)
+        last_logged_seat_throttle_until: dt.datetime | None = None
         while True:
             write_heartbeat(args.heartbeat_path)
             reset_count = db.reset_stale_running_tasks(
@@ -62,6 +64,11 @@ def run_worker(args: argparse.Namespace) -> int:
             if reset_count:
                 LOGGER.warning("reset %s stale running tasks", reset_count)
                 conn.commit()
+            last_logged_seat_throttle_until = log_shared_seat_throttle_wait(
+                conn,
+                worker_id=args.worker_id,
+                previous_blocked_until=last_logged_seat_throttle_until,
+            )
             tasks = queue.claim_due_tasks(conn, worker_id=args.worker_id, limit=args.limit)
             conn.commit()
             if not tasks:
@@ -86,6 +93,21 @@ def run_worker(args: argparse.Namespace) -> int:
                         queue.mark_succeeded(conn, task.task_id)
                         conn.commit()
                         LOGGER.info("task succeeded task_id=%s", task.task_id)
+                    except SeatMapUnavailable as exc:
+                        LOGGER.info("task skipped task_id=%s reason=%s", task.task_id, short_error(exc))
+                        log_backoff_event(
+                            "seat_task_skipped_no_seat_map",
+                            error_type=type(exc).__name__,
+                            error_message=short_error(exc),
+                        )
+                        conn.rollback()
+                        try:
+                            db.mark_task_skipped(conn, task.task_id, exc=exc)
+                            conn.commit()
+                        except Exception:
+                            LOGGER.exception("could not mark task skipped task_id=%s", task.task_id)
+                            conn.rollback()
+                        continue
                     except Exception as exc:
                         LOGGER.exception("task failed task_id=%s", task.task_id)
                         log_backoff_event(
@@ -95,7 +117,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         )
                         conn.rollback()
                         try:
-                            queue.schedule_retry_or_fail(conn, task.task_id, exc)
+                            queue.schedule_retry_or_fail(conn, task, exc)
                             conn.commit()
                         except Exception:
                             LOGGER.exception("could not mark task failed task_id=%s", task.task_id)
@@ -115,6 +137,64 @@ def main() -> int:
 def write_heartbeat(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(time.time()), encoding="utf-8")
+
+
+def initialize_worker_database(conn: object) -> None:
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (DATABASE_INIT_LOCK_KEY,))
+    if worker_schema_is_ready(conn):
+        conn.commit()
+        return
+    db.initialize_amc_database(conn)
+    conn.commit()
+
+
+def worker_schema_is_ready(conn: object) -> bool:
+    row = conn.execute(
+        """
+        SELECT
+            to_regclass('public.collection_tasks') IS NOT NULL
+            AND to_regclass('public.amc_throttle_state') IS NOT NULL
+        """
+    ).fetchone()
+    return bool(row and row[0])
+
+
+def log_shared_seat_throttle_wait(
+    conn: object,
+    *,
+    worker_id: str,
+    previous_blocked_until: dt.datetime | None,
+) -> dt.datetime | None:
+    now = db.utc_now()
+    blocked_until = db.active_throttle_until(
+        conn,
+        queue.SEAT_COLLECTION_THROTTLE_KEY,
+        now=now,
+    )
+    if blocked_until is not None:
+        if previous_blocked_until != blocked_until:
+            log_backoff_event(
+                "shared_seat_collection_wait",
+                worker_id=worker_id,
+                throttle_key=queue.SEAT_COLLECTION_THROTTLE_KEY,
+                throttle_scope="all_workers",
+                workers_share_server_identity=True,
+                blocked_until=blocked_until,
+                wait_remaining_seconds=max(0, int((blocked_until - now).total_seconds())),
+            )
+        return blocked_until
+
+    if previous_blocked_until is not None:
+        log_backoff_event(
+            "shared_seat_collection_backoff_released",
+            worker_id=worker_id,
+            throttle_key=queue.SEAT_COLLECTION_THROTTLE_KEY,
+            throttle_scope="all_workers",
+            workers_share_server_identity=True,
+            previous_blocked_until=previous_blocked_until,
+            release_lag_seconds=max(0, int((now - previous_blocked_until).total_seconds())),
+        )
+    return None
 
 
 def task_diagnostics_fields(worker_id: str, task: db.CollectionTask) -> dict[str, object]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -46,10 +47,25 @@ def search_movies(q: str = Query(default="", max_length=120), limit: int = Query
 
 
 @router.get("/forecasts/movies/{movie_id}")
-def movie_forecast(movie_id: int) -> object:
+def movie_forecast(
+    movie_id: int,
+    target_type: str | None = Query(default=None, max_length=20),
+    target_start_date: str | None = Query(default=None, max_length=10),
+) -> object:
+    parsed_target_start_date: dt.date | None = None
+    if target_start_date:
+        try:
+            parsed_target_start_date = dt.date.fromisoformat(target_start_date)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="target_start_date must be YYYY-MM-DD") from exc
     conn = connect_database()
     try:
-        forecast = forecast_service.forecast_movie(conn, movie_id=movie_id)
+        forecast = forecast_service.forecast_movie(
+            conn,
+            movie_id=movie_id,
+            target_type=target_type,
+            target_start_date=parsed_target_start_date,
+        )
         conn.rollback()
     finally:
         conn.close()

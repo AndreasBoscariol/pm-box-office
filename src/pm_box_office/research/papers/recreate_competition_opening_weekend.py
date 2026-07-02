@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from pm_box_office.db.connection import connect_database, database_url_from_env
-from pm_box_office.research.papers.recreate_wikipedia_boxoffice import (
+from pm_box_office.research.papers.common import (
     format_number,
     mean,
     parse_db_date,

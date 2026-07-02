@@ -480,6 +480,27 @@ def refresh_all_source_freshness(conn: Any) -> None:
     )
     refresh_table_metric(
         conn,
+        source_key="rotten_tomatoes",
+        metric_key="matched_media",
+        table_name="rotten_tomatoes_media",
+        timestamp_column="fetched_at",
+    )
+    refresh_table_metric(
+        conn,
+        source_key="rotten_tomatoes",
+        metric_key="critic_reviews",
+        table_name="rotten_tomatoes_reviews",
+        timestamp_column="fetched_at",
+    )
+    refresh_table_metric(
+        conn,
+        source_key="rotten_tomatoes",
+        metric_key="movie_matches",
+        table_name="movie_rotten_tomatoes_media",
+        timestamp_column="matched_at",
+    )
+    refresh_table_metric(
+        conn,
         source_key="amc_worker",
         metric_key="seat_snapshots",
         table_name="amc_seat_snapshots",

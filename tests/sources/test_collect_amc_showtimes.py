@@ -175,6 +175,14 @@ RSC_SEATS_PAYLOAD = """
 """
 
 
+RSC_NO_SEAT_MAP_PAYLOAD = """
+2:["$","$Ld",null,{"showtime":{"seatingLayout":null,"attributes":[
+  {"name":"Closed Caption"},
+  {"name":"Descriptive Video"}
+]}}}]
+"""
+
+
 class FakeFetcher:
     def __init__(self, pages: dict[str, str]) -> None:
         self.pages = pages
@@ -305,6 +313,17 @@ class CollectAmcShowtimesTests(unittest.TestCase):
         self.assertEqual(2, fill.total_seats)
         self.assertEqual(1, fill.available_seats)
         self.assertEqual(1, fill.filled_or_unavailable_seats)
+
+    def test_extract_rsc_seat_fill_marks_null_layout_unavailable(self) -> None:
+        with self.assertRaises(amc.SeatMapUnavailable) as raised:
+            amc.extract_rsc_seat_fill(
+                RSC_NO_SEAT_MAP_PAYLOAD,
+                theatre_slug="amc-sample-10",
+                date=dt.date(2026, 7, 1),
+                showtime_id="100",
+            )
+
+        self.assertEqual(("Closed Caption", "Descriptive Video"), raised.exception.attribute_names)
 
     def test_fetch_seat_fill_falls_back_to_rsc_payload(self) -> None:
         fetcher = FakeFetcher(

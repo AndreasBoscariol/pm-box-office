@@ -157,6 +157,38 @@ class AudienceParserTests(unittest.TestCase):
         self.assertEqual("not_found", ingest.match_imdb_title(missing, titles, akas).match_status)
         self.assertEqual("tt5555555", ingest.match_imdb_title(url_reordered, titles, akas).tconst)
 
+    def test_imdb_match_duplicate_tconst_is_stored_as_ambiguous(self) -> None:
+        class FakeCursor:
+            def __init__(self, row=None) -> None:
+                self.row = row
+
+            def fetchone(self):
+                return self.row
+
+        class FakeConn:
+            def __init__(self) -> None:
+                self.insert_params = None
+
+            def execute(self, sql, params=None):
+                if "SELECT movie_id" in sql and "FROM movie_imdb_titles" in sql:
+                    return FakeCursor((1,))
+                if "INSERT INTO movie_imdb_titles" in sql:
+                    self.insert_params = params
+                return FakeCursor()
+
+        conn = FakeConn()
+
+        stored = ingest.upsert_imdb_match(
+            conn,
+            ingest.ImdbMatch(2, "tt32104007", "matched", "wikidata_sparql", 150.0, "qid=Q1"),
+        )
+
+        self.assertFalse(stored)
+        self.assertEqual(2, conn.insert_params[0])
+        self.assertIsNone(conn.insert_params[1])
+        self.assertEqual("ambiguous", conn.insert_params[2])
+        self.assertIn("already matched to movie_id 1", conn.insert_params[6])
+
     def test_imdb_ratings_parser(self) -> None:
         ratings = ingest.parse_imdb_ratings(
             gzipped_tsv("tconst\taverageRating\tnumVotes\ntt1111111\t7.4\t12345\n")
@@ -569,6 +601,31 @@ class AudiencePostgresTests(unittest.TestCase):
         )
         self.conn.execute(
             """
+            INSERT INTO movies (movie_id, title, release_year, release_date)
+            VALUES (200, 'Young Washington', 2026, '2026-07-03')
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE boxofficepro_weekend_predictions (
+                source_movie_title TEXT NOT NULL,
+                forecast_metric TEXT NOT NULL,
+                target_start_date DATE,
+                matched_movie_id BIGINT REFERENCES movies(movie_id)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO boxofficepro_weekend_predictions (
+                source_movie_title, forecast_metric, target_start_date, matched_movie_id
+            ) VALUES (
+                'Young Washington', 'domestic_opening_weekend', '2026-07-03', 200
+            )
+            """
+        )
+        self.conn.execute(
+            """
             CREATE TABLE daily_chart_pages (
                 chart_date TEXT NOT NULL,
                 movie_url TEXT NOT NULL,
@@ -617,7 +674,7 @@ class AudiencePostgresTests(unittest.TestCase):
             active_days=7,
         )
         self.conn.commit()
-        self.assertEqual(1, upserted)
+        self.assertEqual(2, upserted)
 
         candidates = ingest.select_candidate_movies(
             self.conn,
@@ -637,8 +694,12 @@ class AudiencePostgresTests(unittest.TestCase):
         self.assertNotIn("Old Chart Movie", titles)
         self.assertNotIn("Rerelease Movie", titles)
         self.assertNotIn("Citizen Kane (Special Engagement, re-release)", titles)
+        self.assertIn("Young Washington", titles)
         chart_movie = next(candidate for candidate in candidates if candidate.title == "Chart Only Movie")
         self.assertEqual(2026, chart_movie.release_year)
+        bop_movie = next(candidate for candidate in candidates if candidate.title == "Young Washington")
+        self.assertIsNone(bop_movie.movie_url)
+        self.assertEqual("2026-07-03", bop_movie.release_date)
 
         limited = ingest.select_candidate_movies(
             self.conn,
@@ -731,6 +792,42 @@ class AudiencePostgresTests(unittest.TestCase):
             """
         ).fetchone()
         self.assertEqual((1, dt.date(2026, 7, 3), dt.date(2026, 7, 2), 12345, 99), panel_row)
+
+    def test_imdb_match_duplicate_tconst_marks_new_movie_ambiguous(self) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO movies (movie_id, movie_url, title, release_year, release_date)
+            VALUES
+                (1, 'https://www.the-numbers.com/movie/Original-(2026)', 'Original', 2026, '2026-07-03'),
+                (2, 'https://www.the-numbers.com/movie/Duplicate-(2026)', 'Duplicate', 2026, '2026-07-03')
+            """
+        )
+        imdb_title = ingest.ImdbTitle("tt32104007", "Original", "Original", 2026, "movie", 0, "Drama")
+        ingest.upsert_imdb_titles(self.conn, [imdb_title], last_seen_at="2026-06-30T00:00:00+00:00")
+
+        self.assertTrue(
+            ingest.upsert_imdb_match(
+                self.conn,
+                ingest.ImdbMatch(1, "tt32104007", "matched", "fixture", 1.0),
+            )
+        )
+        self.assertFalse(
+            ingest.upsert_imdb_match(
+                self.conn,
+                ingest.ImdbMatch(2, "tt32104007", "matched", "wikidata_sparql", 150.0),
+            )
+        )
+
+        rows = self.conn.execute(
+            """
+            SELECT movie_id, tconst, match_status, match_method, notes
+            FROM movie_imdb_titles
+            ORDER BY movie_id
+            """
+        ).fetchall()
+        self.assertEqual("tt32104007", rows[0][1])
+        self.assertEqual((2, None, "ambiguous", "wikidata_sparql"), rows[1][:4])
+        self.assertIn("already matched to movie_id 1", rows[1][4])
 
     def test_failed_state_can_be_reset(self) -> None:
         self.conn.execute(

@@ -18,6 +18,9 @@ pm_box_office...` or the console scripts declared in `pyproject.toml`.
   counts for upcoming and recently active The Numbers movies.
 - Wikipedia ingests pageview and revision activity for movies already present
   in the The Numbers tables.
+- Social X/Nitter is an experimental proof of concept for observed public
+  X/Twitter-clone mention samples; it is not treated as production search
+  volume.
 - AMC collects theatres, showtimes, seat snapshots, and derived same-day
   prediction features.
 - Model training reads from Postgres and writes artifacts under `results/`.
@@ -141,6 +144,40 @@ Useful command:
 .venv/bin/python -m pm_box_office.sources.audience.ingest --max-movies 10
 ```
 
+### Social X/Nitter Search-Buzz POC
+
+Module: `pm_box_office.sources.social_x.ingest`
+
+This experimental source tests whether Nitter-compatible public pages can
+produce useful movie-title buzz samples. It stores observed public-page samples
+and daily aggregates with collection status flags; do not interpret the counts
+as complete X/Twitter search volume.
+
+Collected data:
+
+- Per-movie query variants with ambiguity notes.
+- Raw observed post samples from cached `ntscraper` results.
+- Daily sampled mention aggregates with cap and failure status.
+- A Markdown feasibility report under `results/social_x/` by default.
+
+Main database writes:
+
+- `social_x_queries` stores generated title/context/hashtag queries.
+- `social_x_posts_sample` stores normalized observed posts.
+- `social_x_daily_counts` stores per-movie/day aggregates.
+- `analytics.social_x_daily_features_v1` exposes rolling POC features.
+
+Useful commands:
+
+```sh
+.venv/bin/python -m pm_box_office.sources.social_x.ingest --dry-run --movie-limit 5 --start-date 2026-07-01 --end-date 2026-07-01
+.venv/bin/python -m pm_box_office.sources.social_x.ingest --offline --cache-dir data/raw/social_x --movie-limit 5
+```
+
+Public Nitter instances are unreliable and should be used slowly. The source is
+registered as disabled in orchestration and hidden from the dashboard until a
+feasibility run shows stable, non-empty, date-bucketed samples.
+
 ## Setup
 
 ```sh
@@ -192,6 +229,22 @@ responses to `data/raw/boxofficepro`:
 Use `--discovery rss` for feed-only recent runs, or `--discovery archive` for
 explicit archive backfills.
 
+For a complete Boxoffice Pro backfill/reparse across RSS and the full forecast
+archive, use:
+
+```sh
+.venv/bin/python -m pm_box_office.sources.boxofficepro.ingest --full-refresh --fetch-mode auto
+```
+
+`--full-refresh` forces `--refresh`, uses both RSS and archive discovery,
+expands the date window to all dates, and raises the archive page cap so the
+crawler walks until the archive runs out of pages.
+After pages are cached, reparse cached article HTML concurrently with:
+
+```sh
+.venv/bin/python -m pm_box_office.sources.boxofficepro.ingest --full-refresh --offline --parse-workers 8
+```
+
 Audience snapshots, after The Numbers has populated movies/releases/actuals:
 
 ```sh
@@ -228,11 +281,287 @@ Train AMC box office models:
 .venv/bin/python -m pm_box_office.models.train
 ```
 
+Build deployed opening-window forecast artifacts:
+
+```sh
+.venv/bin/python -m pm_box_office.models.opening_weekend.backtest \
+  --metrics-csv results/papers/day_by_day_opening_weekend/<run>/day_by_day_metrics_by_horizon.csv
+```
+
+The deployed forecast path is `pm_box_office.models.opening_weekend`. It uses a
+versioned registry, explicit 3-day/4-day/5-day target windows, BOP-size
+segments, one-day-lag actual availability, and production/shadow routing. The
+older standalone competition and Boxoffice Pro evaluation CLIs are deprecated as
+forecast entrypoints; their useful metrics and features are folded into the
+day-by-day backtest and deployed registry artifacts.
+
 Find Polymarket movie/box-office accounts:
 
 ```sh
 .venv/bin/python -m pm_box_office.sources.polymarket.accounts
 ```
+
+## Research: Opening-Weekend Competition Checkpoints
+
+The current retained competition experiment lives in:
+
+```sh
+.venv/bin/python -m pm_box_office.research.papers.recreate_day_by_day_opening_weekend \
+  --snapshot-days -1,1,2 \
+  --train-start-year 2022 \
+  --train-end-year 2024 \
+  --test-start-year 2025 \
+  --test-end-year 2026 \
+  --min-opening-day-gross 0 \
+  --min-bop-forecast-midpoint 5000000 \
+  --out results/papers/day_by_day_opening_weekend_train2022_2024_test2025_2026_bop5m
+```
+
+This run trains on 2022-2024 and tests on 2025-2026, limited to movies with a
+Boxoffice Pro opening-weekend midpoint of at least $5M. The checkpoint question
+is: after conditioning on the BOP estimate and the actuals known so far, does a
+competition signal improve final opening-weekend gross prediction?
+
+The retained checkpoint artifacts are written under:
+
+- `results/papers/day_by_day_opening_weekend_train2022_2024_test2025_2026_bop5m`
+- `results/papers/day_by_day_opening_weekend_train2022_2025_test2026_bop5m`
+
+The primary files are:
+
+- `competitive_checkpoint_headline.csv`
+- `competitive_checkpoint_metrics.csv`
+- `competitive_checkpoint_predictions.csv`
+- `competitive_checkpoint_coefficients.csv`
+
+Headline results for the successful 2022-2024 train / 2025-2026 test run:
+
+| Checkpoint | Baseline | Best competition model | Best competition | MAPE lift |
+| --- | ---: | --- | ---: | ---: |
+| Pre-release, BOP only | 34.95% | share-attraction | 34.27% | +0.68 pts |
+| Friday actual known | 16.84% | residual competition | 17.19% | -0.35 pts |
+| Friday and Saturday actuals known | 9.42% | residual competition | 8.32% | +1.11 pts |
+
+The checkpoint models predict the BOP residual:
+
+```text
+log(actual opening weekend gross) - log(Boxoffice Pro midpoint)
+```
+
+All checkpoint predictions are reconciled upward when known actual gross already
+exceeds the BOP midpoint. The three competition variants are:
+
+- `*_competition`: residualized lagged competition. It first predicts expected
+  7-day competitor gross from the focal movie's BOP midpoint using train rows
+  only, then uses the residual as the competition surprise signal.
+- `*_share_attraction`: a Krider/Weinberg-inspired proxy. It calculates the
+  competitor share of an attraction set using focal BOP midpoint, recent
+  competitor grosses, the top competitor, and background competition.
+- `*_logit_demand`: an Einav-inspired proxy. It calculates the log focal
+  attractiveness relative to the competitive choice set:
+  `log((focal BOP midpoint + 1) / (competitor + background + 1))`.
+
+The useful signal appears at the Saturday-known checkpoint because the model is
+no longer estimating the whole opening weekend from scratch. Friday and
+Saturday actuals anchor the movie's own demand, and the competition term helps
+calibrate the remaining Sunday expectation when the observed marketplace is
+stronger or weaker than expected for a movie of that forecast size. Pre-release
+share-attraction shows a small lift, which is consistent with the paper logic:
+competition matters most when it changes the expected audience allocation
+before own actuals are known. Friday-only competition did not improve this
+split; Friday actuals already absorb much of the movie-specific demand signal,
+while one extra competition term adds little and can overfit a small holdout.
+
+## Research: Wikipedia+BOP Residual Timing
+
+The retained Wikipedia timing experiment also runs through
+`pm_box_office.research.papers.recreate_day_by_day_opening_weekend`:
+
+```sh
+.venv/bin/python -m pm_box_office.research.papers.recreate_day_by_day_opening_weekend \
+  --snapshot-days -14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1,0,1,2,3 \
+  --target-types 3_day \
+  --train-start-year 2022 \
+  --train-end-year 2024 \
+  --test-start-year 2025 \
+  --test-end-year 2026 \
+  --min-opening-day-gross 0 \
+  --min-bop-forecast-midpoint 5000000 \
+  --out results/papers/day_by_day_wiki_bop_residual_train2022_2024_test2025_2026_bop5m
+```
+
+This adapts Mestyán, Yasseri, and Kertész's Wikipedia activity model to the
+BOP residual setting. The original paper predicts movie revenue from
+accumulated Wikipedia activity at movie-time `t`; here BOP remains the baseline
+and Wikipedia predicts:
+
+```text
+log(actual 3-day opening weekend gross) - log(Boxoffice Pro midpoint)
+```
+
+The primary Wikipedia models are:
+
+- `bop_residual_wiki_views`: uses only accumulated page views, `log1p(V)`.
+- `bop_residual_wiki_full_activity`: uses accumulated `log1p(V)`, `log1p(U)`,
+  `log1p(R)`, and `log1p(E)`, where `U` is unique human editors, `R` is
+  collaborative rigor, and `E` is human edits.
+- `bop_residual_wiki_full_activity_plus_theaters`: sensitivity only; it adds
+  opening theaters and is excluded from the primary pre-release conclusion
+  because actual theater count may not be known at early snapshots.
+
+Pre-release headline results, train 2022-2024 / test 2025-2026 / BOP midpoint
+at least $5M:
+
+| Snapshot | Raw BOP MAPE | Views MAPE | Full activity MAPE | Best lift |
+| ---: | ---: | ---: | ---: | ---: |
+| `t=-2` | 34.95% | 34.86% | 30.29% | +4.65 pts |
+| `t=-1` | 34.95% | 34.76% | 30.70% | +4.25 pts |
+| `t=0` | 34.95% | 33.20% | 35.10% | +1.75 pts |
+
+The full activity model works best immediately before release, consistent with
+the paper's intuition that editor activity plus views captures committed public
+attention before revenue is observed. On release day, views-only is better:
+views are the cleanest mass-attention signal, while editor variables can add
+noise in a small holdout.
+
+Once Friday/Saturday actuals are known, the displayed forecast with train-only
+remainder ratios ties across BOP and Wikipedia:
+
+| Snapshot | Raw BOP MAPE | Views MAPE | Full activity MAPE |
+| ---: | ---: | ---: | ---: |
+| `t=1` | 12.47% | 12.47% | 12.47% |
+| `t=2` | 4.14% | 4.14% | 4.14% |
+| `t=3` | 0.00% | 0.00% | 0.00% |
+
+This does not mean Wikipedia has no post-release value. It means the displayed
+forecast policy is dominated by known actuals plus train-only weekend remainder
+ratios. To test the more precise question, the experiment also predicts the
+remaining-weekend residual directly:
+
+```text
+log(actual remaining weekend gross)
+  - log(expected remaining weekend gross from train-only remainder ratio)
+```
+
+Direct remaining-weekend results:
+
+| Snapshot | Baseline total MAPE | Views total MAPE | Full activity total MAPE |
+| ---: | ---: | ---: | ---: |
+| `t=1` | 12.47% | 10.56% | 11.38% |
+| `t=2` | 4.14% | 3.77% | 4.05% |
+
+On remaining gross itself:
+
+| Snapshot | Baseline remaining MAPE | Views remaining MAPE | Full activity remaining MAPE |
+| ---: | ---: | ---: | ---: |
+| `t=1` | 22.23% | 18.79% | 19.54% |
+| `t=2` | 17.61% | 15.98% | 15.87% |
+
+The practical conclusion is: use full Wikipedia activity for pre-release
+BOP-residual adjustment near release, especially `t=-2` and `t=-1`; use
+views-only for post-Friday/post-Saturday remaining-weekend residual adjustment
+when optimizing total weekend MAPE. Views appear to generalize better after
+actuals arrive because Friday and Saturday already reveal much of the movie's
+realized demand, leaving Wikipedia page views as a simple incremental attention
+signal for multiplier shape.
+
+### Wiki+Competition Residual Combinations
+
+The same run now also writes a unified Wiki+competition comparison:
+
+```text
+results/papers/day_by_day_wiki_comp_residual_combo_train2022_2024_test2025_2026_bop5m/
+  wiki_comp_combo_predictions.csv
+  wiki_comp_combo_metrics.csv
+  wiki_comp_combo_coefficients.csv
+  wiki_comp_combo_headline.csv
+  wiki_comp_improved_predictions.csv
+  wiki_comp_improved_metrics.csv
+  wiki_comp_improved_coefficients.csv
+  wiki_comp_improved_headline.csv
+```
+
+This compares BOP-only, Wiki residuals, competition residuals, and combined
+Wiki+competition residuals on the same train/test split and BOP-covered cohort.
+For `t<=0`, each model predicts:
+
+```text
+log(actual 3-day opening weekend gross) - log(Boxoffice Pro midpoint)
+```
+
+For `t=1` and `t=2`, the model locks known actuals first, then predicts the
+remaining-weekend residual around a train-only average remainder-ratio
+baseline:
+
+```text
+log(actual remaining weekend gross)
+  - log(expected remaining weekend gross from known actuals and train ratios)
+```
+
+The competition-only residuals use the two paper-inspired competition features:
+
+- `bop_residual_comp_share_attraction`: competitor pressure as a share of the
+  focal movie's BOP-implied size plus the competitive/background market.
+- `bop_residual_comp_logit_demand`: log focal attraction versus
+  competitor/background attraction.
+
+The combination models put Wiki and competition terms into the same linear
+residual regression. They are not forecast averages; the model estimates one
+set of coefficients for the combined feature set at each snapshot day.
+
+Headline total-weekend MAPE:
+
+| Snapshot | Raw BOP | Wiki views | Wiki full | Comp share | Comp logit | Best combo | Best model |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `t=-2` | 34.95% | 34.86% | 30.29% | 33.06% | 34.18% | 33.49% | Wiki full |
+| `t=-1` | 34.95% | 34.76% | 30.70% | 33.17% | 34.42% | 34.06% | Wiki full |
+| `t=0` | 34.95% | 33.20% | 35.10% | 31.83% | 32.20% | 35.49% | Comp share |
+| `t=1` | 12.47% | 10.56% | 11.38% | 12.69% | 14.79% | 11.59% | Wiki views |
+| `t=2` | 4.14% | 3.77% | 4.05% | 3.99% | 4.26% | 4.06% | Wiki views |
+
+Earlier snapshots from `t=-14` through `t=-3` are included in the CSV outputs,
+but the residual models are not yet well identified under the current
+BOP-midpoint `>= $5M` cohort because too few train rows have usable BOP
+snapshots that early. Treat those early days as a data-coverage limitation for
+now, not evidence that BOP-only is intrinsically best.
+
+The combination models did not improve over the best single signal in this
+run. The likely issue is that Wiki attention and competition pressure are
+partly correlated and the near-release holdout is small, so adding both raw
+signals to one OLS residual model increases coefficient variance.
+
+The improved approach tests four safer combination strategies:
+
+- **Stacked residual forecasts:** fit Wiki and competition residual models
+  separately, then train a small meta-model on their predicted residuals.
+- **Timing gate:** use the empirically best source by information day.
+- **Residualized competition:** remove the part of competition pressure already
+  explained by Wiki, then add only the leftover competition signal.
+- **Ridge combinations:** keep raw Wiki+competition features, but shrink
+  coefficients to reduce overfit.
+
+Stacking was the only strategy that consistently improved the results. It uses
+leave-one-out base-model predictions on train rows, so the meta-model learns
+from out-of-sample-style residual forecasts rather than in-sample fitted noise.
+This matters because Wiki and competition are related but not identical signals:
+Wiki captures public attention, while competition captures market crowding and
+relative theatrical room. Stacking lets each source make its own correction
+first, then learns how much to trust each correction.
+
+Best previous model versus best improved model:
+
+| Snapshot | Previous best | Previous MAPE | Best improved | Improved MAPE | Lift |
+| ---: | --- | ---: | --- | ---: | ---: |
+| `t=-2` | Wiki full | 30.29% | Stacked views + share | 29.46% | +0.84 pts |
+| `t=-1` | Wiki full | 30.70% | Stacked views + share | 29.36% | +1.33 pts |
+| `t=0` | Comp share | 31.83% | Stacked views + logit | 29.26% | +2.57 pts |
+| `t=1` | Wiki views | 10.56% | Stacked full + share | 10.05% | +0.52 pts |
+| `t=2` | Wiki views | 3.77% | Stacked full + share | 3.51% | +0.26 pts |
+
+The practical conclusion is that raw feature concatenation is too fragile for
+this sample, but stacked residual forecasts are a useful way to combine the two
+sources. The stacker works because it combines lower-dimensional model outputs,
+not every correlated raw variable at once.
 
 The only remaining `scripts/` files are shell shortcuts for common ingest smoke
 tests:
@@ -299,21 +628,23 @@ Freshness metrics currently read from `daily_box_office`,
 Local worker controls:
 
 ```sh
-AMC_LOCAL_WORKER_COUNT=1 AMC_LOCAL_WORKER_MAX=2 AMC_WORKER_BATCH_LIMIT=1 AMC_WORKER_DELAY_SECONDS=3.0 \
+AMC_LOCAL_WORKER_COUNT=1 AMC_LOCAL_WORKER_MAX=1 AMC_WORKER_BATCH_LIMIT=1 AMC_WORKER_DELAY_SECONDS=3.0 \
   .venv/bin/uvicorn pm_box_office.web.app:app --reload --host 127.0.0.1 --port 8000
 ```
 
 The dashboard auto-starts local worker slots when the AMC queue has due, late,
-or high-overlap scheduled backlog. The defaults are conservative because missing
-seat payloads are treated as backoff pressure: `AMC_LOCAL_WORKER_COUNT=1`,
-`AMC_LOCAL_WORKER_MAX=2`, `AMC_WORKER_BATCH_LIMIT=1`, and
-`AMC_WORKER_DELAY_SECONDS=3.0`. `AMC_AUTOSCALE_DUE_PER_WORKER` defaults to 80
-due tasks per worker, `AMC_AUTOSCALE_LATE_PER_WORKER` defaults to 40 late tasks
-per worker, and `AMC_AUTOSCALE_PEAK_PER_WORKER` defaults to 220 scheduled tasks
-in the same minute per worker. The dashboard reads the backoff diagnostics log
-and caps autoscaling when seat payload misses, failed seat tasks, HTTP retries,
-or HTTP failures appear. Set `AMC_AUTOSCALE_ENABLED=false` to keep only the
-baseline worker count. Each worker claims distinct queue rows from Postgres.
+or high-overlap scheduled backlog. The defaults target about 20 seat tasks per
+minute because missing seat payloads are treated as backoff pressure:
+`AMC_LOCAL_WORKER_COUNT=1`, `AMC_LOCAL_WORKER_MAX=1`,
+`AMC_WORKER_BATCH_LIMIT=1`, and `AMC_WORKER_DELAY_SECONDS=3.0`.
+`AMC_AUTOSCALE_DUE_PER_WORKER` defaults to 80 due tasks per worker,
+`AMC_AUTOSCALE_LATE_PER_WORKER` defaults to 40 late tasks per worker, and
+`AMC_AUTOSCALE_PEAK_PER_WORKER` defaults to 220 scheduled tasks in the same
+minute per worker. The dashboard reads the backoff diagnostics log and caps
+autoscaling when seat payload misses, failed seat tasks, HTTP retries, or HTTP
+failures appear. Set `AMC_LOCAL_WORKER_MAX` above `1` to allow autoscaling past
+the 20 tasks/minute default, or set `AMC_AUTOSCALE_ENABLED=false` to keep only
+the baseline worker count. Each worker claims distinct queue rows from Postgres.
 
 Run with Docker:
 

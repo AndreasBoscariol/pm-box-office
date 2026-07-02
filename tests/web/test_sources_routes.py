@@ -15,10 +15,15 @@ class SourceRouteTests(unittest.TestCase):
             {"source_key": "the_numbers"},
             {"source_key": "amc_worker"},
             {"source_key": "boxofficepro"},
+            {"source_key": "rotten_tomatoes"},
         ]
 
         self.assertEqual(
-            [{"source_key": "the_numbers"}, {"source_key": "boxofficepro"}],
+            [
+                {"source_key": "the_numbers"},
+                {"source_key": "boxofficepro"},
+                {"source_key": "rotten_tomatoes"},
+            ],
             sources.visible_ingest_items(items),
         )
 

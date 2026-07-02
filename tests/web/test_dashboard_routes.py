@@ -134,7 +134,7 @@ class DashboardRouteTests(unittest.IsolatedAsyncioTestCase):
             status = dashboard.local_worker_status()
 
         self.assertEqual(1, status["desired_count"])
-        self.assertEqual(2, status["max_count"])
+        self.assertEqual(1, status["max_count"])
         self.assertEqual(1, status["batch_limit"])
         self.assertEqual(3.0, status["delay_seconds"])
         self.assertEqual(220, status["peak_per_worker"])
@@ -166,7 +166,7 @@ class DashboardRouteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(1, target)
 
-    def test_autoscaled_worker_target_defaults_ramp_conservatively(self) -> None:
+    def test_autoscaled_worker_target_defaults_cap_at_one_worker(self) -> None:
         with patch.dict(dashboard.os.environ, {}, clear=True):
             modest_backlog = dashboard.autoscaled_worker_target({"due_now": 9, "late": 4})
             larger_backlog = dashboard.autoscaled_worker_target({"due_now": 11, "late": 6})
@@ -177,8 +177,8 @@ class DashboardRouteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(1, modest_backlog)
         self.assertEqual(1, larger_backlog)
-        self.assertEqual(2, sampled_peak)
-        self.assertEqual(2, capped_backlog)
+        self.assertEqual(1, sampled_peak)
+        self.assertEqual(1, capped_backlog)
 
     def test_autoscaled_worker_target_scales_for_due_backlog(self) -> None:
         with patch.dict(
