@@ -1,7 +1,7 @@
 # PostgreSQL Setup
 
-Postgres is the system of record for The Numbers actuals, Wikipedia features,
-AMC collection state, and model training datasets.
+Postgres is the system of record for The Numbers actuals, source ingest data,
+and AMC collection state.
 
 DB-backed commands read the database URL in this order:
 
@@ -48,7 +48,6 @@ Commands that write to Postgres include:
 .venv/bin/python -m pm_box_office.sources.amc.collect init-db
 .venv/bin/python -m pm_box_office.sources.amc.collect ingest-theatres
 .venv/bin/python -m pm_box_office.sources.amc.jobs.worker
-.venv/bin/python -m pm_box_office.models.train
 ```
 
 The Polymarket account scanner currently writes file outputs only:
@@ -60,4 +59,3 @@ The Polymarket account scanner currently writes file outputs only:
 Legacy Python modules under `scripts/` and root `web.app` have been removed.
 Use `pm_box_office.*` package entrypoints or the console scripts from
 `pyproject.toml`.
-

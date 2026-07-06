@@ -77,7 +77,7 @@ def fetch_theatre_showtime_page(
     exhibition_date: dt.date,
 ) -> ShowtimePage:
     url = showtimes_url(exhibition_date, theatre_slug)
-    result = fetcher.get_result(url)
+    result = fetcher.get_result(url, refresh=True)
     apollo = maybe_parse_apollo_data(result.body, source_url=url)
     rows = (
         extract_showtimes(apollo, theatre_slug=theatre_slug, date=exhibition_date)
@@ -87,8 +87,10 @@ def fetch_theatre_showtime_page(
     return ShowtimePage(rows=rows, result=result)
 
 
-def create_inventory_run(conn: Any, *, exhibition_date: dt.date) -> tuple[str, int]:
+def create_inventory_run(conn: Any, *, exhibition_date: dt.date, force_refresh: bool = False) -> tuple[str, int]:
     campaign_id = db.ensure_campaign(conn, exhibition_date)
+    if force_refresh:
+        cancel_active_inventory_runs(conn, campaign_id=campaign_id)
     active_run = db.find_active_run(conn, campaign_id=campaign_id, run_type="showtime_inventory")
     if active_run is not None:
         run_id, task_count = active_run
@@ -99,3 +101,21 @@ def create_inventory_run(conn: Any, *, exhibition_date: dt.date) -> tuple[str, i
     if task_count == 0:
         db.mark_run_status(conn, run_id, status="completed")
     return str(run_id), task_count
+
+
+def cancel_active_inventory_runs(conn: Any, *, campaign_id: object) -> int:
+    rows = conn.execute(
+        """
+        SELECT run_id
+        FROM collection_runs
+        WHERE campaign_id = %s
+          AND run_type = 'showtime_inventory'
+          AND status NOT IN ('completed', 'failed', 'cancelled')
+        """,
+        (campaign_id,),
+    ).fetchall()
+    cancelled = 0
+    for row in rows:
+        db.cancel_run(conn, db.as_uuid(row[0]))
+        cancelled += 1
+    return cancelled

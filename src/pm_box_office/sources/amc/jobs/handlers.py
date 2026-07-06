@@ -46,7 +46,7 @@ def _collect_seat_snapshot(conn: Any, fetcher: HtmlFetcher, task: db.CollectionT
             conn,
             fetcher,
             showtime=showtime,
-            target_offset_minutes=task.priority or 5,
+            target_offset_minutes=task.effective_target_offset_minutes,
         )
 
 

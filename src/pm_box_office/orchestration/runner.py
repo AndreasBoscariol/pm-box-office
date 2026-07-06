@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import signal
 import subprocess
@@ -11,6 +12,12 @@ import uuid
 from pm_box_office.config import REPO_ROOT
 from pm_box_office.db.connection import connect_database, database_url_from_env
 from pm_box_office.orchestration import repository
+from pm_box_office.orchestration.registry import RUN_ALL_SOURCE_KEYS
+
+
+THE_NUMBERS_AUTORUN_LOOKBACK_DAYS = 7
+THE_NUMBERS_AUTORUN_PUBLISH_LAG_DAYS = 1
+THE_NUMBERS_AUTORUN_REFRESH_DAYS = 2
 
 
 def start_source_run(
@@ -68,6 +75,62 @@ def start_source_run(
     finally:
         conn.close()
     return run_id
+
+
+def start_run_all(
+    *,
+    trigger: str = "manual_run_all",
+    database_url: str | None = None,
+    source_keys: tuple[str, ...] = RUN_ALL_SOURCE_KEYS,
+) -> dict[str, list[str]]:
+    started: list[str] = []
+    skipped: list[str] = []
+    errors: list[str] = []
+    for source_key in source_keys:
+        try:
+            run_id = start_source_run(
+                source_key,
+                trigger=trigger,
+                database_url=database_url,
+                extra_args=autorun_extra_args(source_key, trigger=trigger),
+            )
+        except (
+            repository.SourceAlreadyRunningError,
+            repository.SourceDependencyError,
+            repository.SourceDisabledError,
+        ) as exc:
+            skipped.append(f"{source_key}: {exc}")
+        except repository.OrchestrationError as exc:
+            errors.append(f"{source_key}: {exc}")
+        else:
+            started.append(f"{source_key}: {run_id}")
+    if started:
+        conn = connect_database(database_url)
+        try:
+            repository.record_autorun_trigger(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    return {"started": started, "skipped": skipped, "errors": errors}
+
+
+def autorun_extra_args(source_key: str, *, trigger: str, today: dt.date | None = None) -> list[str]:
+    if trigger != "auto_daily" or source_key != "the_numbers":
+        return []
+    run_date = today or dt.date.today()
+    end_date = run_date - dt.timedelta(days=THE_NUMBERS_AUTORUN_PUBLISH_LAG_DAYS)
+    start_date = end_date - dt.timedelta(days=THE_NUMBERS_AUTORUN_LOOKBACK_DAYS - 1)
+    return [
+        "--start-date",
+        start_date.isoformat(),
+        "--end-date",
+        end_date.isoformat(),
+        "--refresh-recent-days",
+        str(THE_NUMBERS_AUTORUN_REFRESH_DAYS),
+    ]
 
 
 def cancel_run(run_id: str | uuid.UUID, *, database_url: str | None = None) -> None:

@@ -14,22 +14,25 @@ import concurrent.futures
 import csv
 import datetime as dt
 import gzip
-import hashlib
 from html.parser import HTMLParser
 import io
 import json
 import re
 import sys
-import time
-import unicodedata
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 from pm_box_office.db.connection import connect_database, database_url_from_env
+from pm_box_office.domain import movies as movie_identity
+from pm_box_office.sources.common.cli import parse_date_arg
+from pm_box_office.sources.common.fetch import CacheFirstFetcher
+from pm_box_office.sources.common.parsing import (
+    clean_text,
+    normalize_title as normalize_movie_title,
+    parse_int as parse_common_int,
+)
 
 
 THE_NUMBERS_BASE_URL = "https://www.the-numbers.com"
@@ -256,7 +259,7 @@ class LetterboxdSearchParser(HTMLParser):
             self._capture_parts.append(data)
 
 
-class CachedFetcher:
+class CachedFetcher(CacheFirstFetcher):
     def __init__(
         self,
         cache_dir: Path,
@@ -267,68 +270,23 @@ class CachedFetcher:
         user_agent: str,
         timeout_seconds: float = 60.0,
     ) -> None:
-        self.cache_dir = cache_dir
-        self.refresh = refresh
-        self.offline = offline
-        self.delay_seconds = delay_seconds
-        self.user_agent = user_agent
-        self.timeout_seconds = timeout_seconds
-        self._last_request_at = 0.0
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-    def cache_path(self, url: str, suffix: str) -> Path:
-        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
-        return self.cache_dir / f"{digest}{suffix}"
+        super().__init__(
+            cache_dir,
+            refresh=refresh,
+            offline=offline,
+            delay_seconds=delay_seconds,
+            user_agent=user_agent,
+            timeout_seconds=timeout_seconds,
+            retries=3,
+            transient_statuses=TRANSIENT_STATUSES,
+            default_accept="*/*",
+        )
 
     def get_text(self, url: str) -> tuple[str, Path, bool]:
-        body, cache_path, fetched = self.get_bytes(url, suffix=".html")
-        return body.decode("utf-8", errors="replace"), cache_path, fetched
+        return super().get_text(url, suffix=".html")
 
     def get_bytes(self, url: str, *, suffix: str) -> tuple[bytes, Path, bool]:
-        cache_path = self.cache_path(url, suffix)
-        if cache_path.exists() and not self.refresh:
-            return cache_path.read_bytes(), cache_path, False
-        if self.offline:
-            raise FileNotFoundError(f"Cache miss in offline mode: {url}")
-
-        last_error: Exception | None = None
-        for attempt in range(3):
-            self._wait()
-            request = urllib.request.Request(
-                url,
-                headers={
-                    "Accept": "*/*",
-                    "User-Agent": self.user_agent,
-                },
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                    body = response.read()
-                cache_path.write_bytes(body)
-                self._last_request_at = time.monotonic()
-                return body, cache_path, True
-            except urllib.error.HTTPError as exc:
-                last_error = exc
-                if exc.code == 404:
-                    cache_path.write_bytes(b"")
-                    return b"", cache_path, True
-                if exc.code not in TRANSIENT_STATUSES or attempt == 2:
-                    raise
-                retry_after = exc.headers.get("Retry-After")
-                delay = float(retry_after) if retry_after else self.delay_seconds * (attempt + 1)
-                time.sleep(delay)
-            except (TimeoutError, urllib.error.URLError) as exc:
-                last_error = exc
-                if attempt == 2:
-                    break
-                time.sleep(self.delay_seconds * (attempt + 1))
-        raise RuntimeError(f"GET {url} failed after retry: {last_error}")
-
-    def _wait(self) -> None:
-        elapsed = time.monotonic() - self._last_request_at
-        delay = max(0.0, self.delay_seconds - elapsed)
-        if delay:
-            time.sleep(delay)
+        return super().get_bytes(url, suffix=suffix, not_found_body=b"")
 
 
 def initialize_database(conn: Any) -> None:
@@ -349,6 +307,7 @@ def initialize_database(conn: Any) -> None:
         ALTER TABLE movies
             ADD COLUMN IF NOT EXISTS movie_url TEXT,
             ADD COLUMN IF NOT EXISTS release_year INTEGER,
+            ADD COLUMN IF NOT EXISTS release_date DATE,
             ADD COLUMN IF NOT EXISTS opusdata_id TEXT,
             ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;
 
@@ -605,6 +564,7 @@ def initialize_database(conn: Any) -> None:
         ) aud ON TRUE;
         """
     )
+    movie_identity.ensure_movie_identity_schema(conn)
 
 
 def utc_now() -> str:
@@ -629,19 +589,8 @@ def resolve_user_agent(value: str) -> str:
     return generated_user_agent() if value.strip().lower() == "random" else value
 
 
-def clean_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value.replace("\xa0", " ")).strip()
-
-
 def normalize_title(value: str) -> str:
-    text = unicodedata.normalize("NFKD", value)
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    text = re.sub(r"\s*\(\d{4}\)\s*$", "", text)
-    text = text.lower()
-    text = re.sub(r"\b(disney|marvel|warner bros|universal|paramount|sony)'?s\b", " ", text)
-    text = re.sub(r"&", " and ", text)
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return " ".join(text.split())
+    return normalize_movie_title(value, remove_studio_possessives=True)
 
 
 def strip_title_year(value: str) -> str:
@@ -702,23 +651,7 @@ def parse_year(value: str) -> int | None:
 
 
 def parse_int(value: str) -> int | None:
-    text = clean_text(value).lower()
-    if not text or text in {"-", "n/a", "\\n"}:
-        return None
-    multiplier = 1
-    if text.endswith("k"):
-        multiplier = 1_000
-        text = text[:-1]
-    elif text.endswith("m"):
-        multiplier = 1_000_000
-        text = text[:-1]
-    elif text.endswith("b"):
-        multiplier = 1_000_000_000
-        text = text[:-1]
-    number = re.sub(r"[^0-9.]", "", text)
-    if not number:
-        return None
-    return int(float(number) * multiplier)
+    return parse_common_int(value, suffix_multipliers=True)
 
 
 def parse_money(value: str) -> int | None:
@@ -884,17 +817,14 @@ def upsert_release_schedule_rows(
 def upsert_movies_from_release_schedule(conn: Any, rows: list[TheNumbersReleaseRow]) -> None:
     for row in rows:
         release_year = int(row.release_date[:4]) if row.release_date else parse_year(row.title)
-        conn.execute(
-            """
-            INSERT INTO movies (movie_url, title, release_year, release_date, updated_at)
-            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT(movie_url) WHERE movie_url IS NOT NULL DO UPDATE SET
-                title = excluded.title,
-                release_year = COALESCE(excluded.release_year, movies.release_year),
-                release_date = COALESCE(excluded.release_date, movies.release_date),
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (row.movie_url, row.title, release_year, row.release_date),
+        movie_identity.upsert_movie_by_source(
+            conn,
+            source=movie_identity.SOURCE_THE_NUMBERS,
+            source_movie_id=row.movie_url,
+            title=row.title,
+            movie_url=row.movie_url,
+            release_year=release_year,
+            release_date=row.release_date,
         )
 
 
@@ -928,16 +858,13 @@ def upsert_movies_from_current_chart_pages(
         (snapshot_date - dt.timedelta(days=active_days), snapshot_date),
     ).fetchall()
     for movie_url, title, _chart_date, _days_in_release in rows:
-        conn.execute(
-            """
-            INSERT INTO movies (movie_url, title, release_year, updated_at)
-            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT(movie_url) WHERE movie_url IS NOT NULL DO UPDATE SET
-                title = COALESCE(movies.title, excluded.title),
-                release_year = COALESCE(movies.release_year, excluded.release_year),
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (movie_url, title, parse_release_year_from_movie_url(movie_url)),
+        movie_identity.upsert_movie_by_source(
+            conn,
+            source=movie_identity.SOURCE_THE_NUMBERS,
+            source_movie_id=movie_url,
+            title=title,
+            movie_url=movie_url,
+            release_year=parse_release_year_from_movie_url(movie_url),
         )
     return len(rows)
 
@@ -967,7 +894,10 @@ def select_candidate_movies(
                 m.release_year,
                 COALESCE(m.release_date, tn.release_date)::text AS release_date
             FROM the_numbers_release_schedule tn
-            JOIN movies m ON m.movie_url = tn.movie_url
+            JOIN movie_source_ids msi
+              ON msi.source = 'the_numbers'
+             AND msi.source_movie_id = tn.movie_url
+            JOIN movies m ON m.movie_id = msi.movie_id
             WHERE tn.release_date BETWEEN %s AND %s
               AND tn.title NOT ILIKE '%%untitled%%'
               AND tn.title NOT ILIKE '%%re-release%%'
@@ -985,7 +915,10 @@ def select_candidate_movies(
                 m.release_year,
                 m.release_date::text AS release_date
             FROM daily_chart_pages dcp
-            JOIN movies m ON m.movie_url = dcp.movie_url
+            JOIN movie_source_ids msi
+              ON msi.source = 'the_numbers'
+             AND msi.source_movie_id = dcp.movie_url
+            JOIN movies m ON m.movie_id = msi.movie_id
             WHERE dcp.chart_date::date BETWEEN %s AND %s
               AND COALESCE(dcp.days_in_release, 0) <= 365
               AND dcp.title NOT ILIKE '%%re-release%%'
@@ -1335,6 +1268,17 @@ def upsert_imdb_match(conn: Any, match: ImdbMatch) -> bool:
             stored_match.notes,
         ),
     )
+    if stored_match.tconst and stored_match.match_status in {"matched", "manual_override"}:
+        movie_identity.upsert_movie_source_id(
+            conn,
+            movie_id=stored_match.movie_id,
+            source=movie_identity.SOURCE_IMDB,
+            source_movie_id=stored_match.tconst,
+            source_title=None,
+            match_status="matched" if stored_match.match_status == "manual_override" else stored_match.match_status,
+            match_method=stored_match.match_method,
+            match_score=stored_match.match_score,
+        )
     return stored_match.tconst == match.tconst and stored_match.match_status == match.match_status
 
 
@@ -1613,7 +1557,7 @@ def upsert_wikidata_matches(
                 parse_status="wikidata_seed",
             )
             upsert_letterboxd_film(conn, page, last_seen_at=now)
-            upsert_letterboxd_match(
+            seeded = upsert_letterboxd_match(
                 conn,
                 LetterboxdMatch(
                     movie_id=match.movie_id,
@@ -1624,7 +1568,6 @@ def upsert_wikidata_matches(
                     notes=f"qid={match.qid}; imdb={match.imdb_tconst}; tmdb={match.tmdb_id}",
                 ),
             )
-            seeded = True
         if seeded:
             accepted += 1
     return accepted
@@ -1862,7 +1805,41 @@ def upsert_letterboxd_film(conn: Any, page: LetterboxdFilmPage, *, last_seen_at:
     )
 
 
-def upsert_letterboxd_match(conn: Any, match: LetterboxdMatch) -> None:
+def load_movie_id_for_letterboxd_slug(conn: Any, letterboxd_slug: str) -> int | None:
+    row = conn.execute(
+        """
+        SELECT movie_id
+        FROM movie_letterboxd_films
+        WHERE letterboxd_slug = %s
+        """,
+        (letterboxd_slug,),
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def upsert_letterboxd_match(conn: Any, match: LetterboxdMatch) -> bool:
+    stored_match = match
+    if match.letterboxd_slug:
+        existing_movie_id = load_movie_id_for_letterboxd_slug(conn, match.letterboxd_slug)
+        if existing_movie_id is not None and existing_movie_id != match.movie_id:
+            if match.match_status == "manual_override":
+                raise ValueError(
+                    f"Letterboxd film {match.letterboxd_slug} is already matched to movie_id {existing_movie_id}"
+                )
+            conflict_note = (
+                f"Letterboxd film {match.letterboxd_slug} is already matched to movie_id {existing_movie_id}; "
+                "leaving this candidate unmatched"
+            )
+            if match.notes:
+                conflict_note = f"{conflict_note}; {match.notes}"
+            stored_match = LetterboxdMatch(
+                movie_id=match.movie_id,
+                letterboxd_slug=None,
+                match_status="ambiguous",
+                match_method=match.match_method,
+                match_score=match.match_score,
+                notes=conflict_note,
+            )
     conn.execute(
         """
         INSERT INTO movie_letterboxd_films (
@@ -1877,14 +1854,29 @@ def upsert_letterboxd_match(conn: Any, match: LetterboxdMatch) -> None:
             notes = excluded.notes
         """,
         (
-            match.movie_id,
-            match.letterboxd_slug,
-            match.match_status,
-            match.match_method,
-            match.match_score,
+            stored_match.movie_id,
+            stored_match.letterboxd_slug,
+            stored_match.match_status,
+            stored_match.match_method,
+            stored_match.match_score,
             utc_now(),
-            match.notes,
+            stored_match.notes,
         ),
+    )
+    if stored_match.letterboxd_slug and stored_match.match_status in {"matched", "manual_override"}:
+        movie_identity.upsert_movie_source_id(
+            conn,
+            movie_id=stored_match.movie_id,
+            source=movie_identity.SOURCE_LETTERBOXD,
+            source_movie_id=stored_match.letterboxd_slug,
+            source_title=None,
+            match_status="matched" if stored_match.match_status == "manual_override" else stored_match.match_status,
+            match_method=stored_match.match_method,
+            match_score=stored_match.match_score,
+        )
+    return (
+        stored_match.letterboxd_slug == match.letterboxd_slug
+        and stored_match.match_status == match.match_status
     )
 
 
@@ -2464,13 +2456,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit(f"--delay-seconds must be at least {MIN_DELAY_SECONDS:g}")
     if USER_AGENT_PRODUCT not in args.user_agent and not args.offline and not args.dry_run:
         raise SystemExit("--user-agent must include the pm-box-office audience ingest identifier")
-
-
-def parse_date_arg(value: str) -> dt.date:
-    try:
-        return dt.date.fromisoformat(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"invalid ISO date: {value}") from exc
 
 
 def make_fetcher(args: argparse.Namespace) -> CachedFetcher:

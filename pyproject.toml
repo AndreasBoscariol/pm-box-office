@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pm-box-office"
 version = "0.1.0"
-description = "Box office prediction pipelines using The Numbers, Wikipedia, AMC, and Polymarket data."
+description = "Box office ingest, AMC collection, and Polymarket account utilities."
 requires-python = ">=3.12"
 dependencies = [
   "psycopg[binary]>=3.2",
@@ -13,27 +13,19 @@ dependencies = [
   "fastapi>=0.115",
   "jinja2>=3.1",
   "uvicorn>=0.30",
-  "numpy>=2.0",
-  "pandas>=2.2",
-  "scikit-learn>=1.5",
-  "joblib>=1.4",
-  "matplotlib>=3.9",
   "fake-useragent>=2.0",
   "playwright>=1.45",
-  "ntscraper",
 ]
 
 [project.scripts]
 pm-box-office-amc-worker = "pm_box_office.sources.amc.jobs.worker:main"
 pm-box-office-collect-amc = "pm_box_office.sources.amc.collect:main"
+pm-box-office-amc-seat-tolerance = "pm_box_office.sources.amc.seat_tolerance_diagnostic:main"
 pm-box-office-polymarket-accounts = "pm_box_office.sources.polymarket.accounts:main"
 pm-box-office-boxofficepro-ingest = "pm_box_office.sources.boxofficepro.ingest:main"
-pm-box-office-day-by-day-opening-weekend = "pm_box_office.research.papers.recreate_day_by_day_opening_weekend:main"
-pm-box-office-train-opening-forecast = "pm_box_office.models.opening_weekend.backtest:main"
+pm-box-office-boxofficereport-ingest = "pm_box_office.sources.boxofficereport.ingest:main"
 pm-box-office-scrape-the-numbers = "pm_box_office.sources.the_numbers.ingest:main"
 pm-box-office-audience-ingest = "pm_box_office.sources.audience.ingest:main"
-pm-box-office-social-x-ingest = "pm_box_office.sources.social_x.ingest:main"
-pm-box-office-train-amc = "pm_box_office.models.train:main"
 pm-box-office-wikipedia-ingest = "pm_box_office.sources.wikipedia.ingest:main"
 
 [tool.setuptools.packages.find]

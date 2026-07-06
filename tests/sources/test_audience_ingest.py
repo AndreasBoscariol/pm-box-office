@@ -829,6 +829,56 @@ class AudiencePostgresTests(unittest.TestCase):
         self.assertEqual((2, None, "ambiguous", "wikidata_sparql"), rows[1][:4])
         self.assertIn("already matched to movie_id 1", rows[1][4])
 
+    def test_letterboxd_match_duplicate_slug_marks_new_movie_ambiguous(self) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO movies (movie_id, movie_url, title, release_year, release_date)
+            VALUES
+                (1, 'https://www.the-numbers.com/movie/Original-(2026)', 'Original', 2026, '2026-07-03'),
+                (2, 'https://www.the-numbers.com/movie/Duplicate-(2026)', 'Duplicate', 2026, '2026-07-03')
+            """
+        )
+        page = ingest.LetterboxdFilmPage(
+            letterboxd_slug="young-washington",
+            film_url="https://letterboxd.com/film/young-washington/",
+            source_title="Young Washington",
+            source_year=2026,
+            imdb_tconst=None,
+            tmdb_id=None,
+            average_rating=None,
+            watched_count=None,
+            rating_count=None,
+            review_count=None,
+            log_count=None,
+            fan_count=None,
+            parse_status="wikidata_seed",
+        )
+        ingest.upsert_letterboxd_film(self.conn, page, last_seen_at="2026-06-30T00:00:00+00:00")
+
+        self.assertTrue(
+            ingest.upsert_letterboxd_match(
+                self.conn,
+                ingest.LetterboxdMatch(1, "young-washington", "matched", "fixture", 1.0),
+            )
+        )
+        self.assertFalse(
+            ingest.upsert_letterboxd_match(
+                self.conn,
+                ingest.LetterboxdMatch(2, "young-washington", "matched", "wikidata_sparql", 150.0),
+            )
+        )
+
+        rows = self.conn.execute(
+            """
+            SELECT movie_id, letterboxd_slug, match_status, match_method, notes
+            FROM movie_letterboxd_films
+            ORDER BY movie_id
+            """
+        ).fetchall()
+        self.assertEqual("young-washington", rows[0][1])
+        self.assertEqual((2, None, "ambiguous", "wikidata_sparql"), rows[1][:4])
+        self.assertIn("already matched to movie_id 1", rows[1][4])
+
     def test_failed_state_can_be_reset(self) -> None:
         self.conn.execute(
             """

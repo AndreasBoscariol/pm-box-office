@@ -38,6 +38,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     for table in (
+        "ingest_autorun_state",
         "source_freshness",
         "ingest_run_logs",
         "ingest_runs",

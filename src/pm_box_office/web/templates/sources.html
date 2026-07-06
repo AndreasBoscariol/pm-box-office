@@ -1,22 +1,16 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Ingest Sources</title>
-    <link rel="stylesheet" href="/static/app.css">
-    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
-  </head>
-  <body>
-    <main class="shell">
+{% extends "base.html" %}
+{% block title %}Ingest Sources{% endblock %}
+{% block content %}
       <header class="topbar">
         <div>
           <h1>Ingest Sources</h1>
           <span class="subtle">Local scraper orchestration</span>
         </div>
         <div class="actions">
-          <a class="button-link" href="/">AMC Campaigns</a>
-          <a class="button-link" href="/forecasts">Forecasts</a>
+          <form method="post" action="/sources/run-all">
+            <button type="submit">Run All</button>
+          </form>
+          <a class="button-link" href="/amc">AMC Campaigns</a>
         </div>
       </header>
 
@@ -26,6 +20,24 @@
       {% if error %}
       <div class="notice error">{{ error }}</div>
       {% endif %}
+
+      <section class="autorun-strip">
+        <div>
+          <strong>Daily autorun</strong>
+          <span class="subtle">
+            {% if autorun_state.enabled %}
+            All visible ingest sources will run in {{ autorun_state.seconds_until_next_run|duration_until }}
+            {% else %}
+            Paused
+            {% endif %}
+          </span>
+        </div>
+        <dl>
+          <div><dt>Next run</dt><dd>in {{ autorun_state.seconds_until_next_run|duration_until }}</dd></div>
+          <div><dt>Interval</dt><dd>{{ autorun_state.interval_hours }} hours</dd></div>
+          <div><dt>Last batch</dt><dd>{{ autorun_state.last_triggered_at|time_ago }}</dd></div>
+        </dl>
+      </section>
 
       <section class="source-grid">
         {% for source in sources %}
@@ -109,17 +121,18 @@
             <div
               hx-get="/sources/runs/{{ run.run_id }}/logs"
               hx-trigger="load{% if run.status in ['queued', 'running'] %}, every 3s{% endif %}"
-              hx-swap="outerHTML">
+              hx-swap="innerHTML">
               {% set logs = log_tails.get(run.run_id|string) %}
               {% if log_tails.get(run.run_id|string) %}
               {% include "source_run_logs.html" with context %}
+              {% else %}
+              <pre class="log-tail">No log lines yet.</pre>
               {% endif %}
             </div>
           </article>
           {% endfor %}
         </div>
       </section>
-    </main>
     <script>
       const dismissedRunsKey = "pmBoxOffice.dismissedSourceRuns";
       let dismissedRunIds = [];
@@ -158,5 +171,4 @@
 
       hideDismissedRuns();
     </script>
-  </body>
-</html>
+{% endblock %}

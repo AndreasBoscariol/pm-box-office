@@ -29,7 +29,7 @@ services:
       - --limit
       - ${AMC_WORKER_BATCH_LIMIT:-1}
       - --delay-seconds
-      - ${AMC_WORKER_DELAY_SECONDS:-1.0}
+      - ${AMC_WORKER_DELAY_SECONDS:-1.5}
     environment:
       DATABASE_URL: postgresql://pm_box_office:pm_box_office@postgres:5432/pm_box_office
     depends_on:

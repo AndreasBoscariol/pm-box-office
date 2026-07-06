@@ -15,6 +15,7 @@ from pm_box_office.sources.amc.client import HtmlFetcher
 from pm_box_office.sources.amc.db import CollectionTask
 from pm_box_office.sources.amc.jobs import queue
 from pm_box_office.sources.amc.jobs import worker
+from pm_box_office.sources.amc.services import seat_service
 from tests.sources.test_collect_amc_showtimes import RENDERED_SEATS_HTML, RSC_NO_SEAT_MAP_PAYLOAD
 
 
@@ -114,6 +115,55 @@ class AmcDiagnosticsTests(unittest.TestCase):
         self.assertEqual(403, rows[0]["status_code"])
         self.assertEqual("HTTPError", rows[0]["error_type"])
 
+    def test_archived_live_seat_fetch_does_not_write_top_level_cache_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_dir = Path(tmp_dir) / "cache"
+            fetcher = HtmlFetcher(cache_dir, delay_seconds=0, retries=1)
+            url = amc.current_showtime_seats_url("100")
+            archive_path = cache_dir / "seats" / "2026-07-01" / "100" / "20260701T120000Z.html"
+
+            with patch(
+                "pm_box_office.sources.amc.client.urllib.request.urlopen",
+                return_value=FakeResponse(RENDERED_SEATS_HTML),
+            ):
+                result = fetcher.get_live_result(url, archive_path=archive_path)
+
+            self.assertEqual(RENDERED_SEATS_HTML, result.body)
+            self.assertEqual(archive_path, result.cache_path)
+            self.assertTrue(archive_path.exists())
+            self.assertFalse(fetcher.cache_path(url).exists())
+
+    def test_cleanup_top_level_seat_cache_duplicates_deletes_only_archived_seat_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_dir = Path(tmp_dir) / "cache"
+            fetcher = HtmlFetcher(cache_dir, delay_seconds=0, retries=1)
+            html_url = amc.current_showtime_seats_url("100")
+            rsc_url = amc.current_showtime_seats_rsc_url("100")
+            html_duplicate = fetcher.cache_path(html_url)
+            rsc_duplicate = fetcher.cache_path(rsc_url)
+            unrelated = cache_dir / "unrelated.html"
+            for path in (html_duplicate, rsc_duplicate, unrelated):
+                path.write_text("cached", encoding="utf-8")
+            (cache_dir / "seats" / "2026-07-01" / "100").mkdir(parents=True)
+            (cache_dir / "seats" / "2026-07-01" / "100" / "20260701T120000Z.html").write_text(
+                "archive",
+                encoding="utf-8",
+            )
+            (cache_dir / "seats" / "2026-07-01" / "100" / "20260701T120000Z.rsc.txt").write_text(
+                "archive",
+                encoding="utf-8",
+            )
+
+            dry_run = seat_service.cleanup_top_level_seat_cache_duplicates(cache_dir, dry_run=True)
+            result = seat_service.cleanup_top_level_seat_cache_duplicates(cache_dir)
+
+            self.assertEqual(2, dry_run.duplicate_paths_found)
+            self.assertEqual(0, dry_run.duplicate_files_deleted)
+            self.assertEqual(2, result.duplicate_files_deleted)
+            self.assertFalse(html_duplicate.exists())
+            self.assertFalse(rsc_duplicate.exists())
+            self.assertTrue(unrelated.exists())
+
     def test_fetch_seat_fill_logs_rsc_failure_and_fallback_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             log_path = Path(tmp_dir) / "events.jsonl"
@@ -163,6 +213,10 @@ class AmcDiagnosticsTests(unittest.TestCase):
         self.assertEqual("100", rows[0]["showtime_id"])
         self.assertEqual(["Closed Caption", "Descriptive Video"], rows[0]["attribute_names"])
         self.assertEqual("SeatMapUnavailable", rows[0]["error_type"])
+        self.assertTrue(rows[0]["operational_backoff"])
+        self.assertFalse(rows[0]["shared_throttle_extended"])
+        self.assertFalse(rows[0]["retry_scheduled"])
+        self.assertTrue(rows[0]["terminal"])
 
     def test_worker_task_diagnostics_fields_include_task_metadata(self) -> None:
         run_id = uuid.uuid4()
@@ -191,7 +245,7 @@ class AmcDiagnosticsTests(unittest.TestCase):
         self.assertEqual(5, fields["target_offset_minutes"])
         self.assertGreaterEqual(fields["seconds_late_at_start"], 90)
 
-    def test_seat_backoff_policy_extends_retry_window_and_attempts(self) -> None:
+    def test_http_seat_backoff_policy_extends_retry_window_and_attempts(self) -> None:
         run_id = uuid.uuid4()
         task = CollectionTask(
             task_id=42,
@@ -206,11 +260,40 @@ class AmcDiagnosticsTests(unittest.TestCase):
             attempt_count=3,
             max_attempts=3,
         )
-        exc = ValueError("Could not find showtime object in AMC RSC payload")
+        exc = urllib.error.HTTPError(
+            "https://www.amctheatres.com/showtimes/100/seats?_rsc=1",
+            429,
+            "Too Many Requests",
+            {},
+            None,
+        )
 
         self.assertTrue(queue.is_seat_backoff_failure(task, exc))
         self.assertEqual(120, queue.retry_delay_seconds_for_failure(task, exc))
         self.assertEqual(6, queue.minimum_max_attempts_for_failure(task, exc))
+
+    def test_rsc_content_failure_gets_exploratory_retry(self) -> None:
+        run_id = uuid.uuid4()
+        task = CollectionTask(
+            task_id=42,
+            run_id=run_id,
+            task_type="collect_seat_snapshot",
+            amc_theatre_id=None,
+            showtime_id="100",
+            amc_movie_id="movie-1",
+            scheduled_for=dt.datetime.now(dt.timezone.utc),
+            status="running",
+            priority=5,
+            attempt_count=1,
+            max_attempts=3,
+        )
+        exc = ValueError("Could not find showtime object in AMC RSC payload")
+
+        self.assertFalse(queue.is_seat_backoff_failure(task, exc))
+        self.assertTrue(queue.is_exploratory_seat_content_failure(task, exc))
+        self.assertEqual("missing_showtime_object", queue.classify_seat_failure(task, exc))
+        self.assertEqual(75, queue.retry_delay_seconds_for_failure(task, exc))
+        self.assertEqual(2, queue.minimum_max_attempts_for_failure(task, exc))
 
     def test_non_seat_backoff_policy_keeps_default_retry(self) -> None:
         run_id = uuid.uuid4()
@@ -233,7 +316,7 @@ class AmcDiagnosticsTests(unittest.TestCase):
         self.assertEqual(60, queue.retry_delay_seconds_for_failure(task, exc))
         self.assertIsNone(queue.minimum_max_attempts_for_failure(task, exc))
 
-    def test_unavailable_seat_map_is_not_backoff(self) -> None:
+    def test_unavailable_seat_map_gets_exploratory_retry_classification(self) -> None:
         run_id = uuid.uuid4()
         task = CollectionTask(
             task_id=42,
@@ -251,10 +334,12 @@ class AmcDiagnosticsTests(unittest.TestCase):
         exc = amc.SeatMapUnavailable("AMC RSC payload has no reserved seat map for this showtime")
 
         self.assertFalse(queue.is_seat_backoff_failure(task, exc))
-        self.assertEqual(60, queue.retry_delay_seconds_for_failure(task, exc))
-        self.assertIsNone(queue.minimum_max_attempts_for_failure(task, exc))
+        self.assertTrue(queue.is_exploratory_seat_content_failure(task, exc))
+        self.assertEqual("no_seat_map_non_reserved", queue.classify_seat_failure(task, exc))
+        self.assertEqual(75, queue.retry_delay_seconds_for_failure(task, exc))
+        self.assertEqual(2, queue.minimum_max_attempts_for_failure(task, exc))
 
-    def test_seat_backoff_failure_extends_shared_throttle(self) -> None:
+    def test_http_seat_backoff_failure_extends_shared_throttle(self) -> None:
         run_id = uuid.uuid4()
         task = CollectionTask(
             task_id=42,
@@ -269,7 +354,13 @@ class AmcDiagnosticsTests(unittest.TestCase):
             attempt_count=1,
             max_attempts=3,
         )
-        exc = ValueError("Could not find showtime object in AMC RSC payload")
+        exc = urllib.error.HTTPError(
+            "https://www.amctheatres.com/showtimes/100/seats?_rsc=1",
+            429,
+            "Too Many Requests",
+            {},
+            None,
+        )
         observed_at = dt.datetime(2026, 7, 1, 23, 0, tzinfo=dt.timezone.utc)
         blocked_until = observed_at + dt.timedelta(seconds=75)
 
@@ -293,9 +384,77 @@ class AmcDiagnosticsTests(unittest.TestCase):
         self.assertEqual("shared_seat_collection_backoff", rows[0]["event_type"])
         self.assertEqual("all_workers", rows[0]["throttle_scope"])
         self.assertTrue(rows[0]["workers_share_server_identity"])
+        self.assertEqual("shared_http_backoff", rows[0]["backoff_class"])
+        self.assertTrue(rows[0]["operational_backoff"])
+        self.assertTrue(rows[0]["shared_throttle_extended"])
+        self.assertTrue(rows[0]["retry_scheduled"])
+        self.assertFalse(rows[0]["terminal"])
         self.assertEqual(75, rows[0]["retry_delay_seconds"])
         self.assertEqual(75, rows[0]["throttle_extended_by_seconds"])
         self.assertNotIn("previous_blocked_until", rows[0])
+
+    def test_content_failure_schedules_exploratory_retry_without_throttle(self) -> None:
+        run_id = uuid.uuid4()
+        task = CollectionTask(
+            task_id=42,
+            run_id=run_id,
+            task_type="collect_seat_snapshot",
+            amc_theatre_id=None,
+            showtime_id="100",
+            amc_movie_id="movie-1",
+            scheduled_for=dt.datetime.now(dt.timezone.utc),
+            status="running",
+            priority=5,
+            attempt_count=1,
+            max_attempts=3,
+        )
+        exc = ValueError("Could not find showtime object in AMC RSC payload")
+
+        with (
+            patch.object(queue.db, "extend_throttle") as extend_throttle,
+            patch.object(queue.db, "mark_task_skipped") as mark_task_skipped,
+            patch.object(queue.db, "mark_task_failed") as mark_task_failed,
+        ):
+            queue.schedule_retry_or_fail(object(), task, exc)
+
+        extend_throttle.assert_not_called()
+        mark_task_skipped.assert_not_called()
+        mark_task_failed.assert_called_once()
+        self.assertEqual(75, mark_task_failed.call_args.kwargs["retry_delay_seconds"])
+        self.assertEqual(2, mark_task_failed.call_args.kwargs["max_attempts"])
+
+    def test_second_content_failure_schedules_late_rescue(self) -> None:
+        run_id = uuid.uuid4()
+        observed_at = dt.datetime(2026, 7, 1, 22, 0, tzinfo=dt.timezone.utc)
+        starts_at = observed_at + dt.timedelta(minutes=5)
+        showtime = type("Showtime", (), {"utc_start_at": starts_at})()
+        task = CollectionTask(
+            task_id=42,
+            run_id=run_id,
+            task_type="collect_seat_snapshot",
+            amc_theatre_id=None,
+            showtime_id="100",
+            amc_movie_id="movie-1",
+            scheduled_for=dt.datetime.now(dt.timezone.utc),
+            status="running",
+            priority=5,
+            attempt_count=2,
+            max_attempts=3,
+        )
+        exc = ValueError("Could not find showtime.seatingLayout.seats in AMC RSC payload")
+
+        with (
+            patch.object(queue.db, "utc_now", return_value=observed_at),
+            patch.object(queue.db, "select_showtime_by_id", return_value=showtime),
+            patch.object(queue.db, "mark_task_failed") as mark_task_failed,
+            patch.object(queue.db, "reschedule_task_retry") as reschedule_task_retry,
+        ):
+            queue.schedule_retry_or_fail(object(), task, exc)
+
+        mark_task_failed.assert_not_called()
+        reschedule_task_retry.assert_called_once()
+        self.assertEqual(starts_at + dt.timedelta(minutes=10), reschedule_task_retry.call_args.kwargs["scheduled_for"])
+        self.assertEqual(-10, reschedule_task_retry.call_args.kwargs["target_offset_minutes"])
 
     def test_worker_logs_shared_throttle_wait_and_release(self) -> None:
         blocked_until = dt.datetime(2026, 7, 1, 23, 1, 15, tzinfo=dt.timezone.utc)

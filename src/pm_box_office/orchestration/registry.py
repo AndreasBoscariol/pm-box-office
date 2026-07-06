@@ -28,6 +28,11 @@ SOURCE_DEFINITIONS: tuple[SourceDefinition, ...] = (
         command="pm_box_office.sources.boxofficepro.ingest",
     ),
     SourceDefinition(
+        source_key="boxofficereport",
+        display_name="Box Office Report",
+        command="pm_box_office.sources.boxofficereport.ingest",
+    ),
+    SourceDefinition(
         source_key="wikipedia",
         display_name="Wikipedia Activity",
         command="pm_box_office.sources.wikipedia.ingest",
@@ -46,14 +51,6 @@ SOURCE_DEFINITIONS: tuple[SourceDefinition, ...] = (
         requires_movies=True,
     ),
     SourceDefinition(
-        source_key="social_x",
-        display_name="Social X/Nitter POC",
-        command="pm_box_office.sources.social_x.ingest",
-        default_args=("--dry-run", "--movie-limit", "5"),
-        enabled=False,
-        requires_movies=True,
-    ),
-    SourceDefinition(
         source_key="amc_worker",
         display_name="AMC Worker Batch",
         command="pm_box_office.sources.amc.jobs.worker",
@@ -63,3 +60,8 @@ SOURCE_DEFINITIONS: tuple[SourceDefinition, ...] = (
 
 
 SOURCE_BY_KEY = {source.source_key: source for source in SOURCE_DEFINITIONS}
+RUN_ALL_SOURCE_KEYS = tuple(
+    source.source_key
+    for source in SOURCE_DEFINITIONS
+    if source.enabled and source.source_key not in {"amc_worker"}
+)

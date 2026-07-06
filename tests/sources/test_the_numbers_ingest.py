@@ -42,6 +42,8 @@ MOVIE_PAGE_HTML = """
       <tr><td><b>MPA&nbsp;Rating:</b></td>
       <td>PG-13 for intense action and brief language.<br>(Rating bulletin 2885)</td></tr>
       <tr><td><b>Genre:</b></td><td>Action</td></tr>
+      <tr><td><b>Production Budget:</b></td><td>$125,000,000</td></tr>
+      <tr><td><b>Franchise:</b></td><td><a href="/movies/franchise/Sample">Sample Saga</a></td></tr>
     </table>
     <h2>Daily Box Office Performance</h2>
     <table>
@@ -125,17 +127,171 @@ class ScrapeTheNumbersTests(unittest.TestCase):
             metadata.mpa_rating_details,
         )
         self.assertEqual("Action", metadata.genre)
+        self.assertEqual(125000000, metadata.production_budget_usd)
+        self.assertEqual("Sample Saga", metadata.franchise)
+
+    def test_movies_schema_keeps_release_date_for_schedule_sources(self) -> None:
+        conn, schema = make_isolated_postgres_schema()
+        scraper.initialize_database(conn)
+        try:
+            column = conn.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'movies'
+                  AND column_name = 'release_date'
+                """
+            ).fetchone()
+
+            self.assertEqual(("release_date",), tuple(column))
+        finally:
+            drop_isolated_postgres_schema(conn, schema)
+
+    def test_the_numbers_movie_url_is_source_id_not_required_movie_key(self) -> None:
+        conn, schema = make_isolated_postgres_schema()
+        scraper.initialize_database(conn)
+        try:
+            nullable = conn.execute(
+                """
+                SELECT is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'movies'
+                  AND column_name = 'movie_url'
+                """
+            ).fetchone()[0]
+            self.assertEqual("YES", nullable)
+
+            row = scraper.MovieDailyRow(
+                movie_url="https://www.the-numbers.com/movie/Sample-Movie-(2026)",
+                title="Sample Movie (2026)",
+                release_year=2026,
+                opusdata_id="123456",
+                box_office_date="2026-05-01",
+                rank="1",
+                gross_usd=100,
+                percent_yesterday=None,
+                percent_last_week=None,
+                theaters=1000,
+                per_theater_usd=1,
+                cumulative_gross_usd=100,
+                days_in_release=1,
+                is_preview=0,
+                source_url="https://www.the-numbers.com/movie/Sample-Movie-(2026)",
+            )
+            movie_id = scraper.upsert_movie(conn, row)
+
+            source_rows = conn.execute(
+                """
+                SELECT source, source_movie_id, movie_id
+                FROM movie_source_ids
+                WHERE movie_id = %s
+                ORDER BY source
+                """,
+                (movie_id,),
+            ).fetchall()
+
+            self.assertEqual(
+                [
+                    ("the_numbers", "https://www.the-numbers.com/movie/Sample-Movie-(2026)", movie_id),
+                    ("the_numbers_opusdata", "123456", movie_id),
+                ],
+                [tuple(row) for row in source_rows],
+            )
+        finally:
+            drop_isolated_postgres_schema(conn, schema)
 
     def test_parse_workers_default_to_sixteen(self) -> None:
         args = scraper.build_arg_parser().parse_args(["--dry-run"])
 
         self.assertEqual(16, args.parse_workers)
 
+    def test_metadata_backfill_all_flag_is_parsed(self) -> None:
+        args = scraper.build_arg_parser().parse_args(
+            ["--metadata-backfill", "--metadata-backfill-all", "--offline"]
+        )
+
+        self.assertTrue(args.metadata_backfill)
+        self.assertTrue(args.metadata_backfill_all)
+
+    def test_metadata_backfill_all_selects_complete_rows(self) -> None:
+        conn, schema = make_isolated_postgres_schema()
+        scraper.initialize_database(conn)
+        try:
+            conn.execute(
+                """
+                INSERT INTO movies (movie_url, title, release_year)
+                VALUES
+                    ('https://www.the-numbers.com/movie/Complete-(2026)', 'Complete (2026)', 2026),
+                    ('https://www.the-numbers.com/movie/Missing-(2026)', 'Missing (2026)', 2026)
+                """
+            )
+            complete_movie_id = conn.execute(
+                """
+                SELECT movie_id
+                FROM movies
+                WHERE movie_url = 'https://www.the-numbers.com/movie/Complete-(2026)'
+                """
+            ).fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO the_numbers_movie_metadata (
+                    movie_id, movie_url, title, release_year, mpa_rating,
+                    source_url, fetched_at, raw_cache_path
+                ) VALUES (
+                    %s,
+                    'https://www.the-numbers.com/movie/Complete-(2026)',
+                    'Complete (2026)',
+                    2026,
+                    'PG',
+                    'https://www.the-numbers.com/movie/Complete-(2026)',
+                    '2026-07-03T00:00:00+00:00',
+                    'cache.html'
+                )
+                """,
+                (complete_movie_id,),
+            )
+
+            missing_only = scraper.load_movie_urls_for_metadata_backfill(conn)
+            all_movies = scraper.load_movie_urls_for_metadata_backfill(conn, include_complete=True)
+
+            self.assertEqual(
+                [("https://www.the-numbers.com/movie/Missing-(2026)", "Missing (2026)")],
+                missing_only,
+            )
+            self.assertEqual(
+                [
+                    ("https://www.the-numbers.com/movie/Complete-(2026)", "Complete (2026)"),
+                    ("https://www.the-numbers.com/movie/Missing-(2026)", "Missing (2026)"),
+                ],
+                all_movies,
+            )
+        finally:
+            drop_isolated_postgres_schema(conn, schema)
+
     def test_parse_workers_must_be_positive(self) -> None:
         args = scraper.build_arg_parser().parse_args(["--parse-workers", "0", "--dry-run"])
 
         with self.assertRaisesRegex(SystemExit, "--parse-workers must be at least 1"):
             scraper.validate_args(args)
+
+    def test_refresh_recent_days_only_marks_trailing_dates(self) -> None:
+        args = scraper.build_arg_parser().parse_args(
+            [
+                "--start-date",
+                "2026-06-27",
+                "--end-date",
+                "2026-07-03",
+                "--refresh-recent-days",
+                "2",
+                "--dry-run",
+            ]
+        )
+
+        self.assertFalse(scraper.should_refresh_recent_day(dt.date(2026, 6, 29), args))
+        self.assertTrue(scraper.should_refresh_recent_day(dt.date(2026, 7, 2), args))
+        self.assertTrue(scraper.should_refresh_recent_day(dt.date(2026, 7, 3), args))
 
     def test_cached_movie_pages_parse_concurrently_in_input_order(self) -> None:
         movie_urls = [
@@ -229,7 +385,7 @@ class ScrapeTheNumbersTests(unittest.TestCase):
                 daily_count = conn.execute("SELECT COUNT(*) FROM daily_box_office").fetchone()[0]
                 metadata_row = conn.execute(
                     """
-                    SELECT mpa_rating, mpa_rating_details, genre
+                    SELECT mpa_rating, mpa_rating_details, genre, production_budget_usd, franchise
                     FROM the_numbers_movie_metadata
                     WHERE movie_url = %s
                     """,
@@ -252,12 +408,76 @@ class ScrapeTheNumbersTests(unittest.TestCase):
                     metadata_row[1],
                 )
                 self.assertEqual("Action", metadata_row[2])
+                self.assertEqual(125000000, metadata_row[3])
+                self.assertEqual("Sample Saga", metadata_row[4])
                 self.assertEqual(chart_rows[0].movie_url, source_id_row[0])
                 self.assertEqual("Sample Movie (2026)", source_id_row[1])
                 self.assertEqual("matched", source_id_row[2])
                 self.assertEqual("source_primary_key", source_id_row[3])
                 self.assertEqual(1.0, source_id_row[4])
                 self.assertEqual(0, issue_count)
+            finally:
+                drop_isolated_postgres_schema(conn, schema)
+
+    def test_reconcile_can_be_scoped_to_current_run(self) -> None:
+        chart_rows = scraper.parse_daily_chart(
+            DAILY_CHART_HTML,
+            chart_date=dt.date(2026, 5, 1),
+            source_url="https://www.the-numbers.com/box-office-chart/daily/2026/05/01",
+        )
+        stale_chart_row = scraper.DailyChartRow(
+            chart_date="2026-04-01",
+            movie_url="https://www.the-numbers.com/movie/Missing-Movie-(2026)#tab=box-office",
+            title="Missing Movie",
+            rank="1",
+            prev_rank=None,
+            gross_usd=100,
+            daily_change_pct=None,
+            weekly_change_pct=None,
+            theaters=10,
+            per_theater_usd=10,
+            cumulative_gross_usd=100,
+            days_in_release=1,
+            source_url="https://www.the-numbers.com/box-office-chart/daily/2026/04/01",
+        )
+        movie_rows = scraper.parse_movie_page(
+            MOVIE_PAGE_HTML,
+            movie_url=chart_rows[0].movie_url,
+            source_url=chart_rows[0].movie_url,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "fixture.html"
+            cache_path.write_text("fixture", encoding="utf-8")
+            conn, schema = make_isolated_postgres_schema()
+            scraper.initialize_database(conn)
+            try:
+                scraper.insert_daily_chart_rows(
+                    conn,
+                    [*chart_rows, stale_chart_row],
+                    fetched_at="2026-06-28T00:00:00+00:00",
+                    raw_cache_path=cache_path,
+                )
+                scraper.insert_movie_daily_rows(
+                    conn,
+                    movie_rows,
+                    fetched_at="2026-06-28T00:00:00+00:00",
+                    raw_cache_path=cache_path,
+                )
+                conn.commit()
+
+                issue_count = scraper.reconcile(
+                    conn,
+                    issue_source="test",
+                    chart_dates=["2026-05-01"],
+                    movie_urls=[chart_rows[0].movie_url],
+                )
+                stored_issue_count = conn.execute(
+                    "SELECT COUNT(*) FROM box_office_import_issues"
+                ).fetchone()[0]
+
+                self.assertEqual(0, issue_count)
+                self.assertEqual(0, stored_issue_count)
             finally:
                 drop_isolated_postgres_schema(conn, schema)
 

@@ -26,6 +26,7 @@ _REQUIRED_TABLES = {
     "ingest_runs",
     "ingest_run_logs",
     "source_freshness",
+    "ingest_autorun_state",
 }
 _REQUIRED_COLUMNS = {
     "amc_showtimes": {"showtime_id", "amc_movie_id", "exhibition_date", "starts_at_utc"},
@@ -36,6 +37,16 @@ _REQUIRED_COLUMNS = {
         "inclusion_probability",
         "analysis_weight",
     },
+    "collection_runs": {
+        "run_id",
+        "campaign_id",
+        "run_type",
+        "status",
+        "sample_set_id",
+        "sample_key",
+        "target_offsets_minutes",
+        "schedule_strategy",
+    },
     "collection_tasks": {
         "task_id",
         "run_id",
@@ -44,12 +55,14 @@ _REQUIRED_COLUMNS = {
         "scheduled_for",
         "status",
         "priority",
+        "target_offset_minutes",
         "worker_id",
         "last_error_type",
         "last_error_message",
     },
     "amc_seat_snapshots": {"showtime_id", "target_offset_minutes", "scheduled_for", "lateness_seconds"},
     "ingest_sources": {"source_key", "display_name", "command", "default_args"},
+    "ingest_autorun_state": {"schedule_key", "enabled", "interval_hours", "next_run_at"},
 }
 
 

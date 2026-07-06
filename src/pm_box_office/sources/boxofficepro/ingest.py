@@ -28,6 +28,9 @@ from pathlib import Path
 from typing import Any
 
 from pm_box_office.db.connection import connect_database, database_url_from_env
+from pm_box_office.domain import movies as movie_identity
+from pm_box_office.sources.common.cli import parse_date_arg
+from pm_box_office.sources.common.parsing import clean_text
 
 
 BASE_URL = "https://www.boxofficepro.com"
@@ -582,10 +585,6 @@ class WeekendPreviewParser(HTMLParser):
             self.article_text_blocks.append(block)
 
 
-def clean_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value.replace("\xa0", " ")).strip()
-
-
 def clean_multiline_text(value: str) -> str:
     text = value.replace("\xa0", " ").replace("\r", "\n")
     lines = [clean_text(line) for line in text.split("\n")]
@@ -631,13 +630,6 @@ def archive_url(page: int) -> str:
     if page <= 1:
         return FORECAST_ARCHIVE_URL
     return f"{FORECAST_ARCHIVE_URL}page/{page}/"
-
-
-def parse_date_arg(value: str) -> dt.date:
-    try:
-        return dt.date.fromisoformat(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"invalid ISO date: {value}") from exc
 
 
 def parse_dateish(value: str) -> str | None:
@@ -2020,6 +2012,7 @@ def initialize_database(conn: Any) -> None:
             ON boxofficepro_weekend_predictions(normalized_movie_title);
         """
     )
+    movie_identity.ensure_movie_identity_schema(conn)
 
 
 def upsert_article(
@@ -2485,13 +2478,16 @@ def boxofficepro_prediction_columns(conn: Any) -> set[str]:
 
 
 def find_manual_override(conn: Any, prediction: WeekendPrediction) -> MovieMatch | None:
-    if "movie_url" not in movie_table_columns(conn):
+    if not relation_exists(conn, "movie_source_ids"):
         return None
     row = conn.execute(
         """
         SELECT m.movie_id, o.movie_url
         FROM boxofficepro_movie_match_overrides o
-        JOIN movies m ON m.movie_url = o.movie_url
+        JOIN movie_source_ids msi
+          ON msi.source = 'the_numbers'
+         AND msi.source_movie_id = o.movie_url
+        JOIN movies m ON m.movie_id = msi.movie_id
         WHERE o.active = TRUE
           AND o.normalized_movie_title = %s
           AND (o.article_url = %s OR o.article_url IS NULL)

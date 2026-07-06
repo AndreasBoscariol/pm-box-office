@@ -70,9 +70,11 @@ class FakeShowtimeFetcher:
     def __init__(self, pages: dict[str, str]) -> None:
         self.pages = pages
         self.urls: list[str] = []
+        self.refresh_values: list[bool | None] = []
 
-    def get_result(self, url: str) -> FetchResult:
+    def get_result(self, url: str, *, refresh: bool | None = None) -> FetchResult:
         self.urls.append(url)
+        self.refresh_values.append(refresh)
         return FetchResult(
             body=self.pages[url],
             source_url=url,
@@ -164,6 +166,37 @@ class AmcPipelineUnitTests(unittest.TestCase):
         self.assertEqual([360, 120, 30, 5], [snapshot.minutes_before_showtime for snapshot in snapshots])
         self.assertEqual("2026-07-01T20:00:00+00:00", snapshots[0].due_utc_at.isoformat())
         self.assertEqual("2026-07-01T13:00:00-07:00", snapshots[0].due_local_at.isoformat())
+
+    def test_smooth_seat_scan_schedule_spreads_same_minute_bursts(self) -> None:
+        start = dt.datetime(2026, 7, 1, 23, 0, tzinfo=dt.timezone.utc)
+        showtimes = [
+            db.StoredShowtime(
+                showtime_id=f"{index}",
+                amc_theatre_id=index,
+                theatre_slug=f"amc-{index}",
+                local_show_date="2026-07-01",
+                local_start_at=start,
+                utc_start_at=start,
+                timezone="UTC",
+                amc_movie_id="movie-1",
+                amc_movie_name="Sample One",
+            )
+            for index in range(30)
+        ]
+
+        rows = db.seat_scan_task_rows(
+            showtimes,
+            offsets=range(20, 0, -1),
+            schedule_strategy="smooth_once",
+        )
+        loads: dict[dt.datetime, int] = {}
+        for row in rows:
+            loads[row["scheduled_for"]] = loads.get(row["scheduled_for"], 0) + 1
+
+        self.assertEqual(30, len(rows))
+        self.assertEqual(20, len(loads))
+        self.assertLessEqual(max(loads.values()), 2)
+        self.assertEqual(1, len([row for row in rows if row["showtime"].showtime_id == "0"]))
 
     def test_stratified_sample_is_deterministic(self) -> None:
         theatres = [
@@ -341,6 +374,63 @@ class AmcPipelinePostgresTests(unittest.TestCase):
             self.conn.execute("SELECT COUNT(*) FROM amc_seat_snapshots").fetchone()[0],
         )
 
+    def test_utc_showtime_date_is_stored_as_theatre_local_business_date(self) -> None:
+        theatre = AmcTheatre(
+            amc_theatre_id=200,
+            slug="amc-pacific-12",
+            theatre_url="https://www.amctheatres.com/movie-theatres/los-angeles/amc-pacific-12",
+            name="AMC Pacific 12",
+            address_line1="",
+            city="LOS ANGELES",
+            state="CA",
+            postal_code="90001",
+            latitude=34.0,
+            longitude=-118.2,
+            timezone="America/Los_Angeles",
+            inferred_screen_count=12,
+        )
+        db.upsert_theatres(self.conn, [theatre])
+        stored_theatre = db.select_active_theatres(self.conn)[0]
+        showtimes = [
+            ShowtimeRecord(
+                theatre_slug=stored_theatre.slug,
+                date="2026-07-03",
+                showtime_id="utc-evening",
+                when="2026-07-03T00:00:00Z",
+                movie_name="Sample One",
+                movie_id="movie-1",
+                showtime_url="https://www.amctheatres.com/showtimes/utc-evening",
+                attribute_names="",
+            ),
+            ShowtimeRecord(
+                theatre_slug=stored_theatre.slug,
+                date="2026-07-04",
+                showtime_id="late-night",
+                when="2026-07-04T07:30:00Z",
+                movie_name="Sample One",
+                movie_id="movie-1",
+                showtime_url="https://www.amctheatres.com/showtimes/late-night",
+                attribute_names="",
+            ),
+        ]
+
+        db.upsert_showtimes(self.conn, theatre=stored_theatre, showtimes=showtimes)
+        rows = self.conn.execute(
+            """
+            SELECT showtime_id, exhibition_date, local_calendar_start_at
+            FROM amc_showtimes
+            ORDER BY showtime_id
+            """
+        ).fetchall()
+
+        self.assertEqual(
+            [
+                ("late-night", dt.date(2026, 7, 3), dt.datetime(2026, 7, 4, 0, 30)),
+                ("utc-evening", dt.date(2026, 7, 2), dt.datetime(2026, 7, 2, 17, 0)),
+            ],
+            [(str(row[0]), row[1], row[2]) for row in rows],
+        )
+
     def test_campaign_movie_selection_is_idempotent(self) -> None:
         db.upsert_amc_movie(
             self.conn,
@@ -470,7 +560,7 @@ class AmcPipelinePostgresTests(unittest.TestCase):
                     movie_name="Sample One",
                     movie_id="movie-1",
                     showtime_url="https://www.amctheatres.com/showtimes/100",
-                    attribute_names="IMAX",
+                    attribute_names="IMAX|Reserved Seating",
                 )
             ],
         )
@@ -487,21 +577,131 @@ class AmcPipelinePostgresTests(unittest.TestCase):
             self.conn,
             run_id=run_id,
             showtimes=[showtime],
-            target_offsets_minutes=(120, 30, 5),
+            target_offsets_minutes=(120, 30, 5, -15),
         )
         self.conn.commit()
 
         rows = self.conn.execute(
             """
-            SELECT priority
+            SELECT priority, target_offset_minutes, scheduled_for
             FROM collection_tasks
             WHERE run_id = %s
-            ORDER BY priority DESC
+            ORDER BY target_offset_minutes DESC
             """,
             (run_id,),
         ).fetchall()
-        self.assertEqual(3, task_count)
-        self.assertEqual([120, 30, 5], [row[0] for row in rows])
+        self.assertEqual(4, task_count)
+        self.assertEqual([120, 30, 5, -15], [row[1] for row in rows])
+        self.assertEqual(showtime.utc_start_at + dt.timedelta(minutes=15), db.ensure_utc(rows[-1][2]))
+
+    def test_seat_collection_quality_view_uses_planned_task_grid(self) -> None:
+        theatre = parse_theatre_sitemap(SITEMAP_XML)[0]
+        db.upsert_theatres(self.conn, [theatre])
+        stored_theatre = db.select_active_theatres_basic(self.conn)[0]
+        db.upsert_showtimes(
+            self.conn,
+            theatre=stored_theatre,
+            showtimes=[
+                ShowtimeRecord(
+                    theatre_slug=stored_theatre.slug,
+                    date="2026-07-01",
+                    showtime_id="100",
+                    when="2026-07-01T19:00:00-04:00",
+                    movie_name="Sample One",
+                    movie_id="movie-1",
+                    showtime_url="https://www.amctheatres.com/showtimes/100",
+                    attribute_names="IMAX|Reserved Seating",
+                )
+            ],
+        )
+        campaign_id = db.ensure_campaign(self.conn, dt.date(2026, 7, 1))
+        sample_set = sample_service.ensure_default_theatre_sample(
+            self.conn,
+            sample_key="quality-grid",
+            sample_size=1,
+            certainty_count=0,
+            seed="sample",
+        )
+        run_id = db.create_run(
+            self.conn,
+            campaign_id=campaign_id,
+            run_type="seat_collection",
+            sample_set_id=sample_set.sample_set_id,
+            sample_key=sample_set.sample_key,
+            target_offsets_minutes=(120, 30),
+            schedule_strategy="all_offsets",
+        )
+        showtime = db.select_showtimes_for_target(
+            self.conn,
+            target_date="2026-07-01",
+            target_amc_movie_id="movie-1",
+            target_amc_movie_name=None,
+        )[0]
+        db.create_seat_scan_tasks(
+            self.conn,
+            run_id=run_id,
+            showtimes=[showtime],
+            target_offsets_minutes=(120, 30),
+            schedule_strategy="all_offsets",
+        )
+        db.upsert_seat_snapshot(
+            self.conn,
+            showtime=showtime,
+            seat_fill=SeatFill(
+                theatre_slug=showtime.theatre_slug,
+                date="2026-07-01",
+                showtime_id=showtime.showtime_id,
+                showtime_url="https://www.amctheatres.com/showtimes/100",
+                total_seats=100,
+                available_seats=80,
+                filled_or_unavailable_seats=20,
+                fill_rate=0.2,
+            ),
+            snapshot_utc_at=dt.datetime(2026, 7, 1, 22, 30, tzinfo=dt.timezone.utc),
+            minutes_before_showtime=30,
+        )
+        self.conn.commit()
+
+        task_offsets = self.conn.execute(
+            """
+            SELECT target_offset_minutes
+            FROM collection_tasks
+            WHERE run_id = %s
+            ORDER BY target_offset_minutes DESC
+            """,
+            (run_id,),
+        ).fetchall()
+        quality = self.conn.execute(
+            """
+            SELECT
+                expected_snapshots,
+                observed_snapshots,
+                snapshot_success_rate,
+                observed_capacity,
+                expected_known_capacity,
+                capacity_coverage_rate
+            FROM analytics.amc_seat_collection_quality_v1
+            WHERE run_id = %s AND amc_movie_id = 'movie-1'
+            """,
+            (run_id,),
+        ).fetchone()
+        blocks = self.conn.execute(
+            """
+            SELECT snapshot_coverage, capacity_coverage
+            FROM analytics.amc_movie_day_blocks_v1
+            WHERE amc_movie_id = 'movie-1' AND exhibition_date = '2026-07-01'
+            """
+        ).fetchone()
+
+        self.assertEqual([120, 30], [int(row[0]) for row in task_offsets])
+        self.assertEqual(2, int(quality[0]))
+        self.assertEqual(1, int(quality[1]))
+        self.assertAlmostEqual(0.5, float(quality[2]))
+        self.assertEqual(100, int(quality[3]))
+        self.assertEqual(200, int(quality[4]))
+        self.assertAlmostEqual(0.5, float(quality[5]))
+        self.assertAlmostEqual(0.5, float(blocks[0]))
+        self.assertAlmostEqual(0.5, float(blocks[1]))
 
     def test_collection_services_reuse_active_runs(self) -> None:
         theatre = parse_theatre_sitemap(SITEMAP_XML)[0]
@@ -519,7 +719,7 @@ class AmcPipelinePostgresTests(unittest.TestCase):
                     movie_name="Sample One",
                     movie_id="movie-1",
                     showtime_url="https://www.amctheatres.com/showtimes/100",
-                    attribute_names="IMAX",
+                    attribute_names="IMAX|Reserved Seating",
                 )
             ],
         )
@@ -555,6 +755,37 @@ class AmcPipelinePostgresTests(unittest.TestCase):
         self.assertEqual(seat_run_1, seat_run_2)
         self.assertEqual(seat_tasks_1, seat_tasks_2)
 
+    def test_create_inventory_run_force_refresh_cancels_active_run(self) -> None:
+        theatre = parse_theatre_sitemap(SITEMAP_XML)[0]
+        db.upsert_theatres(self.conn, [theatre])
+        campaign_id = db.ensure_campaign(self.conn, dt.date(2026, 7, 1))
+        old_run_id = db.create_run(self.conn, campaign_id=campaign_id, run_type="showtime_inventory")
+        db.create_inventory_tasks(self.conn, run_id=old_run_id, theatres=db.select_active_theatres_basic(self.conn))
+        self.conn.commit()
+
+        new_run_id, task_count = showtime_service.create_inventory_run(
+            self.conn,
+            exhibition_date=dt.date(2026, 7, 1),
+            force_refresh=True,
+        )
+
+        rows = self.conn.execute(
+            """
+            SELECT run_id, status, tasks_total, tasks_cancelled
+            FROM collection_runs
+            WHERE campaign_id = %s AND run_type = 'showtime_inventory'
+            ORDER BY started_at, run_id
+            """,
+            (campaign_id,),
+        ).fetchall()
+
+        self.assertNotEqual(str(old_run_id), new_run_id)
+        self.assertEqual(1, task_count)
+        self.assertEqual("cancelled", rows[0][1])
+        self.assertEqual(1, int(rows[0][3]))
+        self.assertEqual(new_run_id, str(rows[1][0]))
+        self.assertEqual("queued", rows[1][1])
+
     def test_persistent_theatre_sample_is_reused_and_weighted(self) -> None:
         theatres = [
             synthetic_theatre(1, state="CA", timezone="America/Los_Angeles", screens=30),
@@ -578,7 +809,7 @@ class AmcPipelinePostgresTests(unittest.TestCase):
                         movie_name="Sample One",
                         movie_id="movie-1",
                         showtime_url=f"https://www.amctheatres.com/showtimes/{theatre.amc_theatre_id}",
-                        attribute_names="",
+                        attribute_names="Reserved Seating",
                     )
                 ],
             )
@@ -653,7 +884,7 @@ class AmcPipelinePostgresTests(unittest.TestCase):
                         movie_name="Sample One",
                         movie_id="movie-1",
                         showtime_url=f"https://www.amctheatres.com/showtimes/{theatre.amc_theatre_id}",
-                        attribute_names="",
+                        attribute_names="Reserved Seating",
                     )
                 ],
             )
@@ -695,6 +926,68 @@ class AmcPipelinePostgresTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual(3, task_count)
         self.assertEqual(sampled_theatre_ids, {int(row[0]) for row in task_rows})
+
+    def test_seat_collection_run_excludes_non_reserved_showtimes(self) -> None:
+        theatres = [
+            synthetic_theatre(index, state="CA", timezone="America/Los_Angeles", screens=10 + index)
+            for index in range(1, 4)
+        ]
+        db.upsert_theatres(self.conn, theatres)
+        for theatre in db.select_active_theatres_basic(self.conn):
+            is_reserved = theatre.amc_theatre_id != theatres[0].amc_theatre_id
+            db.upsert_showtimes(
+                self.conn,
+                theatre=theatre,
+                showtimes=[
+                    ShowtimeRecord(
+                        theatre_slug=theatre.slug,
+                        date="2026-07-01",
+                        showtime_id=f"{theatre.amc_theatre_id}",
+                        when="2026-07-01T19:00:00",
+                        movie_name="Sample One",
+                        movie_id="movie-1",
+                        showtime_url=f"https://www.amctheatres.com/showtimes/{theatre.amc_theatre_id}",
+                        attribute_names="Reserved Seating" if is_reserved else "Closed Caption|Audio Description",
+                    )
+                ],
+            )
+        campaign_id = db.ensure_campaign(self.conn, dt.date(2026, 7, 1))
+        db.set_campaign_movie_selected(
+            self.conn,
+            campaign_id=campaign_id,
+            amc_movie_id="movie-1",
+            selected=True,
+        )
+        sample_service.ensure_default_theatre_sample(
+            self.conn,
+            sample_key="reserved-only-seat-run",
+            sample_size=3,
+            certainty_count=0,
+            seed="sample",
+        )
+        self.conn.commit()
+
+        run_id, task_count = movie_service.create_seat_collection_run(
+            self.conn,
+            exhibition_date=dt.date(2026, 7, 1),
+            sample_key="reserved-only-seat-run",
+        )
+
+        task_rows = self.conn.execute(
+            """
+            SELECT s.attribute_names, t.priority, t.deadline_at, t.target_offset_minutes, t.scheduled_for
+            FROM collection_tasks t
+            JOIN amc_showtimes s ON s.showtime_id = t.showtime_id
+            WHERE t.run_id = %s
+            ORDER BY s.showtime_id
+            """,
+            (run_id,),
+        ).fetchall()
+        self.assertEqual(2, task_count)
+        self.assertTrue(all("Reserved Seating" in row[0] for row in task_rows))
+        self.assertTrue(all(1 <= int(row[1]) <= 20 for row in task_rows))
+        self.assertTrue(all(row[2] is None for row in task_rows))
+        self.assertTrue(all(int(row[3]) == -15 for row in task_rows))
 
     def test_reset_collection_state_preserves_sample_and_inventory(self) -> None:
         theatres = [
@@ -948,6 +1241,7 @@ class AmcPipelinePostgresTests(unittest.TestCase):
             ],
             fetcher.urls,
         )
+        self.assertEqual([True, True], fetcher.refresh_values)
         rows = self.conn.execute(
             """
             SELECT showtime_id, exhibition_date
@@ -1069,6 +1363,128 @@ class AmcPipelinePostgresTests(unittest.TestCase):
         )
 
         self.assertEqual(["collect_seat_snapshot"], [task.task_type for task in claimed_after_backoff])
+
+    def test_historical_deadline_does_not_block_seat_claim(self) -> None:
+        campaign_id = db.ensure_campaign(self.conn, dt.date(2026, 7, 1))
+        run_id = db.create_run(self.conn, campaign_id=campaign_id, run_type="seat_collection")
+        now = db.utc_now()
+        row = self.conn.execute(
+            """
+            INSERT INTO collection_tasks (
+                run_id, task_type, scheduled_for, deadline_at, status, priority, available_after
+            ) VALUES (%s, 'collect_seat_snapshot', %s, %s, 'queued', 5, %s)
+            RETURNING task_id
+            """,
+            (run_id, now - dt.timedelta(minutes=10), now - dt.timedelta(minutes=1), now - dt.timedelta(minutes=10)),
+        ).fetchone()
+        self.conn.commit()
+
+        claimed = db.claim_due_tasks(self.conn, worker_id="worker-1", limit=10, now=now)
+
+        task_row = self.conn.execute(
+            """
+            SELECT status, last_error_type, completed_at
+            FROM collection_tasks
+            WHERE task_id = %s
+            """,
+            (int(row[0]),),
+        ).fetchone()
+        self.assertEqual([int(row[0])], [task.task_id for task in claimed])
+        self.assertEqual("running", task_row[0])
+        self.assertIsNone(task_row[1])
+        self.assertIsNone(task_row[2])
+
+    def test_seat_tasks_without_deadline_are_claimable_after_showtime_start(self) -> None:
+        theatre = parse_theatre_sitemap(SITEMAP_XML)[0]
+        db.upsert_theatres(self.conn, [theatre])
+        stored_theatre = db.select_active_theatres_basic(self.conn)[0]
+        db.upsert_showtimes(
+            self.conn,
+            theatre=stored_theatre,
+            showtimes=[
+                ShowtimeRecord(
+                    theatre_slug=stored_theatre.slug,
+                    date="2026-07-01",
+                    showtime_id="expired-showtime",
+                    when="2026-07-01T19:00:00-04:00",
+                    movie_name="Sample One",
+                    movie_id="movie-1",
+                    showtime_url="https://www.amctheatres.com/showtimes/expired-showtime",
+                    attribute_names="Reserved Seating",
+                )
+            ],
+        )
+        campaign_id = db.ensure_campaign(self.conn, dt.date(2026, 7, 1))
+        run_id = db.create_run(self.conn, campaign_id=campaign_id, run_type="seat_collection")
+        showtime = db.select_showtimes_for_target(
+            self.conn,
+            target_date="2026-07-01",
+            target_amc_movie_id="movie-1",
+            target_amc_movie_name=None,
+        )[0]
+        now = showtime.utc_start_at + dt.timedelta(minutes=1)
+        row = self.conn.execute(
+            """
+            INSERT INTO collection_tasks (
+                run_id, task_type, showtime_id, scheduled_for, deadline_at, status, priority, available_after
+            ) VALUES (%s, 'collect_seat_snapshot', %s, %s, NULL, 'queued', 5, %s)
+            RETURNING task_id
+            """,
+            (
+                run_id,
+                showtime.showtime_id,
+                showtime.utc_start_at - dt.timedelta(minutes=5),
+                showtime.utc_start_at - dt.timedelta(minutes=5),
+            ),
+        ).fetchone()
+        self.conn.commit()
+
+        claimed = db.claim_due_tasks(self.conn, worker_id="worker-1", limit=10, now=now)
+
+        task_row = self.conn.execute(
+            """
+            SELECT status, last_error_type, completed_at
+            FROM collection_tasks
+            WHERE task_id = %s
+            """,
+            (int(row[0]),),
+        ).fetchone()
+        self.assertEqual([int(row[0])], [task.task_id for task in claimed])
+        self.assertEqual("running", task_row[0])
+        self.assertIsNone(task_row[1])
+        self.assertIsNone(task_row[2])
+
+    def test_global_live_request_limiter_returns_wait_after_cap(self) -> None:
+        now = dt.datetime(2026, 7, 1, 12, 0, tzinfo=dt.timezone.utc)
+
+        first_wait = db.acquire_live_request_slot(
+            self.conn,
+            max_requests_per_minute=2,
+            worker_id="worker-1",
+            url_kind="rsc",
+            source_url="https://www.amctheatres.com/showtimes/100/seats?_rsc=1",
+            now=now,
+        )
+        second_wait = db.acquire_live_request_slot(
+            self.conn,
+            max_requests_per_minute=2,
+            worker_id="worker-2",
+            url_kind="rsc",
+            source_url="https://www.amctheatres.com/showtimes/101/seats?_rsc=1",
+            now=now + dt.timedelta(seconds=1),
+        )
+        third_wait = db.acquire_live_request_slot(
+            self.conn,
+            max_requests_per_minute=2,
+            worker_id="worker-3",
+            url_kind="rsc",
+            source_url="https://www.amctheatres.com/showtimes/102/seats?_rsc=1",
+            now=now + dt.timedelta(seconds=2),
+        )
+
+        self.assertIsNone(first_wait)
+        self.assertIsNone(second_wait)
+        self.assertEqual(now + dt.timedelta(seconds=60), third_wait)
 
 
 if __name__ == "__main__":

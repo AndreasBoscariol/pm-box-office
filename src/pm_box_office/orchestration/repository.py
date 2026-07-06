@@ -13,6 +13,14 @@ from pm_box_office.orchestration.registry import SOURCE_DEFINITIONS, SourceDefin
 
 ACTIVE_STATUSES = ("queued", "running")
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled")
+DAILY_RUN_ALL_SCHEDULE_KEY = "daily_run_all"
+NEXT_11PM_SQL = """
+CASE
+    WHEN CURRENT_DATE + TIME '23:00' > CURRENT_TIMESTAMP
+    THEN CURRENT_DATE + TIME '23:00'
+    ELSE CURRENT_DATE + TIME '23:00' + INTERVAL '1 day'
+END
+"""
 
 
 class OrchestrationError(RuntimeError):
@@ -102,11 +110,39 @@ def initialize_orchestration_database(conn: Any) -> None:
             PRIMARY KEY (source_key, metric_key)
         );
 
+        CREATE TABLE IF NOT EXISTS ingest_autorun_state (
+            schedule_key TEXT PRIMARY KEY,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            interval_hours INTEGER NOT NULL DEFAULT 24 CHECK (interval_hours >= 1),
+            next_run_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_triggered_at TIMESTAMPTZ,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE INDEX IF NOT EXISTS idx_ingest_runs_source_status
             ON ingest_runs(source_key, status, requested_at DESC);
         CREATE INDEX IF NOT EXISTS idx_ingest_run_logs_run_emitted
             ON ingest_run_logs(run_id, emitted_at DESC, log_id DESC);
         """
+    )
+    seed_autorun_state(conn)
+
+
+def seed_autorun_state(conn: Any) -> None:
+    conn.execute(
+        f"""
+        INSERT INTO ingest_autorun_state (schedule_key, enabled, interval_hours, next_run_at, updated_at)
+        VALUES (%s, TRUE, 24, ({NEXT_11PM_SQL})::timestamptz, CURRENT_TIMESTAMP)
+        ON CONFLICT(schedule_key) DO UPDATE SET
+            interval_hours = 24,
+            next_run_at = CASE
+                WHEN ingest_autorun_state.last_triggered_at IS NULL
+                THEN ({NEXT_11PM_SQL})::timestamptz
+                ELSE ingest_autorun_state.next_run_at
+            END,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (DAILY_RUN_ALL_SCHEDULE_KEY,),
     )
 
 
@@ -200,6 +236,68 @@ def create_run(
         (str(run_id), source_key, trigger, source.command, json.dumps(args)),
     )
     return run_id
+
+
+def get_autorun_state(conn: Any, *, schedule_key: str = DAILY_RUN_ALL_SCHEDULE_KEY) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT schedule_key, enabled, interval_hours, next_run_at, last_triggered_at, updated_at,
+               GREATEST(0, EXTRACT(EPOCH FROM (next_run_at - CURRENT_TIMESTAMP)))::bigint
+        FROM ingest_autorun_state
+        WHERE schedule_key = %s
+        """,
+        (schedule_key,),
+    ).fetchone()
+    if row is None:
+        seed_autorun_state(conn)
+        row = conn.execute(
+            """
+            SELECT schedule_key, enabled, interval_hours, next_run_at, last_triggered_at, updated_at,
+                   GREATEST(0, EXTRACT(EPOCH FROM (next_run_at - CURRENT_TIMESTAMP)))::bigint
+            FROM ingest_autorun_state
+            WHERE schedule_key = %s
+            """,
+            (schedule_key,),
+        ).fetchone()
+    if row is None:
+        raise OrchestrationError(f"Missing autorun schedule: {schedule_key}")
+    return {
+        "schedule_key": row[0],
+        "enabled": row[1],
+        "interval_hours": row[2],
+        "next_run_at": row[3],
+        "last_triggered_at": row[4],
+        "updated_at": row[5],
+        "seconds_until_next_run": int(row[6] or 0),
+    }
+
+
+def autorun_due(conn: Any, *, schedule_key: str = DAILY_RUN_ALL_SCHEDULE_KEY) -> bool:
+    row = conn.execute(
+        """
+        SELECT enabled AND next_run_at <= CURRENT_TIMESTAMP
+        FROM ingest_autorun_state
+        WHERE schedule_key = %s
+        """,
+        (schedule_key,),
+    ).fetchone()
+    if row is None:
+        seed_autorun_state(conn)
+        return True
+    return bool(row[0])
+
+
+def record_autorun_trigger(conn: Any, *, schedule_key: str = DAILY_RUN_ALL_SCHEDULE_KEY) -> None:
+    conn.execute(
+        f"""
+        UPDATE ingest_autorun_state
+        SET last_triggered_at = CURRENT_TIMESTAMP,
+            next_run_at = ({NEXT_11PM_SQL})::timestamptz,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE schedule_key = %s
+        """,
+        (schedule_key,),
+    )
 
 
 def mark_run_spawned(conn: Any, *, run_id: uuid.UUID | str, pid: int) -> None:
@@ -455,6 +553,13 @@ def refresh_all_source_freshness(conn: Any) -> None:
         source_key="boxofficepro",
         metric_key="weekend_predictions",
         table_name="boxofficepro_weekend_predictions",
+        timestamp_column="fetched_at",
+    )
+    refresh_table_metric(
+        conn,
+        source_key="boxofficereport",
+        metric_key="weekend_predictions",
+        table_name="boxofficereport_weekend_predictions",
         timestamp_column="fetched_at",
     )
     refresh_table_metric(

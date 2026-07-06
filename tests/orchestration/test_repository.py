@@ -56,6 +56,21 @@ class OrchestrationRepositoryTests(unittest.TestCase):
             tuple(row),
         )
 
+    def test_autorun_state_tracks_next_daily_run(self) -> None:
+        state = repository.get_autorun_state(self.conn)
+
+        self.assertTrue(state["enabled"])
+        self.assertEqual(24, state["interval_hours"])
+        self.assertGreater(state["seconds_until_next_run"], 0)
+        self.assertLessEqual(state["seconds_until_next_run"], 24 * 60 * 60)
+
+        repository.record_autorun_trigger(self.conn)
+        updated = repository.get_autorun_state(self.conn)
+
+        self.assertGreater(updated["seconds_until_next_run"], 0)
+        self.assertLessEqual(updated["seconds_until_next_run"], 24 * 60 * 60)
+        self.assertIsNotNone(updated["last_triggered_at"])
+
     def test_log_tail_returns_oldest_to_newest_with_limit(self) -> None:
         run_id = repository.create_run(self.conn, source_key="the_numbers", trigger="manual")
         for index in range(5):

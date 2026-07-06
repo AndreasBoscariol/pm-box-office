@@ -455,6 +455,50 @@ class WikipediaIngestTests(unittest.TestCase):
         )
         self.assertNotIn("Young Washington", {row.title for row in rows})
 
+    def test_candidate_selection_includes_the_numbers_schedule_prerelease_movies(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE the_numbers_release_schedule (
+                movie_url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                release_date DATE,
+                release_pattern TEXT
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO movies (movie_id, movie_url, title, release_year)
+            VALUES (2, 'https://www.the-numbers.com/movie/Future-Movie-(2026)', 'Future Movie', 2026)
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO the_numbers_release_schedule (movie_url, title, release_date, release_pattern)
+            VALUES ('https://www.the-numbers.com/movie/Future-Movie-(2026)', 'Future Movie', '2026-07-17', 'Wide')
+            """
+        )
+
+        rows = ingest.select_candidate_movies(
+            self.conn,
+            release_year=2026,
+            min_opening_theaters=None,
+            movie_limit=None,
+        )
+
+        by_title = {row.title: row for row in rows}
+        self.assertIn("Future Movie", by_title)
+        self.assertEqual("2026-07-17", by_title["Future Movie"].opening_date)
+        self.assertEqual(0, by_title["Future Movie"].release_run_id)
+
+        rows = ingest.select_candidate_movies(
+            self.conn,
+            release_year=2026,
+            min_opening_theaters=3000,
+            movie_limit=None,
+        )
+        self.assertNotIn("Future Movie", {row.title for row in rows})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -27,20 +27,18 @@
     <div><dt>Done</dt><dd>{{ progress.succeeded }}</dd></div>
     <div><dt>Failed</dt><dd>{{ progress.failed }}</dd></div>
     <div><dt>Due</dt><dd>{{ progress.due_now }}</dd></div>
-    <div><dt>Late</dt><dd>{{ progress.late }}</dd></div>
   </dl>
   <div class="run-detail">
-    {% if progress.running_worker_id %}
-    <span>Worker {{ progress.running_worker_id }}</span>
-    {% endif %}
-    {% if progress.oldest_running_task_id %}
-    <span>Running task {{ progress.oldest_running_task_id }} since {{ progress.oldest_running_at }}</span>
+    {% if progress.running_worker_id or progress.oldest_running_task_id %}
+    <span>{% if progress.oldest_running_task_id %}Task {{ progress.oldest_running_task_id }}{% endif %}{% if progress.running_worker_id %}{% if progress.oldest_running_task_id %} on {% else %}Worker {% endif %}{{ progress.running_worker_id }}{% endif %}{% if progress.oldest_running_at %} since {{ progress.oldest_running_at|local_time }}{% endif %}</span>
     {% endif %}
     {% if progress.next_scheduled_for %}
-    <span>Next queued {{ progress.next_scheduled_for }}</span>
+    <span>Next {{ progress.next_scheduled_for|local_time }}</span>
     {% endif %}
-    {% if progress.last_error_type %}
-    <span class="error">{{ progress.last_error_type }}: {{ progress.last_error_message }}</span>
+    {% if progress.last_error_message %}
+    <span class="error">{{ progress.last_error_message }}</span>
+    {% elif progress.last_error_type %}
+    <span class="error">{{ progress.last_error_type }}</span>
     {% endif %}
   </div>
   {% if progress.events %}
@@ -51,7 +49,7 @@
       <span>{{ event.status }}</span>
       <span>{{ event.task_type }}</span>
       <span>{% if event.amc_theatre_id %}Theatre {{ event.amc_theatre_id }}{% elif event.showtime_id %}Showtime {{ event.showtime_id }}{% endif %}</span>
-      <span>{% if event.last_error_type %}{{ event.last_error_type }}{% endif %}</span>
+      <span>{% if event.last_error_type and event.status != "succeeded" %}{{ event.last_error_type }}{% endif %}</span>
     </div>
     {% endfor %}
   </div>

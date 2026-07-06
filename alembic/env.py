@@ -20,6 +20,10 @@ def database_url() -> str:
     url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_DSN") or database_url_from_env()
     if not url:
         raise RuntimeError("Set DATABASE_URL or POSTGRES_DSN before running Alembic.")
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + url.removeprefix("postgresql://")
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg://" + url.removeprefix("postgres://")
     return url
 
 

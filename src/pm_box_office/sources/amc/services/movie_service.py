@@ -9,6 +9,9 @@ from pm_box_office.sources.amc import db
 from pm_box_office.sources.amc.services import sample_service
 
 
+DEFAULT_SEAT_TARGET_OFFSETS_MINUTES = (-15,)
+
+
 def list_movies_for_date(
     conn: Any,
     *,
@@ -90,7 +93,7 @@ def create_seat_collection_run(
     conn: Any,
     *,
     exhibition_date: dt.date,
-    target_offsets_minutes: tuple[int, ...] = (5,),
+    target_offsets_minutes: tuple[int, ...] = DEFAULT_SEAT_TARGET_OFFSETS_MINUTES,
     sample_key: str = sample_service.DEFAULT_SAMPLE_KEY,
 ) -> tuple[str, int]:
     campaign_id = db.ensure_campaign(conn, exhibition_date)
@@ -98,8 +101,17 @@ def create_seat_collection_run(
     if active_run is not None:
         run_id, task_count = active_run
         return str(run_id), task_count
-    run_id = db.create_run(conn, campaign_id=campaign_id, run_type="seat_collection", status="queued")
     sample_set = sample_service.ensure_default_theatre_sample(conn, sample_key=sample_key)
+    run_id = db.create_run(
+        conn,
+        campaign_id=campaign_id,
+        run_type="seat_collection",
+        status="queued",
+        sample_set_id=sample_set.sample_set_id,
+        sample_key=sample_set.sample_key,
+        target_offsets_minutes=target_offsets_minutes,
+        schedule_strategy="smooth_once",
+    )
     selected_rows = [
         row
         for row in db.list_movies_for_date(
@@ -117,12 +129,14 @@ def create_seat_collection_run(
             target_amc_movie_id=movie.amc_movie_id,
             target_amc_movie_name=None,
             sample_set_id=sample_set.sample_set_id,
+            reserved_seating_only=True,
         )
         task_count += db.create_seat_scan_tasks(
             conn,
             run_id=run_id,
             showtimes=showtimes,
             target_offsets_minutes=target_offsets_minutes,
+            schedule_strategy="smooth_once",
         )
     if task_count == 0:
         db.mark_run_status(conn, run_id, status="completed")

@@ -98,6 +98,34 @@ class FakeFetcher:
         return REVIEWS_PAGE_1, Path("page1.json"), False
 
 
+class EmptyHtmlFetcher:
+    refresh = False
+
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    def get_text(self, url: str, *, suffix: str = "html"):
+        self.urls.append(url)
+        return "", Path(f"{len(self.urls)}.{suffix}"), False
+
+
+class OnePageIngestFetcher:
+    refresh = False
+
+    def __init__(self) -> None:
+        self.text_urls: list[str] = []
+        self.json_urls: list[str] = []
+
+    def get_text(self, url: str, *, suffix: str = "html"):
+        self.text_urls.append(url)
+        return MEDIA_HTML, Path(f"media.{suffix}"), False
+
+    def get_json(self, url: str):
+        self.json_urls.append(url)
+        payload = {**REVIEWS_PAGE_1, "pageInfo": {"hasNextPage": False}}
+        return payload, Path("reviews.json"), False
+
+
 class RottenTomatoesParserTests(unittest.TestCase):
     def test_media_page_parser_extracts_context_and_score_metadata(self) -> None:
         media = ingest.parse_media_page(MEDIA_HTML, source_url="https://www.rottentomatoes.com/m/barbie")
@@ -110,6 +138,26 @@ class RottenTomatoesParserTests(unittest.TestCase):
         self.assertEqual(2023, media.release_year)
         self.assertEqual(88, media.tomatometer_score)
         self.assertTrue(media.certified_fresh)
+
+    def test_media_page_parser_extracts_year_from_full_release_date(self) -> None:
+        html = MEDIA_HTML.replace('"cag[release]":"2023"', '"cag[release]":"Jan 24, 2025"')
+
+        media = ingest.parse_media_page(html, source_url="https://www.rottentomatoes.com/m/barbie")
+
+        self.assertIsNotNone(media)
+        assert media is not None
+        self.assertEqual(2025, media.release_year)
+
+    def test_media_page_parser_prefers_page_metadata_over_stale_review_context(self) -> None:
+        html = MEDIA_HTML.replace('"emsId":"317d7155-533b-396f-8c1c-34a22e2e8ef9"', '"emsId":"stale-id"')
+        html = html.replace('"title":"Barbie","emsId":"stale-id"', '"title":"Wrong Movie","emsId":"stale-id"')
+
+        media = ingest.parse_media_page(html, source_url="https://www.rottentomatoes.com/m/barbie")
+
+        self.assertIsNotNone(media)
+        assert media is not None
+        self.assertEqual("317d7155-533b-396f-8c1c-34a22e2e8ef9", media.ems_id)
+        self.assertEqual("Barbie", media.title)
 
     def test_reviews_parser_extracts_critic_fields(self) -> None:
         reviews, cursor = ingest.parse_reviews_payload(
@@ -209,6 +257,71 @@ class RottenTomatoesDatabaseTests(unittest.TestCase):
             "SELECT rt_critic_review_count, rt_top_critic_review_count, rt_fresh_review_count FROM analytics.rotten_tomatoes_movie_review_features_v1 WHERE movie_id = 1"
         ).fetchone()
         self.assertEqual((1, 1, 1), tuple(features))
+
+    def test_match_movie_skips_known_failed_slug_probes(self) -> None:
+        self.conn.execute(
+            "INSERT INTO movies (movie_id, title, release_year, release_date) VALUES (1, 'Barbie', 2023, '2023-07-21')"
+        )
+        movie = ingest.CandidateMovie(1, "Barbie", 2023, dt.date(2023, 7, 21), None)
+        fetcher = EmptyHtmlFetcher()
+
+        first_match, _media, _cache_path = ingest.match_movie(self.conn, fetcher, movie)
+        second_match, _media, _cache_path = ingest.match_movie(self.conn, fetcher, movie)
+
+        self.assertEqual("not_found", first_match.match_status)
+        self.assertEqual("not_found", second_match.match_status)
+        self.assertEqual(2, len(fetcher.urls))
+        self.assertEqual(
+            2,
+            self.conn.execute("SELECT COUNT(*) FROM rotten_tomatoes_slug_probes WHERE status = 'not_found'").fetchone()[0],
+        )
+
+    def test_ingest_movie_fetches_reviews_once_without_top_only_pass(self) -> None:
+        self.conn.execute(
+            "INSERT INTO movies (movie_id, title, release_year, release_date) VALUES (1, 'Barbie', 2023, '2023-07-21')"
+        )
+        movie = ingest.CandidateMovie(1, "Barbie", 2023, dt.date(2023, 7, 21), None)
+        fetcher = OnePageIngestFetcher()
+
+        rows = ingest.ingest_movie(self.conn, fetcher, movie=movie, issue_source="test")
+
+        self.assertEqual(1, rows)
+        self.assertEqual(1, len(fetcher.json_urls))
+        self.assertNotIn("topOnly=true", fetcher.json_urls[0])
+        features = self.conn.execute(
+            "SELECT rt_critic_review_count, rt_top_critic_review_count FROM analytics.rotten_tomatoes_movie_review_features_v1 WHERE movie_id = 1"
+        ).fetchone()
+        self.assertEqual((1, 1), tuple(features))
+
+    def test_candidate_selection_includes_the_numbers_schedule_prerelease_movies(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE the_numbers_release_schedule (
+                movie_url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                release_date DATE,
+                release_pattern TEXT
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO movies (movie_id, title, movie_url, release_year)
+            VALUES (1, 'Future Movie', 'https://www.the-numbers.com/movie/Future-Movie-(2026)', 2026)
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO the_numbers_release_schedule (movie_url, title, release_date, release_pattern)
+            VALUES ('https://www.the-numbers.com/movie/Future-Movie-(2026)', 'Future Movie', '2026-07-17', 'Wide')
+            """
+        )
+
+        movies = ingest.select_candidate_movies(self.conn, release_year=2026)
+
+        self.assertEqual(1, len(movies))
+        self.assertEqual("Future Movie", movies[0].title)
+        self.assertEqual(dt.date(2026, 7, 17), movies[0].release_date)
 
     def test_dry_run_lists_candidates_without_fetching(self) -> None:
         self.conn.execute(

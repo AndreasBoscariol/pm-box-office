@@ -22,9 +22,11 @@ from pm_box_office.sources.amc.services import (
     movie_service,
     progress_service,
     sample_service,
+    seat_service,
     showtime_service,
     theatre_service,
 )
+from pm_box_office.sources.common.cli import parse_date_arg
 
 
 DATABASE_URL_HELP = "PostgreSQL URL. Defaults to DATABASE_URL/POSTGRES_DSN/.env."
@@ -41,10 +43,7 @@ class MovieOption:
 
 
 def parse_date(value: str) -> dt.date:
-    try:
-        return dt.date.fromisoformat(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"Expected YYYY-MM-DD date, got {value!r}") from exc
+    return parse_date_arg(value)
 
 
 def parse_offsets(value: str) -> tuple[int, ...]:
@@ -406,6 +405,20 @@ def cmd_reset_collection_state(args: Any) -> int:
     return 0
 
 
+def cmd_cleanup_seat_cache_duplicates(args: Any) -> int:
+    result = seat_service.cleanup_top_level_seat_cache_duplicates(
+        args.cache_dir,
+        dry_run=args.dry_run,
+    )
+    action = "Would delete" if args.dry_run else "Deleted"
+    print(
+        f"{action} {result.duplicate_files_deleted if not args.dry_run else result.duplicate_paths_found} "
+        f"top-level seat cache duplicate files from {args.cache_dir} "
+        f"({result.bytes_deleted:,} bytes; scanned {result.archived_files_scanned} archived seat files)."
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     add_database_arg(parser)
@@ -467,8 +480,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--target-offset-minutes",
         dest="target_offsets_minutes",
         type=parse_offsets,
-        default=(5,),
-        help="Comma-separated minutes before showtime to collect. Default: 5.",
+        default=movie_service.DEFAULT_SEAT_TARGET_OFFSETS_MINUTES,
+        help="Comma-separated smoothing window minutes before showtime. Default: 20,19,...,1.",
     )
     seat_run.add_argument(
         "--sample-key",
@@ -525,6 +538,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only clear campaign queue state; preserve date-scoped seat snapshots.",
     )
     reset.set_defaults(func=cmd_reset_collection_state)
+
+    cleanup_seat_cache = add_command_parser(
+        subparsers,
+        "cleanup-seat-cache-duplicates",
+        help="Delete top-level AMC seat cache files that duplicate archived seat snapshots.",
+    )
+    add_fetch_args(cleanup_seat_cache)
+    cleanup_seat_cache.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report duplicate top-level seat cache files without deleting them.",
+    )
+    cleanup_seat_cache.set_defaults(func=cmd_cleanup_seat_cache_duplicates)
     return parser
 
 

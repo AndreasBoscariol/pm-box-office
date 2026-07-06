@@ -18,19 +18,17 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
-import json
 import re
 import sys
-import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pm_box_office.db.connection import connect_database, database_url_from_env, insert_ignore_sql
+from pm_box_office.domain import movies as movie_identity
+from pm_box_office.db.connection import connect_database, insert_ignore_sql
+from pm_box_office.sources.common.cli import add_cache_args, add_database_arg
+from pm_box_office.sources.common.fetch import CacheFirstFetcher
 
 
 DEFAULT_CACHE_DIR = Path("data/raw/wikimedia")
@@ -90,7 +88,7 @@ class RevisionRow:
     source_url: str
 
 
-class JsonFetcher:
+class JsonFetcher(CacheFirstFetcher):
     def __init__(
         self,
         cache_dir: Path,
@@ -101,65 +99,21 @@ class JsonFetcher:
         user_agent: str,
         timeout_seconds: float = 60.0,
     ) -> None:
-        self.cache_dir = cache_dir
-        self.refresh = refresh
-        self.offline = offline
-        self.delay_seconds = delay_seconds
-        self.user_agent = user_agent
-        self.timeout_seconds = timeout_seconds
-        self._last_request_at = 0.0
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-    def cache_path(self, url: str) -> Path:
-        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
-        return self.cache_dir / f"{digest}.json"
+        super().__init__(
+            cache_dir,
+            refresh=refresh,
+            offline=offline,
+            delay_seconds=delay_seconds,
+            user_agent=user_agent,
+            timeout_seconds=timeout_seconds,
+            retries=3,
+            transient_statuses=TRANSIENT_STATUSES,
+            default_accept="application/json",
+        )
 
     def get_json(self, url: str) -> tuple[dict[str, Any], Path, bool]:
-        cache_path = self.cache_path(url)
-        if cache_path.exists() and not self.refresh:
-            return json.loads(cache_path.read_text(encoding="utf-8")), cache_path, False
-        if self.offline:
-            raise FileNotFoundError(f"Cache miss in offline mode: {url}")
-
-        last_error: Exception | None = None
-        for attempt in range(3):
-            self._wait()
-            request = urllib.request.Request(
-                url,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": self.user_agent,
-                },
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                    body = response.read().decode("utf-8", errors="replace")
-                cache_path.write_text(body, encoding="utf-8")
-                self._last_request_at = time.monotonic()
-                return json.loads(body), cache_path, True
-            except urllib.error.HTTPError as exc:
-                last_error = exc
-                if exc.code == 404:
-                    empty = {"items": []}
-                    cache_path.write_text(json.dumps(empty), encoding="utf-8")
-                    return empty, cache_path, True
-                if exc.code not in TRANSIENT_STATUSES or attempt == 2:
-                    raise
-                retry_after = exc.headers.get("Retry-After")
-                delay = float(retry_after) if retry_after else self.delay_seconds * (attempt + 1)
-                time.sleep(delay)
-            except (TimeoutError, urllib.error.URLError) as exc:
-                last_error = exc
-                if attempt == 2:
-                    break
-                time.sleep(self.delay_seconds * (attempt + 1))
-        raise RuntimeError(f"GET {url} failed after retry: {last_error}")
-
-    def _wait(self) -> None:
-        elapsed = time.monotonic() - self._last_request_at
-        delay = max(0.0, self.delay_seconds - elapsed)
-        if delay:
-            time.sleep(delay)
+        data, cache_path, fetched = super().get_json(url, suffix=".json", not_found_json={"items": []})
+        return data, cache_path, fetched
 
 
 def initialize_wikipedia_database(conn: Any) -> None:
@@ -398,6 +352,7 @@ def initialize_wikipedia_database(conn: Any) -> None:
              AND m.wiki_page_id = d.wiki_page_id;
         """
     )
+    movie_identity.ensure_movie_identity_schema(conn)
 
 
 def utc_now() -> str:
@@ -493,6 +448,31 @@ def select_candidate_movies(
               AND p.source_movie_title NOT ILIKE '%%untitled%%'
               AND p.source_movie_title NOT ILIKE '%%re-release%%'
               AND COALESCE(m.title, p.source_movie_title) NOT ILIKE '%%re-release%%'
+            """
+        )
+    if relation_exists(conn, "the_numbers_release_schedule"):
+        selects.append(
+            """
+            SELECT DISTINCT
+                m.movie_id,
+                m.movie_url,
+                COALESCE(m.title, tn.title) AS title,
+                COALESCE(m.release_year, EXTRACT(YEAR FROM tn.release_date)::integer) AS release_year,
+                0 AS release_run_id,
+                tn.release_date::text AS opening_date,
+                NULL::integer AS opening_theaters,
+                NULL::integer AS opening_day_gross_usd,
+                NULL::integer AS opening_weekend_revenue_usd,
+                2 AS source_priority
+            FROM the_numbers_release_schedule tn
+            JOIN movie_source_ids msi
+              ON msi.source = 'the_numbers'
+             AND msi.source_movie_id = tn.movie_url
+            JOIN movies m ON m.movie_id = msi.movie_id
+            WHERE tn.release_date IS NOT NULL
+              AND tn.title NOT ILIKE '%%untitled%%'
+              AND tn.title NOT ILIKE '%%re-release%%'
+              AND COALESCE(tn.release_pattern, '') NOT ILIKE '%%re-release%%'
             """
         )
     sql = f"""
@@ -788,6 +768,17 @@ def upsert_wiki_match(
             match.notes,
         ),
     )
+    if match.page_id is not None and match.status in {"matched", "manual_override"}:
+        movie_identity.upsert_movie_source_id(
+            conn,
+            movie_id=movie.movie_id,
+            source=movie_identity.SOURCE_WIKIPEDIA,
+            source_movie_id=f"{language}:{match.page_id}",
+            source_title=match.page_title,
+            match_status="matched" if match.status == "manual_override" else match.status,
+            match_method=match.method,
+            match_score=match.score,
+        )
 
 
 def fetch_pageviews(
@@ -1239,12 +1230,8 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--database-url",
-        default=database_url_from_env(),
-        help="PostgreSQL connection URL. Defaults to DATABASE_URL or POSTGRES_DSN.",
-    )
-    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    add_database_arg(parser)
+    add_cache_args(parser, default_cache_dir=DEFAULT_CACHE_DIR, include_dry_run=False)
     parser.add_argument("--language", default="en")
     parser.add_argument("--day-start", type=int, default=-500)
     parser.add_argument("--day-end", type=int, default=100)
@@ -1253,8 +1240,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--movie-limit", type=int)
     parser.add_argument("--release-year", type=int)
     parser.add_argument("--min-opening-theaters", type=int)
-    parser.add_argument("--refresh", action="store_true")
-    parser.add_argument("--offline", action="store_true")
     parser.add_argument("--reset-failed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")

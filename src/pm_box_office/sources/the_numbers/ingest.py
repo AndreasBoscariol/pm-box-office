@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Scrape a minimal The Numbers daily box-office sample into PostgreSQL.
 
-The default run targets May 1-31, 2026. It discovers movies from daily
+The default run targets June 25-July 1, 2026. It discovers movies from daily
 domestic chart pages, then imports each discovered movie page's full daily
 domestic run. The fetcher is deliberately cache-first, single-threaded, and
 slow because The Numbers restricts automated scraping in its terms; cached
@@ -13,26 +13,26 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
-import hashlib
 from html.parser import HTMLParser
 import re
 import sys
-import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pm_box_office.db.connection import connect_database, database_url_from_env, insert_ignore_sql
+from pm_box_office.domain import movies as movie_identity
+from pm_box_office.db.connection import connect_database, insert_ignore_sql
+from pm_box_office.sources.common.cli import add_cache_args, add_database_arg, parse_date_arg
+from pm_box_office.sources.common.fetch import CacheFirstFetcher
+from pm_box_office.sources.common.parsing import clean_text, parse_int, parse_money
 
 
 BASE_URL = "https://www.the-numbers.com"
-DEFAULT_START_DATE = dt.date(2010, 1, 1)
-DEFAULT_END_DATE = dt.date(2020, 1, 1)
+DEFAULT_START_DATE = dt.date(2026, 6, 25)
+DEFAULT_END_DATE = dt.date(2026, 7, 1)
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
-MIN_DELAY_SECONDS = 20.0
+MIN_DELAY_SECONDS = 1
 DEFAULT_PARSE_WORKERS = 16
 
 
@@ -88,6 +88,8 @@ class MovieMetadata:
     mpa_rating: str | None
     mpa_rating_details: str | None
     genre: str | None
+    production_budget_usd: int | None
+    franchise: str | None
     source_url: str
 
 
@@ -184,7 +186,7 @@ class TableParser(HTMLParser):
             self._cell_parts.append(data)
 
 
-class HtmlFetcher:
+class HtmlFetcher(CacheFirstFetcher):
     def __init__(
         self,
         cache_dir: Path,
@@ -195,93 +197,24 @@ class HtmlFetcher:
         user_agent: str,
         timeout_seconds: float = 60.0,
     ) -> None:
-        self.cache_dir = cache_dir
-        self.refresh = refresh
-        self.offline = offline
-        self.delay_seconds = delay_seconds
-        self.user_agent = user_agent
-        self.timeout_seconds = timeout_seconds
-        self._last_request_at = 0.0
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        super().__init__(
+            cache_dir,
+            refresh=refresh,
+            offline=offline,
+            delay_seconds=delay_seconds,
+            user_agent=user_agent,
+            timeout_seconds=timeout_seconds,
+            retries=2,
+            transient_statuses=TRANSIENT_STATUSES,
+            default_accept="text/html,application/xhtml+xml",
+        )
 
-    def cache_path(self, url: str) -> Path:
-        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
-        return self.cache_dir / f"{digest}.html"
-
-    def get(self, url: str) -> tuple[str, Path, bool]:
-        cache_path = self.cache_path(url)
-        if cache_path.exists() and not self.refresh:
-            return cache_path.read_text(encoding="utf-8"), cache_path, False
-        if self.offline:
-            raise FileNotFoundError(f"Cache miss in offline mode: {url}")
-
-        last_error: Exception | None = None
-        for attempt in range(2):
-            self._wait()
-            request = urllib.request.Request(
-                url,
-                headers={
-                    "Accept": "text/html,application/xhtml+xml",
-                    "User-Agent": self.user_agent,
-                },
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                    body = response.read().decode("utf-8", errors="replace")
-                cache_path.write_text(body, encoding="utf-8")
-                self._last_request_at = time.monotonic()
-                return body, cache_path, True
-            except urllib.error.HTTPError as exc:
-                last_error = exc
-                if exc.code == 403:
-                    raise
-                if exc.code not in TRANSIENT_STATUSES or attempt == 1:
-                    raise
-                retry_after = exc.headers.get("Retry-After")
-                delay = float(retry_after) if retry_after else self.delay_seconds
-                time.sleep(delay)
-            except (TimeoutError, urllib.error.URLError) as exc:
-                last_error = exc
-                if attempt == 1:
-                    break
-                time.sleep(self.delay_seconds)
-        raise RuntimeError(f"GET {url} failed after retry: {last_error}")
-
-    def _wait(self) -> None:
-        elapsed = time.monotonic() - self._last_request_at
-        delay = max(0.0, self.delay_seconds - elapsed)
-        if delay:
-            time.sleep(delay)
-
-
-def clean_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value.replace("\xa0", " ")).strip()
+    def get(self, url: str, *, refresh: bool | None = None) -> tuple[str, Path, bool]:
+        return self.get_text(url, suffix=".html", refresh=refresh)
 
 
 def absolute_url(href: str) -> str:
     return urllib.parse.urljoin(BASE_URL, href)
-
-
-def parse_money(value: str) -> int | None:
-    text = clean_text(value)
-    if not text or text in {"-", "n/a"}:
-        return None
-    negative = text.startswith("(") and text.endswith(")")
-    digits = re.sub(r"[^0-9]", "", text)
-    if not digits:
-        return None
-    amount = int(digits)
-    return -amount if negative else amount
-
-
-def parse_int(value: str) -> int | None:
-    text = clean_text(value)
-    if not text or text in {"-", "n/a"}:
-        return None
-    digits = re.sub(r"[^0-9-]", "", text)
-    if not digits or digits == "-":
-        return None
-    return int(digits)
 
 
 def parse_percent(value: str) -> float | None:
@@ -431,6 +364,8 @@ def parse_movie_metadata(html: str, *, movie_url: str, source_url: str) -> Movie
         mpa_rating=parse_mpa_rating(mpa_rating_details),
         mpa_rating_details=mpa_rating_details,
         genre=details.get("Genre"),
+        production_budget_usd=parse_money(details.get("Production Budget", "")),
+        franchise=details.get("Franchise"),
         source_url=source_url,
     )
 
@@ -525,13 +460,17 @@ def initialize_database(conn: Any) -> None:
 
         CREATE TABLE IF NOT EXISTS movies (
             movie_id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-            movie_url TEXT NOT NULL UNIQUE,
+            movie_url TEXT,
             title TEXT NOT NULL,
             release_year INTEGER,
+            release_date DATE,
             opusdata_id TEXT UNIQUE,
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text)
         );
+
+        ALTER TABLE movies
+            ADD COLUMN IF NOT EXISTS release_date DATE;
 
         CREATE TABLE IF NOT EXISTS release_runs (
             release_run_id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -575,12 +514,20 @@ def initialize_database(conn: Any) -> None:
             mpa_rating TEXT,
             mpa_rating_details TEXT,
             genre TEXT,
+            production_budget_usd BIGINT,
+            franchise TEXT,
             source_url TEXT NOT NULL,
             fetched_at TEXT NOT NULL,
             raw_cache_path TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
             PRIMARY KEY(movie_id)
         );
+
+        ALTER TABLE the_numbers_movie_metadata
+            ADD COLUMN IF NOT EXISTS production_budget_usd BIGINT;
+
+        ALTER TABLE the_numbers_movie_metadata
+            ADD COLUMN IF NOT EXISTS franchise TEXT;
 
         CREATE TABLE IF NOT EXISTS box_office_import_issues (
             issue_id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -607,8 +554,11 @@ def initialize_database(conn: Any) -> None:
             ON the_numbers_movie_metadata(mpa_rating);
         CREATE INDEX IF NOT EXISTS idx_tn_movie_metadata_genre
             ON the_numbers_movie_metadata(genre);
+        CREATE INDEX IF NOT EXISTS idx_tn_movie_metadata_franchise
+            ON the_numbers_movie_metadata(franchise);
         """
     )
+    movie_identity.ensure_movie_identity_schema(conn)
 
 
 def record_raw_page(
@@ -744,44 +694,41 @@ def load_daily_chart_rows(conn: Any, *, source_url: str) -> list[DailyChartRow]:
     ]
 
 
-def load_movie_urls_missing_metadata(conn: Any) -> list[tuple[str, str]]:
+def load_movie_urls_for_metadata_backfill(
+    conn: Any,
+    *,
+    include_complete: bool = False,
+) -> list[tuple[str, str]]:
+    where_sql = ""
+    if not include_complete:
+        where_sql = "AND (tnmm.movie_id IS NULL OR tnmm.mpa_rating IS NULL)"
     rows = conn.execute(
-        """
+        f"""
         SELECT m.movie_url, m.title
         FROM movies m
         LEFT JOIN the_numbers_movie_metadata tnmm ON tnmm.movie_id = m.movie_id
         WHERE m.movie_url IS NOT NULL
-          AND (tnmm.movie_id IS NULL OR tnmm.mpa_rating IS NULL)
+          {where_sql}
         ORDER BY m.movie_url
         """
     ).fetchall()
     return [(row[0], row[1]) for row in rows]
 
 
+def load_movie_urls_missing_metadata(conn: Any) -> list[tuple[str, str]]:
+    return load_movie_urls_for_metadata_backfill(conn)
+
+
 def upsert_movie(conn: Any, row: MovieDailyRow) -> int:
-    conn.execute(
-        """
-        INSERT INTO movies (movie_url, title, release_year, opusdata_id, updated_at)
-        VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-        ON CONFLICT(movie_url) DO UPDATE SET
-            title = excluded.title,
-            release_year = excluded.release_year,
-            opusdata_id = COALESCE(excluded.opusdata_id, movies.opusdata_id),
-            updated_at = CURRENT_TIMESTAMP
-        """,
-        (row.movie_url, row.title, row.release_year, row.opusdata_id),
-    )
-    movie_id = conn.execute(
-        "SELECT movie_id FROM movies WHERE movie_url = %s", (row.movie_url,)
-    ).fetchone()[0]
-    upsert_movie_source_id(
+    return movie_identity.upsert_movie_by_source(
         conn,
-        movie_id=int(movie_id),
-        source="the_numbers",
+        source=movie_identity.SOURCE_THE_NUMBERS,
         source_movie_id=row.movie_url,
-        source_title=row.title,
+        title=row.title,
+        movie_url=row.movie_url,
+        release_year=row.release_year,
+        opusdata_id=row.opusdata_id,
     )
-    return int(movie_id)
 
 
 def upsert_movie_source_id(
@@ -794,49 +741,25 @@ def upsert_movie_source_id(
 ) -> None:
     if not relation_exists(conn, "movie_source_ids"):
         return
-    conn.execute(
-        """
-        INSERT INTO movie_source_ids (
-            movie_id, source, source_movie_id, source_title,
-            match_status, match_method, match_score, matched_at
-        )
-        VALUES (%s, %s, %s, %s, 'matched', 'source_primary_key', 1.0, CURRENT_TIMESTAMP)
-        ON CONFLICT(source, source_movie_id) DO UPDATE SET
-            movie_id = excluded.movie_id,
-            source_title = excluded.source_title,
-            match_status = excluded.match_status,
-            match_method = excluded.match_method,
-            match_score = excluded.match_score,
-            matched_at = excluded.matched_at
-        """,
-        (movie_id, source, source_movie_id, source_title),
+    movie_identity.upsert_movie_source_id(
+        conn,
+        movie_id=movie_id,
+        source=source,
+        source_movie_id=source_movie_id,
+        source_title=source_title,
     )
 
 
 def upsert_movie_from_metadata(conn: Any, metadata: MovieMetadata) -> int:
-    conn.execute(
-        """
-        INSERT INTO movies (movie_url, title, release_year, opusdata_id, updated_at)
-        VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-        ON CONFLICT(movie_url) DO UPDATE SET
-            title = excluded.title,
-            release_year = COALESCE(excluded.release_year, movies.release_year),
-            opusdata_id = COALESCE(excluded.opusdata_id, movies.opusdata_id),
-            updated_at = CURRENT_TIMESTAMP
-        """,
-        (metadata.movie_url, metadata.title, metadata.release_year, metadata.opusdata_id),
-    )
-    movie_id = conn.execute(
-        "SELECT movie_id FROM movies WHERE movie_url = %s", (metadata.movie_url,)
-    ).fetchone()[0]
-    upsert_movie_source_id(
+    return movie_identity.upsert_movie_by_source(
         conn,
-        movie_id=int(movie_id),
-        source="the_numbers",
+        source=movie_identity.SOURCE_THE_NUMBERS,
         source_movie_id=metadata.movie_url,
-        source_title=metadata.title,
+        title=metadata.title,
+        movie_url=metadata.movie_url,
+        release_year=metadata.release_year,
+        opusdata_id=metadata.opusdata_id,
     )
-    return int(movie_id)
 
 
 def upsert_movie_metadata(
@@ -851,9 +774,9 @@ def upsert_movie_metadata(
         """
         INSERT INTO the_numbers_movie_metadata (
             movie_id, movie_url, title, release_year, opusdata_id, mpa_rating,
-            mpa_rating_details, genre, source_url, fetched_at, raw_cache_path,
-            updated_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            mpa_rating_details, genre, production_budget_usd, franchise, source_url,
+            fetched_at, raw_cache_path, updated_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
         ON CONFLICT(movie_id) DO UPDATE SET
             movie_url = excluded.movie_url,
             title = excluded.title,
@@ -862,6 +785,8 @@ def upsert_movie_metadata(
             mpa_rating = excluded.mpa_rating,
             mpa_rating_details = excluded.mpa_rating_details,
             genre = excluded.genre,
+            production_budget_usd = excluded.production_budget_usd,
+            franchise = excluded.franchise,
             source_url = excluded.source_url,
             fetched_at = excluded.fetched_at,
             raw_cache_path = excluded.raw_cache_path,
@@ -876,6 +801,8 @@ def upsert_movie_metadata(
             metadata.mpa_rating,
             metadata.mpa_rating_details,
             metadata.genre,
+            metadata.production_budget_usd,
+            metadata.franchise,
             metadata.source_url,
             fetched_at,
             str(raw_cache_path),
@@ -996,16 +923,45 @@ def movie_metadata_imported(conn: Any, *, movie_url: str) -> bool:
     return row is not None
 
 
-def reconcile(conn: Any, *, issue_source: str) -> int:
+def reconcile(
+    conn: Any,
+    *,
+    issue_source: str,
+    chart_dates: list[str] | None = None,
+    movie_urls: list[str] | None = None,
+) -> int:
+    where_clauses: list[str] = []
+    params: list[Any] = []
+    delete_clauses: list[str] = ["issue_source = %s"]
+    delete_params: list[Any] = [issue_source]
+
+    if chart_dates is not None:
+        if not chart_dates:
+            return 0
+        where_clauses.append("chart_date = ANY(%s)")
+        params.append(chart_dates)
+        delete_clauses.append("box_office_date = ANY(%s)")
+        delete_params.append(chart_dates)
+    if movie_urls is not None:
+        if not movie_urls:
+            return 0
+        where_clauses.append("movie_url = ANY(%s)")
+        params.append(movie_urls)
+        delete_clauses.append("movie_url = ANY(%s)")
+        delete_params.append(movie_urls)
+
     conn.execute(
-        "DELETE FROM box_office_import_issues WHERE issue_source = %s",
-        (issue_source,),
+        f"DELETE FROM box_office_import_issues WHERE {' AND '.join(delete_clauses)}",
+        delete_params,
     )
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     chart_rows = conn.execute(
-        """
+        f"""
         SELECT chart_date, movie_url, title, gross_usd, theaters, cumulative_gross_usd
         FROM daily_chart_pages
-        """
+        {where_sql}
+        """,
+        params,
     ).fetchall()
     issue_count = 0
     for chart_date, movie_url, title, gross, theaters, cumulative in chart_rows:
@@ -1217,6 +1173,7 @@ def run(args: argparse.Namespace) -> int:
     validate_args(args)
     days = date_range(args.start_date, args.end_date)
     chart_urls = [daily_chart_url(day) for day in days]
+    refresh_chart_dates = {day for day in days if should_refresh_recent_day(day, args)}
     if args.dry_run:
         for url in chart_urls:
             print(url)
@@ -1237,10 +1194,12 @@ def run(args: argparse.Namespace) -> int:
         if args.metadata_backfill:
             return run_metadata_backfill(args, conn, fetcher)
         discovered_movie_urls: dict[str, str] = {}
+        discovered_movie_dates: dict[str, set[dt.date]] = {}
         chart_row_count = 0
         skipped_chart_count = 0
         for day, url in zip(days, chart_urls):
-            if not args.refresh and source_page_recorded(
+            refresh_chart = args.refresh or day in refresh_chart_dates
+            if not refresh_chart and source_page_recorded(
                 conn,
                 source_url=url,
                 source_page_type="daily_chart",
@@ -1251,7 +1210,7 @@ def run(args: argparse.Namespace) -> int:
             else:
                 conn.commit()
                 print(f"Reading chart {day.isoformat()} {url}", file=sys.stderr)
-                html, cache_path, _fetched = fetcher.get(url)
+                html, cache_path, _fetched = fetcher.get(url, refresh=refresh_chart)
                 fetched_at = dt.datetime.now(dt.UTC).isoformat()
                 rows = parse_daily_chart(html, chart_date=day, source_url=url)
                 record_raw_page(
@@ -1267,6 +1226,7 @@ def run(args: argparse.Namespace) -> int:
                 chart_row_count += len(rows)
             for row in rows:
                 discovered_movie_urls.setdefault(row.movie_url, row.title)
+                discovered_movie_dates.setdefault(row.movie_url, set()).add(day)
 
         movie_urls = sorted(discovered_movie_urls)
         if args.max_movies is not None:
@@ -1275,10 +1235,11 @@ def run(args: argparse.Namespace) -> int:
         metadata_row_count = 0
         skipped_movie_count = 0
         cached_movie_items: list[tuple[str, str, Path]] = []
-        uncached_movie_urls: list[str] = []
+        uncached_movie_items: list[tuple[str, bool]] = []
         for index, movie_url in enumerate(movie_urls, start=1):
+            refresh_movie = args.refresh or bool(discovered_movie_dates.get(movie_url, set()) & refresh_chart_dates)
             if (
-                not args.refresh
+                not refresh_movie
                 and movie_page_imported(conn, movie_url=movie_url)
                 and movie_metadata_imported(conn, movie_url=movie_url)
             ):
@@ -1290,10 +1251,10 @@ def run(args: argparse.Namespace) -> int:
                 skipped_movie_count += 1
                 continue
             cache_path = fetcher.cache_path(movie_url)
-            if cache_path.exists() and not args.refresh:
+            if cache_path.exists() and not refresh_movie:
                 cached_movie_items.append((movie_url, discovered_movie_urls[movie_url], cache_path))
             else:
-                uncached_movie_urls.append(movie_url)
+                uncached_movie_items.append((movie_url, refresh_movie))
 
         if cached_movie_items and args.parse_workers > 1:
             print(
@@ -1321,14 +1282,14 @@ def run(args: argparse.Namespace) -> int:
                 movie_row_count += row_count
                 metadata_row_count += metadata_count
 
-        for index, movie_url in enumerate(uncached_movie_urls, start=1):
+        for index, (movie_url, refresh_movie) in enumerate(uncached_movie_items, start=1):
             print(
-                f"Reading uncached movie {index}/{len(uncached_movie_urls)} "
+                f"Reading uncached movie {index}/{len(uncached_movie_items)} "
                 f"{discovered_movie_urls[movie_url]}",
                 file=sys.stderr,
             )
             conn.commit()
-            html, cache_path, _fetched = fetcher.get(movie_url)
+            html, cache_path, _fetched = fetcher.get(movie_url, refresh=refresh_movie)
             result = parse_movie_page_result(
                 movie_url,
                 discovered_movie_urls[movie_url],
@@ -1339,11 +1300,16 @@ def run(args: argparse.Namespace) -> int:
             movie_row_count += row_count
             metadata_row_count += metadata_count
 
-        issue_count = reconcile(conn, issue_source=args.issue_source)
+        issue_count = reconcile(
+            conn,
+            issue_source=args.issue_source,
+            chart_dates=[day.isoformat() for day in days],
+            movie_urls=movie_urls,
+        )
         conn.commit()
         print(
-            f"Imported {chart_row_count} new chart rows, {len(movie_urls)} discovered movies, "
-            f"{movie_row_count} new movie daily rows, {metadata_row_count} movie metadata rows, "
+            f"Imported {chart_row_count} chart rows from fetched charts, {len(movie_urls)} discovered movies, "
+            f"{movie_row_count} movie daily rows, {metadata_row_count} movie metadata rows, "
             f"skipped {skipped_chart_count} chart pages and {skipped_movie_count} movie pages, "
             f"{issue_count} reconciliation issues.",
             file=sys.stderr,
@@ -1354,7 +1320,10 @@ def run(args: argparse.Namespace) -> int:
 
 
 def run_metadata_backfill(args: argparse.Namespace, conn: Any, fetcher: HtmlFetcher) -> int:
-    movie_items = load_movie_urls_missing_metadata(conn)
+    movie_items = load_movie_urls_for_metadata_backfill(
+        conn,
+        include_complete=args.metadata_backfill_all,
+    )
     if args.max_movies is not None:
         movie_items = movie_items[: args.max_movies]
 
@@ -1398,13 +1367,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--user-agent must identify the scraper as a bot")
     if args.parse_workers < 1:
         raise SystemExit("--parse-workers must be at least 1")
+    if args.refresh_recent_days < 0:
+        raise SystemExit("--refresh-recent-days must be non-negative")
 
 
-def parse_date_arg(value: str) -> dt.date:
-    try:
-        return dt.date.fromisoformat(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"invalid ISO date: {value}") from exc
+def should_refresh_recent_day(day: dt.date, args: argparse.Namespace) -> bool:
+    if args.refresh_recent_days <= 0:
+        return False
+    start_date = args.end_date - dt.timedelta(days=args.refresh_recent_days - 1)
+    return start_date <= day <= args.end_date
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1413,35 +1384,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--start-date", type=parse_date_arg, default=DEFAULT_START_DATE)
     parser.add_argument("--end-date", type=parse_date_arg, default=DEFAULT_END_DATE)
-    parser.add_argument(
-        "--database-url",
-        default=database_url_from_env(),
-        help="PostgreSQL connection URL. Defaults to DATABASE_URL or POSTGRES_DSN.",
-    )
-    parser.add_argument(
-        "--cache-dir",
-        type=Path,
-        default=Path("data/raw/the_numbers"),
-        help="Raw HTML cache directory.",
+    add_database_arg(parser)
+    add_cache_args(
+        parser,
+        default_cache_dir=Path("data/raw/the_numbers"),
+        cache_help="Raw HTML cache directory.",
+        include_dry_run=False,
     )
     parser.add_argument(
         "--delay-seconds",
         type=float,
         default=MIN_DELAY_SECONDS,
-        help="Delay between uncached HTTP requests. Must be at least 20.",
+        help=f"Delay between uncached HTTP requests. Must be at least {MIN_DELAY_SECONDS:g}.",
     )
     parser.add_argument(
         "--user-agent",
         default="pm-box-office-the-numbers-bot/1.0 (+personal research; set --user-agent contact)",
         help="HTTP User-Agent. Must identify as a bot when fetching.",
     )
-    parser.add_argument("--refresh", action="store_true", help="Refetch even when cache exists.")
-    parser.add_argument("--offline", action="store_true", help="Require all pages to exist in cache.")
+    parser.add_argument(
+        "--refresh-recent-days",
+        type=int,
+        default=0,
+        help="Within the requested range, refetch this many trailing days even when already recorded.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print chart URLs and exit.")
     parser.add_argument(
         "--metadata-backfill",
         action="store_true",
         help="Fetch existing movies missing The Numbers metadata or MPA rating, without chart discovery.",
+    )
+    parser.add_argument(
+        "--metadata-backfill-all",
+        action="store_true",
+        help="With --metadata-backfill, reparse every existing movie URL instead of only missing metadata.",
     )
     parser.add_argument(
         "--max-movies",

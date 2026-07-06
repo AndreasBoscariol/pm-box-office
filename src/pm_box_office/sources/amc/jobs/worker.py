@@ -44,15 +44,21 @@ def run_worker(args: argparse.Namespace) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     conn = connect_database(args.database_url)
+    diagnostics_conn = connect_database(args.database_url)
+    rate_limit_conn = connect_database(args.database_url)
     fetcher = HtmlFetcher(
         args.cache_dir,
         refresh=False,
         offline=False,
         delay_seconds=args.delay_seconds,
         user_agent=args.user_agent,
+        diagnostics_conn=diagnostics_conn,
+        rate_limit_conn=rate_limit_conn,
     )
     try:
         initialize_worker_database(conn)
+        initialize_worker_database(diagnostics_conn)
+        initialize_worker_database(rate_limit_conn)
         LOGGER.info("worker started worker_id=%s limit=%s", args.worker_id, args.limit)
         last_logged_seat_throttle_until: dt.datetime | None = None
         while True:
@@ -90,43 +96,52 @@ def run_worker(args: argparse.Namespace) -> int:
                 with diagnostics_context(**task_diagnostics_fields(args.worker_id, task)):
                     try:
                         handlers.execute(conn, fetcher, task)
+                        record_success_diagnostics(diagnostics_conn, task)
+                        diagnostics_conn.commit()
                         queue.mark_succeeded(conn, task.task_id)
                         conn.commit()
                         LOGGER.info("task succeeded task_id=%s", task.task_id)
                     except SeatMapUnavailable as exc:
-                        LOGGER.info("task skipped task_id=%s reason=%s", task.task_id, short_error(exc))
-                        log_backoff_event(
-                            "seat_task_skipped_no_seat_map",
-                            error_type=type(exc).__name__,
-                            error_message=short_error(exc),
-                        )
+                        LOGGER.info("task seat-map unavailable task_id=%s reason=%s", task.task_id, short_error(exc))
                         conn.rollback()
                         try:
-                            db.mark_task_skipped(conn, task.task_id, exc=exc)
+                            queue.schedule_retry_or_fail(conn, task, exc, diagnostics_conn=diagnostics_conn)
                             conn.commit()
+                            diagnostics_conn.commit()
                         except Exception:
-                            LOGGER.exception("could not mark task skipped task_id=%s", task.task_id)
+                            LOGGER.exception("could not schedule retry or fail task_id=%s", task.task_id)
                             conn.rollback()
+                            diagnostics_conn.rollback()
                         continue
                     except Exception as exc:
                         LOGGER.exception("task failed task_id=%s", task.task_id)
+                        terminal_content_failure = queue.is_terminal_seat_content_failure(task, exc)
                         log_backoff_event(
-                            "seat_task_failed",
+                            "seat_task_content_failure" if terminal_content_failure else "seat_task_failed",
+                            backoff_class="terminal_content_failure" if terminal_content_failure else None,
+                            operational_backoff=True if terminal_content_failure else None,
+                            shared_throttle_extended=False if terminal_content_failure else None,
+                            retry_scheduled=False if terminal_content_failure else None,
+                            terminal=True if terminal_content_failure else None,
                             error_type=type(exc).__name__,
                             error_message=short_error(exc),
                         )
                         conn.rollback()
                         try:
-                            queue.schedule_retry_or_fail(conn, task, exc)
+                            queue.schedule_retry_or_fail(conn, task, exc, diagnostics_conn=diagnostics_conn)
                             conn.commit()
+                            diagnostics_conn.commit()
                         except Exception:
                             LOGGER.exception("could not mark task failed task_id=%s", task.task_id)
                             conn.rollback()
+                            diagnostics_conn.rollback()
                         continue
             if args.once:
                 LOGGER.info("processed one batch; exiting because --once was set")
                 return 0
     finally:
+        rate_limit_conn.close()
+        diagnostics_conn.close()
         conn.close()
 
 
@@ -209,10 +224,30 @@ def task_diagnostics_fields(worker_id: str, task: db.CollectionTask) -> dict[str
         "amc_movie_id": task.amc_movie_id,
         "amc_theatre_id": task.amc_theatre_id,
         "scheduled_for": scheduled_for,
-        "target_offset_minutes": task.priority or 5,
+        "target_offset_minutes": task.effective_target_offset_minutes,
         "attempt_count": task.attempt_count,
         "seconds_late_at_start": max(0, int((now - scheduled_for).total_seconds())),
     }
+
+
+def record_success_diagnostics(conn: object, task: db.CollectionTask) -> None:
+    root_cause_code = queue.classify_previous_task_failure(task)
+    if task.attempt_count > 1:
+        db.record_task_diagnostic_event(
+            conn,
+            task,
+            event_type="seat_retry_recovered",
+            root_cause_code=root_cause_code,
+            retry_decision="recovered_after_retry",
+            recovered=True,
+        )
+    db.record_task_diagnostic_event(
+        conn,
+        task,
+        event_type="seat_snapshot_recorded",
+        root_cause_code=root_cause_code,
+        recovered=task.attempt_count > 1,
+    )
 
 
 if __name__ == "__main__":

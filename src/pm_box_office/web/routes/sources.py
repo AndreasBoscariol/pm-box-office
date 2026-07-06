@@ -1,72 +1,32 @@
 from __future__ import annotations
 
-import datetime as dt
 import uuid
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
-from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from pm_box_office.db.connection import connect_database
 from pm_box_office.orchestration import repository, runner
 from pm_box_office.web.db_init import ensure_initialized
+from pm_box_office.web.templating import templates
+from pm_box_office.web.time_format import duration_until, time_ago
 
 
-WEB_ROOT = Path(__file__).resolve().parents[1]
 router = APIRouter()
-HIDDEN_SOURCE_KEYS = {"amc_worker", "social_x"}
-templates = Jinja2Templates(
-    env=Environment(
-        loader=FileSystemLoader(str(WEB_ROOT / "templates")),
-        autoescape=select_autoescape(("html", "xml")),
-        cache_size=0,
-    )
-)
-templates.env.filters["time_ago"] = lambda value: time_ago(value)
+HIDDEN_SOURCE_KEYS = {"amc_worker", "social_x", "nitter"}
+HIDDEN_SOURCE_NAMES = {"social x", "social x/nitter poc", "nitter", "nitter poc"}
 
 
 def visible_ingest_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [item for item in items if item.get("source_key") not in HIDDEN_SOURCE_KEYS]
+    return [item for item in items if not is_hidden_ingest_item(item)]
 
 
-def time_ago(value: object) -> str:
-    timestamp = coerce_datetime(value)
-    if timestamp is None:
-        return "Never"
-
-    now = dt.datetime.now(timestamp.tzinfo or dt.UTC)
-    if timestamp.tzinfo is None:
-        now = now.replace(tzinfo=None)
-
-    seconds = max(0, int((now - timestamp).total_seconds()))
-    if seconds < 60:
-        return "Just now"
-
-    minutes = seconds // 60
-    if minutes < 60:
-        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
-
-    hours = minutes // 60
-    if hours < 48:
-        return f"{hours} hour{'s' if hours != 1 else ''} ago"
-
-    days = hours // 24
-    return f"{days} day{'s' if days != 1 else ''} ago"
-
-
-def coerce_datetime(value: object) -> dt.datetime | None:
-    if isinstance(value, dt.datetime):
-        return value
-    if isinstance(value, str) and value:
-        try:
-            return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    return None
+def is_hidden_ingest_item(item: dict[str, Any]) -> bool:
+    source_key = str(item.get("source_key") or "").strip().lower()
+    display_name = str(item.get("display_name") or "").strip().lower()
+    return source_key in HIDDEN_SOURCE_KEYS or display_name in HIDDEN_SOURCE_NAMES
 
 
 @router.get("/sources")
@@ -76,6 +36,7 @@ def sources_dashboard(request: Request) -> object:
         ensure_initialized(conn)
         repository.refresh_all_source_freshness(conn)
         sources = visible_ingest_items(repository.list_source_summaries(conn))
+        autorun_state = repository.get_autorun_state(conn)
         recent_runs = visible_ingest_items(repository.list_recent_runs(conn, limit=50))[:12]
         log_tails = {str(run["run_id"]): repository.list_log_tail(conn, run["run_id"], limit=40) for run in recent_runs[:4]}
         conn.commit()
@@ -86,6 +47,7 @@ def sources_dashboard(request: Request) -> object:
         context={
             "request": request,
             "sources": sources,
+            "autorun_state": autorun_state,
             "recent_runs": recent_runs,
             "log_tails": log_tails,
             "message": request.query_params.get("message"),
@@ -93,6 +55,19 @@ def sources_dashboard(request: Request) -> object:
         },
         request=request,
     )
+
+
+@router.post("/sources/run-all")
+def run_all_sources() -> object:
+    result = runner.start_run_all(trigger="manual_run_all")
+    if result["errors"]:
+        return RedirectResponse(url=f"/sources?error={quote('; '.join(result['errors']))}", status_code=303)
+    started_count = len(result["started"])
+    skipped_count = len(result["skipped"])
+    message = f"Started {started_count} ingest runs"
+    if skipped_count:
+        message = f"{message}; skipped {skipped_count}"
+    return RedirectResponse(url=f"/sources?message={quote(message)}", status_code=303)
 
 
 @router.post("/sources/{source_key}/run")

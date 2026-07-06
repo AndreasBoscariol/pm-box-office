@@ -11,20 +11,22 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
-import html
 import json
 import re
 import sys
-import time
-import unicodedata
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 from pm_box_office.db.connection import connect_database, database_url_from_env, insert_ignore_sql
+from pm_box_office.domain import movies as movie_identity
+from pm_box_office.sources.common.fetch import CacheFirstFetcher
+from pm_box_office.sources.common.parsing import (
+    clean_text,
+    normalize_title as normalize_movie_title,
+    parse_int as parse_common_int,
+)
 
 
 BASE_URL = "https://www.rottentomatoes.com"
@@ -32,6 +34,7 @@ DEFAULT_CACHE_DIR = Path("data/raw/rotten_tomatoes")
 DEFAULT_USER_AGENT = "pm-box-office-rotten-tomatoes-ingest/0.1 (+research; cache-first)"
 PARSER_VERSION = "rt_critic_reviews_v1"
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+MIN_DELAY_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -91,81 +94,36 @@ class CriticReview:
     raw_json: dict[str, Any]
 
 
-class TextFetcher:
+class TextFetcher(CacheFirstFetcher):
     def __init__(
         self,
         cache_dir: Path,
         *,
         refresh: bool = False,
         offline: bool = False,
-        delay_seconds: float = 5.0,
+        delay_seconds: float = MIN_DELAY_SECONDS,
         timeout_seconds: float = 30.0,
         user_agent: str = DEFAULT_USER_AGENT,
     ) -> None:
-        self.cache_dir = cache_dir
-        self.refresh = refresh
-        self.offline = offline
-        self.delay_seconds = delay_seconds
-        self.timeout_seconds = timeout_seconds
-        self.user_agent = user_agent
-        self._last_request_at = 0.0
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-    def cache_path(self, url: str, *, suffix: str) -> Path:
-        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
-        return self.cache_dir / f"{digest}.{suffix}"
+        super().__init__(
+            cache_dir,
+            refresh=refresh,
+            offline=offline,
+            delay_seconds=delay_seconds,
+            user_agent=user_agent,
+            timeout_seconds=timeout_seconds,
+            retries=3,
+            transient_statuses=TRANSIENT_STATUSES,
+            default_accept="application/json,text/html,application/xhtml+xml",
+            offline_error_prefix="Missing cached Rotten Tomatoes response",
+        )
 
     def get_text(self, url: str, *, suffix: str = "html") -> tuple[str, Path, bool]:
-        cache_path = self.cache_path(url, suffix=suffix)
-        if cache_path.exists() and not self.refresh:
-            return cache_path.read_text(encoding="utf-8"), cache_path, False
-        if self.offline:
-            raise FileNotFoundError(f"Missing cached Rotten Tomatoes response for {url}: {cache_path}")
-        body, fetched = self._fetch(url)
-        cache_path.write_text(body, encoding="utf-8")
-        return body, cache_path, fetched
+        return super().get_text(url, suffix=suffix, not_found_text="")
 
     def get_json(self, url: str) -> tuple[dict[str, Any], Path, bool]:
         text, cache_path, fetched = self.get_text(url, suffix="json")
         return json.loads(text), cache_path, fetched
-
-    def _fetch(self, url: str) -> tuple[str, bool]:
-        last_error: BaseException | None = None
-        for attempt in range(3):
-            self._wait()
-            request = urllib.request.Request(
-                url,
-                headers={
-                    "Accept": "application/json,text/html,application/xhtml+xml",
-                    "User-Agent": self.user_agent,
-                },
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                    body = response.read().decode("utf-8", errors="replace")
-                self._last_request_at = time.monotonic()
-                return body, True
-            except urllib.error.HTTPError as exc:
-                last_error = exc
-                if exc.code == 404:
-                    return "", True
-                if exc.code not in TRANSIENT_STATUSES or attempt == 2:
-                    raise
-                retry_after = exc.headers.get("Retry-After")
-                delay = float(retry_after) if retry_after else self.delay_seconds * (attempt + 1)
-                time.sleep(delay)
-            except (TimeoutError, urllib.error.URLError) as exc:
-                last_error = exc
-                if attempt == 2:
-                    break
-                time.sleep(self.delay_seconds * (attempt + 1))
-        raise RuntimeError(f"GET {url} failed after retry: {last_error}")
-
-    def _wait(self) -> None:
-        elapsed = time.monotonic() - self._last_request_at
-        delay = max(0.0, self.delay_seconds - elapsed)
-        if delay:
-            time.sleep(delay)
 
 
 def initialize_database(conn: Any) -> None:
@@ -256,6 +214,22 @@ def initialize_database(conn: Any) -> None:
             ON rotten_tomatoes_movie_match_overrides(movie_id) WHERE active AND movie_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_rt_overrides_title_year
             ON rotten_tomatoes_movie_match_overrides(normalized_title, release_year) WHERE active;
+
+        CREATE TABLE IF NOT EXISTS rotten_tomatoes_slug_probes (
+            vanity_slug TEXT PRIMARY KEY,
+            source_url TEXT NOT NULL,
+            status TEXT NOT NULL,
+            ems_id TEXT,
+            source_title TEXT,
+            release_year INTEGER,
+            raw_cache_path TEXT,
+            parser_version TEXT NOT NULL,
+            first_seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_rt_slug_probes_status
+            ON rotten_tomatoes_slug_probes(status, last_seen_at);
 
         CREATE TABLE IF NOT EXISTS rotten_tomatoes_reviews (
             review_key TEXT PRIMARY KEY,
@@ -358,26 +332,15 @@ def initialize_database(conn: Any) -> None:
         GROUP BY COALESCE(r.critic_id, r.critic_name);
         """
     )
+    movie_identity.ensure_movie_identity_schema(conn)
 
 
 def utc_now() -> str:
     return dt.datetime.now(dt.UTC).isoformat()
 
 
-def clean_text(value: str | None) -> str:
-    if not value:
-        return ""
-    return re.sub(r"\s+", " ", html.unescape(value).replace("\xa0", " ")).strip()
-
-
 def normalize_title(value: str) -> str:
-    text = unicodedata.normalize("NFKD", value)
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    text = re.sub(r"\s*\(\d{4}\)\s*$", "", text)
-    text = text.lower()
-    text = re.sub(r"&", " and ", text)
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return " ".join(text.split())
+    return normalize_movie_title(value)
 
 
 def parse_optional_date(value: object) -> dt.date | None:
@@ -415,10 +378,17 @@ def parse_bool(value: Any) -> bool | None:
 
 
 def parse_int(value: Any) -> int | None:
+    return parse_common_int(value)
+
+
+def parse_release_year(value: Any) -> int | None:
     if value in (None, ""):
         return None
-    match = re.search(r"-?\d+", str(value).replace(",", ""))
-    return int(match.group(0)) if match else None
+    text = str(value)
+    year_match = re.search(r"\b(19|20)\d{2}\b", text)
+    if year_match:
+        return int(year_match.group(0))
+    return parse_int(value)
 
 
 def slugify_rt_title(title: str, release_year: int | None = None) -> str:
@@ -505,13 +475,13 @@ def balanced_json_end(text: str, start: int) -> int | None:
 def parse_media_page(html_text: str, *, source_url: str) -> RottenTomatoesMedia | None:
     review_context = extract_json_assignment(html_text, "root.RottenTomatoes.context.review") or {}
     mps = extract_json_assignment(html_text, "window.mpscall") or {}
-    ems_id = first_text(review_context.get("emsId"), mps.get("field[rtid]"), regex_group(html_text, r'"titleId":"([^"]+)"'))
-    title = first_text(review_context.get("title"), mps.get("title"), mps.get("cag[movieshow]"))
+    ems_id = first_text(mps.get("field[rtid]"), review_context.get("emsId"), regex_group(html_text, r'"titleId":"([^"]+)"'))
+    title = first_text(mps.get("title"), mps.get("cag[movieshow]"), review_context.get("title"))
     if not ems_id or not title:
         return None
     vanity_slug = source_url.rstrip("/").split("/m/")[-1].split("?")[0]
     media_type = first_text(review_context.get("mediaType"), "movie") or "movie"
-    release_year = parse_int(first_text(mps.get("cag[release]"), regex_group(html_text, r'"releaseDate":"?(\d{4})')))
+    release_year = parse_release_year(first_text(mps.get("cag[release]"), regex_group(html_text, r'"releaseDate":"?(\d{4})')))
     score = parse_int(mps.get("cag[score]"))
     sentiment = first_text(mps.get("cag[fresh_rotten]"))
     certified = parse_bool(mps.get("cag[certified_fresh]"))
@@ -630,18 +600,66 @@ def review_key(ems_id: str, item: dict[str, Any]) -> str:
     return f"{ems_id}:sha256:{digest}"
 
 
+def relation_exists(conn: Any, relation_name: str) -> bool:
+    row = conn.execute("SELECT to_regclass(%s)", (relation_name,)).fetchone()
+    return bool(row and row[0])
+
+
 def select_candidate_movies(
     conn: Any,
     *,
     release_year: int | None = None,
     movie_limit: int | None = None,
 ) -> list[CandidateMovie]:
-    where = "WHERE (%s::integer IS NULL OR m.release_year = %s::integer OR EXTRACT(YEAR FROM m.release_date)::integer = %s::integer)"
-    sql = f"""
-        SELECT m.movie_id, m.title, m.release_year, m.release_date, m.movie_url
+    selects = [
+        """
+        SELECT
+            m.movie_id,
+            m.title,
+            m.release_year,
+            m.release_date,
+            m.movie_url,
+            1 AS source_priority
         FROM movies m
-        {where}
-        ORDER BY COALESCE(m.release_date, make_date(COALESCE(m.release_year, 9999), 1, 1)), m.title
+        """
+    ]
+    if relation_exists(conn, "the_numbers_release_schedule"):
+        selects.append(
+            """
+            SELECT DISTINCT
+                m.movie_id,
+                COALESCE(m.title, tn.title) AS title,
+                COALESCE(m.release_year, EXTRACT(YEAR FROM tn.release_date)::integer) AS release_year,
+                COALESCE(m.release_date, tn.release_date) AS release_date,
+                m.movie_url,
+                0 AS source_priority
+            FROM the_numbers_release_schedule tn
+            JOIN movie_source_ids msi
+              ON msi.source = 'the_numbers'
+             AND msi.source_movie_id = tn.movie_url
+            JOIN movies m ON m.movie_id = msi.movie_id
+            WHERE tn.release_date IS NOT NULL
+              AND tn.title NOT ILIKE '%%untitled%%'
+              AND tn.title NOT ILIKE '%%re-release%%'
+              AND COALESCE(tn.release_pattern, '') NOT ILIKE '%%re-release%%'
+            """
+        )
+    sql = f"""
+        SELECT movie_id, title, release_year, release_date, movie_url
+        FROM (
+            SELECT DISTINCT ON (movie_id)
+                movie_id, title, release_year, release_date, movie_url, source_priority
+            FROM (
+                {" UNION ALL ".join(selects)}
+            ) candidate_sources
+            WHERE (
+                %s::integer IS NULL
+                OR release_year = %s::integer
+                OR EXTRACT(YEAR FROM release_date)::integer = %s::integer
+            )
+            ORDER BY movie_id, source_priority, release_date, title
+        ) deduped
+        ORDER BY COALESCE(release_date, make_date(COALESCE(release_year, 9999), 1, 1)), title
     """
     params: list[Any] = [release_year, release_year, release_year]
     if movie_limit is not None:
@@ -699,6 +717,57 @@ def override_for_movie(conn: Any, movie: CandidateMovie) -> tuple[str | None, st
     return (str(row[0]) if row[0] else None, str(row[1]) if row[1] else None)
 
 
+def slug_probe_status(conn: Any, slug: str) -> str | None:
+    row = conn.execute(
+        """
+        SELECT status
+        FROM rotten_tomatoes_slug_probes
+        WHERE vanity_slug = %s
+          AND parser_version = %s
+        """,
+        (slug, PARSER_VERSION),
+    ).fetchone()
+    return str(row[0]) if row else None
+
+
+def upsert_slug_probe(
+    conn: Any,
+    *,
+    slug: str,
+    source_url: str,
+    status: str,
+    media: RottenTomatoesMedia | None,
+    raw_cache_path: Path | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO rotten_tomatoes_slug_probes (
+            vanity_slug, source_url, status, ems_id, source_title, release_year,
+            raw_cache_path, parser_version, last_seen_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+        ON CONFLICT(vanity_slug) DO UPDATE SET
+            source_url = excluded.source_url,
+            status = excluded.status,
+            ems_id = excluded.ems_id,
+            source_title = excluded.source_title,
+            release_year = excluded.release_year,
+            raw_cache_path = excluded.raw_cache_path,
+            parser_version = excluded.parser_version,
+            last_seen_at = excluded.last_seen_at
+        """,
+        (
+            slug,
+            source_url,
+            status,
+            media.ems_id if media else None,
+            media.title if media else None,
+            media.release_year if media else None,
+            str(raw_cache_path) if raw_cache_path else None,
+            PARSER_VERSION,
+        ),
+    )
+
+
 def match_movie(conn: Any, fetcher: TextFetcher, movie: CandidateMovie) -> tuple[MovieMatch, RottenTomatoesMedia | None, Path | None]:
     override_ems, override_slug = override_for_movie(conn, movie)
     existing_ems = existing_match(conn, movie)
@@ -708,13 +777,18 @@ def match_movie(conn: Any, fetcher: TextFetcher, movie: CandidateMovie) -> tuple
     best: tuple[float, RottenTomatoesMedia, Path] | None = None
     ambiguous = False
     for slug in [s for s in slugs if s]:
+        if not override_slug and not fetcher.refresh and slug_probe_status(conn, slug) in {"not_found", "parse_failed"}:
+            continue
         url = movie_page_url(slug)
         html_text, cache_path, _fetched = fetcher.get_text(url, suffix="html")
         if not html_text:
+            upsert_slug_probe(conn, slug=slug, source_url=url, status="not_found", media=None, raw_cache_path=cache_path)
             continue
         media = parse_media_page(html_text, source_url=url)
         if media is None:
+            upsert_slug_probe(conn, slug=slug, source_url=url, status="parse_failed", media=None, raw_cache_path=cache_path)
             continue
+        upsert_slug_probe(conn, slug=slug, source_url=url, status="parsed", media=media, raw_cache_path=cache_path)
         score = score_media_match(movie, media)
         if override_slug:
             score = max(score, 1.0)
@@ -802,7 +876,7 @@ def upsert_movie_match(conn: Any, match: MovieMatch) -> None:
                 movie_id, source, source_movie_id, source_title,
                 match_status, match_method, match_score, matched_at
             )
-            SELECT movie_id, 'rottentomatoes', ems_id, rtm.title,
+            SELECT mrtm.movie_id, 'rottentomatoes', mrtm.ems_id, rtm.title,
                    match_status, match_method, match_score, CURRENT_TIMESTAMP
             FROM movie_rotten_tomatoes_media mrtm
             LEFT JOIN rotten_tomatoes_media rtm ON rtm.ems_id = mrtm.ems_id
@@ -1039,21 +1113,8 @@ def ingest_movie(
     if review_cache_path is None:
         review_cache_path = media_cache_path or Path("")
     insert_reviews(conn, reviews, fetched_at=utc_now(), raw_cache_path=review_cache_path)
-    top_reviews, top_review_cache_path = fetch_all_reviews(
-        fetcher,
-        ems_id=match.ems_id,
-        movie_id=movie.movie_id,
-        top_only=True,
-    )
-    if top_reviews:
-        insert_reviews(
-            conn,
-            top_reviews,
-            fetched_at=utc_now(),
-            raw_cache_path=top_review_cache_path or review_cache_path,
-        )
     update_media_review_counts(conn, match.ems_id)
-    if not reviews and not top_reviews:
+    if not reviews:
         insert_issue(
             conn,
             issue_source=issue_source,
@@ -1064,7 +1125,7 @@ def ingest_movie(
             details="Matched RT media but critic review API returned no reviews",
         )
     upsert_state(conn, movie_id=movie.movie_id, stage="done", status="completed")
-    return len(reviews) + len(top_reviews)
+    return len(reviews)
 
 
 def minimal_media_for_existing_match(ems_id: str) -> RottenTomatoesMedia:
@@ -1143,8 +1204,8 @@ def run(args: argparse.Namespace) -> int:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.delay_seconds < 5.0 and not args.offline:
-        raise SystemExit("--delay-seconds must be at least 5.0 unless --offline is set")
+    if args.delay_seconds < MIN_DELAY_SECONDS and not args.offline:
+        raise SystemExit(f"--delay-seconds must be at least {MIN_DELAY_SECONDS:.1f} unless --offline is set")
     if args.movie_limit is not None and args.movie_limit < 1:
         raise SystemExit("--movie-limit must be positive")
 
@@ -1157,7 +1218,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="PostgreSQL connection URL. Defaults to DATABASE_URL or POSTGRES_DSN.",
     )
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
-    parser.add_argument("--delay-seconds", type=float, default=5.0)
+    parser.add_argument("--delay-seconds", type=float, default=MIN_DELAY_SECONDS)
     parser.add_argument("--movie-limit", type=int)
     parser.add_argument("--release-year", type=int)
     parser.add_argument("--refresh", action="store_true")

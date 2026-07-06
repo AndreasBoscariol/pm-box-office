@@ -1,2 +1,0 @@
-"""Paper reproduction tests."""
-

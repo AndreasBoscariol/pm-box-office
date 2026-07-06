@@ -21,12 +21,14 @@ from html import escape
 import json
 import math
 import os
+import sqlite3
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -82,6 +84,99 @@ class HttpRequestError(RuntimeError):
         self.body = body
         self.original = original
         super().__init__(f"GET {url} failed: status={status} body={body!r}")
+
+
+@dataclass(frozen=True)
+class CacheCompactionResult:
+    imported: int
+    deleted: int
+    skipped: int
+    input_bytes: int
+    sqlite_bytes: int
+
+
+class CompressedSqliteCache:
+    """Compressed response cache with legacy loose-JSON read compatibility."""
+
+    filename = "api_cache.sqlite3"
+
+    def __init__(self, cache_dir: Path) -> None:
+        self.cache_dir = cache_dir
+        self.db_path = cache_dir / self.filename
+        self._init_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._initialized = False
+
+    def read(self, cache_key: str) -> Any | None:
+        self._ensure_initialized()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT response_zlib FROM api_responses WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(zlib.decompress(row[0]).decode("utf-8"))
+
+    def write(self, cache_key: str, url: str | None, data: Any) -> None:
+        self._ensure_initialized()
+        body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        compressed = zlib.compress(body, level=9)
+        with self._write_lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO api_responses (cache_key, url, response_zlib, updated_at)
+                    VALUES (?, ?, ?, unixepoch())
+                    ON CONFLICT(cache_key) DO UPDATE SET
+                        url = COALESCE(excluded.url, api_responses.url),
+                        response_zlib = excluded.response_zlib,
+                        updated_at = excluded.updated_at
+                    """,
+                    (cache_key, url, compressed),
+                )
+
+    def checkpoint(self) -> None:
+        self._ensure_initialized()
+        with self._connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def disk_bytes(self) -> int:
+        paths = [
+            self.db_path,
+            self.db_path.with_name(f"{self.db_path.name}-wal"),
+            self.db_path.with_name(f"{self.db_path.name}-shm"),
+        ]
+        return sum(path.stat().st_size for path in paths if path.exists())
+
+    def _ensure_initialized(self) -> None:
+        if self._initialized:
+            return
+        with self._init_lock:
+            if self._initialized:
+                return
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            with self._connect() as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS api_responses (
+                        cache_key TEXT PRIMARY KEY,
+                        url TEXT,
+                        response_zlib BLOB NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_api_responses_url ON api_responses(url)"
+                )
+            self._initialized = True
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=60.0)
+        conn.execute("PRAGMA busy_timeout = 60000")
+        return conn
 
 
 @dataclass(frozen=True)
@@ -164,6 +259,7 @@ class PolymarketClient:
             for name, rate in (rates or {}).items()
         }
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache = CompressedSqliteCache(cache_dir)
 
     def get_json(self, base_url: str, path: str, params: dict[str, Any] | None = None) -> Any:
         query = urllib.parse.urlencode(
@@ -178,12 +274,19 @@ class PolymarketClient:
         if query:
             url = f"{url}?{query}"
 
-        cache_path = self._cache_path(url)
-        if cache_path.exists() and not self.refresh:
-            try:
-                return json.loads(cache_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                cache_path.unlink(missing_ok=True)
+        cache_key = self._cache_key(url)
+        legacy_cache_path = self._cache_path(url)
+        if not self.refresh:
+            cached = self.cache.read(cache_key)
+            if cached is not None:
+                return cached
+            if legacy_cache_path.exists():
+                try:
+                    data = json.loads(legacy_cache_path.read_text(encoding="utf-8"))
+                    self.cache.write(cache_key, url, data)
+                    return data
+                except json.JSONDecodeError:
+                    legacy_cache_path.unlink(missing_ok=True)
 
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
@@ -201,11 +304,7 @@ class PolymarketClient:
                 with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                     payload = response.read().decode("utf-8")
                 data = json.loads(payload)
-                tmp_path = cache_path.with_name(
-                    f"{cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-                )
-                tmp_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-                tmp_path.replace(cache_path)
+                self.cache.write(cache_key, url, data)
                 return data
             except urllib.error.HTTPError as exc:
                 if exc.code == 404:
@@ -226,8 +325,12 @@ class PolymarketClient:
         raise RuntimeError(f"GET {url} failed after retries: {last_error}")
 
     def _cache_path(self, url: str) -> Path:
+        return self.cache_dir / f"{self._cache_key(url)}.json"
+
+    @staticmethod
+    def _cache_key(url: str) -> str:
         digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
-        return self.cache_dir / f"{digest}.json"
+        return digest
 
     def _wait_for_rate_limit(self, base_url: str, path: str) -> None:
         bucket = self._rate_bucket(base_url, path)
@@ -256,6 +359,110 @@ class PolymarketClient:
                 return "data_activity"
             return "data_general"
         return "general"
+
+
+def compact_legacy_api_cache(
+    cache_dir: Path,
+    *,
+    delete_legacy_files: bool = False,
+) -> CacheCompactionResult:
+    """Import loose SHA-named JSON cache files into the compressed SQLite cache."""
+
+    cache = CompressedSqliteCache(cache_dir)
+    imported = 0
+    deleted = 0
+    skipped = 0
+    input_bytes = 0
+    pending_rows: list[tuple[str, None, bytes]] = []
+    pending_paths: list[Path] = []
+
+    def flush() -> None:
+        nonlocal deleted, skipped
+        if not pending_rows:
+            return
+        with cache._write_lock:
+            with cache._connect() as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO api_responses (cache_key, url, response_zlib, updated_at)
+                    VALUES (?, ?, ?, unixepoch())
+                    ON CONFLICT(cache_key) DO UPDATE SET
+                        url = COALESCE(excluded.url, api_responses.url),
+                        response_zlib = excluded.response_zlib,
+                        updated_at = excluded.updated_at
+                    """,
+                    pending_rows,
+                )
+        if delete_legacy_files:
+            for path in pending_paths:
+                try:
+                    path.unlink()
+                    deleted += 1
+                except OSError:
+                    skipped += 1
+        pending_rows.clear()
+        pending_paths.clear()
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache._ensure_initialized()
+    for entry in os.scandir(cache_dir):
+        if not entry.is_file() or not entry.name.endswith(".json"):
+            continue
+        cache_key = entry.name[:-5]
+        if len(cache_key) != 64:
+            skipped += 1
+            continue
+        path = Path(entry.path)
+        try:
+            input_bytes += entry.stat().st_size
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            skipped += 1
+            continue
+        body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        pending_rows.append((cache_key, None, zlib.compress(body, level=9)))
+        pending_paths.append(path)
+        imported += 1
+        if len(pending_rows) >= 1000:
+            flush()
+
+    flush()
+    cache.checkpoint()
+    sqlite_bytes = cache.disk_bytes()
+    return CacheCompactionResult(
+        imported=imported,
+        deleted=deleted,
+        skipped=skipped,
+        input_bytes=input_bytes,
+        sqlite_bytes=sqlite_bytes,
+    )
+
+
+def compact_legacy_api_cache_tree(
+    root_dir: Path,
+    *,
+    delete_legacy_files: bool = False,
+) -> dict[Path, CacheCompactionResult]:
+    """Compact root_dir and each immediate child directory that may contain API cache JSON."""
+
+    results: dict[Path, CacheCompactionResult] = {}
+    if not root_dir.exists():
+        return results
+
+    candidates = [root_dir]
+    candidates.extend(
+        Path(entry.path)
+        for entry in os.scandir(root_dir)
+        if entry.is_dir()
+    )
+    for candidate in candidates:
+        result = compact_legacy_api_cache(
+            candidate,
+            delete_legacy_files=delete_legacy_files,
+        )
+        if result.imported or result.deleted or result.skipped:
+            results[candidate] = result
+    return results
 
 
 def discover_movie_tag_id(client: PolymarketClient) -> int:
@@ -1636,7 +1843,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--cache-dir",
         type=Path,
         default=Path("data/raw/polymarket/api_cache"),
-        help="Directory for cached API responses.",
+        help="Directory for cached API responses. New responses are stored in a compressed SQLite cache in this directory.",
+    )
+    parser.add_argument(
+        "--compact-cache",
+        action="store_true",
+        help="Import legacy loose *.json API cache files into the compressed SQLite cache and exit.",
+    )
+    parser.add_argument(
+        "--compact-cache-tree",
+        action="store_true",
+        help="Treat --cache-dir as a Polymarket raw root and compact it plus each immediate child cache directory.",
+    )
+    parser.add_argument(
+        "--delete-legacy-cache-files",
+        action="store_true",
+        help="With --compact-cache or --compact-cache-tree, delete each loose *.json file after it is imported.",
     )
     parser.add_argument(
         "--refresh",
@@ -1807,7 +2029,52 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.delete_legacy_cache_files and not (args.compact_cache or args.compact_cache_tree):
+        parser.error("--delete-legacy-cache-files requires --compact-cache or --compact-cache-tree")
+    if args.compact_cache and args.compact_cache_tree:
+        parser.error("Use only one of --compact-cache or --compact-cache-tree")
+    if args.compact_cache_tree:
+        results = compact_legacy_api_cache_tree(
+            args.cache_dir,
+            delete_legacy_files=args.delete_legacy_cache_files,
+        )
+        if not results:
+            print(f"No legacy loose JSON cache files found under {args.cache_dir}", file=sys.stderr)
+            return 0
+        total = CacheCompactionResult(
+            imported=sum(result.imported for result in results.values()),
+            deleted=sum(result.deleted for result in results.values()),
+            skipped=sum(result.skipped for result in results.values()),
+            input_bytes=sum(result.input_bytes for result in results.values()),
+            sqlite_bytes=sum(result.sqlite_bytes for result in results.values()),
+        )
+        for path, result in sorted(results.items()):
+            print(
+                f"{path}: imported={result.imported} deleted={result.deleted} skipped={result.skipped} "
+                f"legacy_input={result.input_bytes:,} bytes sqlite={result.sqlite_bytes:,} bytes",
+                file=sys.stderr,
+            )
+        print(
+            "Compacted Polymarket API cache tree: "
+            f"imported={total.imported} deleted={total.deleted} skipped={total.skipped} "
+            f"legacy_input={total.input_bytes:,} bytes sqlite={total.sqlite_bytes:,} bytes",
+            file=sys.stderr,
+        )
+        return 0
+    if args.compact_cache:
+        result = compact_legacy_api_cache(
+            args.cache_dir,
+            delete_legacy_files=args.delete_legacy_cache_files,
+        )
+        print(
+            "Compacted Polymarket API cache: "
+            f"imported={result.imported} deleted={result.deleted} skipped={result.skipped} "
+            f"legacy_input={result.input_bytes:,} bytes sqlite={result.sqlite_bytes:,} bytes",
+            file=sys.stderr,
+        )
+        return 0
     result = find_accounts(args)
     all_output = args.all_output or args.diagnostics_output or default_all_output(args.output)
     write_scores_csv(args.output, result.qualifying_scores)
