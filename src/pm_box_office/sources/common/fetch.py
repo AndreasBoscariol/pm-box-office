@@ -16,6 +16,17 @@ import urllib.request
 DEFAULT_TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 
 
+def cache_path_for_url(cache_dir: Path, url: str, suffix: str = ".html") -> Path:
+    normalized_suffix = suffix if suffix.startswith(".") else f".{suffix}"
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    return cache_dir / f"{digest}{normalized_suffix}"
+
+
+def retry_delay_seconds(exc: urllib.error.HTTPError, *, fallback_seconds: float) -> float:
+    retry_after = exc.headers.get("Retry-After")
+    return float(retry_after) if retry_after else fallback_seconds
+
+
 @dataclass(frozen=True)
 class FetchResult:
     body: bytes
@@ -57,9 +68,7 @@ class CacheFirstFetcher:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def cache_path(self, url: str, suffix: str = ".html") -> Path:
-        normalized_suffix = suffix if suffix.startswith(".") else f".{suffix}"
-        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
-        return self.cache_dir / f"{digest}{normalized_suffix}"
+        return cache_path_for_url(self.cache_dir, url, suffix=suffix)
 
     def get_bytes(
         self,
@@ -194,5 +203,4 @@ class CacheFirstFetcher:
             time.sleep(delay)
 
     def _retry_delay(self, exc: urllib.error.HTTPError, attempt: int) -> float:
-        retry_after = exc.headers.get("Retry-After")
-        return float(retry_after) if retry_after else self.delay_seconds * (attempt + 1)
+        return retry_delay_seconds(exc, fallback_seconds=self.delay_seconds * (attempt + 1))

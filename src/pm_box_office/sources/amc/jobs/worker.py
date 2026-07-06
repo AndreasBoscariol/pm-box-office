@@ -16,6 +16,7 @@ from pm_box_office.sources.amc.client import DEFAULT_CACHE_DIR, DEFAULT_USER_AGE
 from pm_box_office.sources.amc.diagnostics import diagnostics_context, log_backoff_event, short_error
 from pm_box_office.sources.amc.jobs import handlers, queue
 from pm_box_office.sources.amc.parsers import SeatMapUnavailable
+from pm_box_office.sources.common.cli import add_database_arg
 
 
 LOGGER = logging.getLogger("amc.worker")
@@ -24,7 +25,7 @@ DATABASE_INIT_LOCK_KEY = "amc_database_initialize"
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database-url", help="PostgreSQL URL. Defaults to DATABASE_URL/POSTGRES_DSN/.env.")
+    add_database_arg(parser)
     parser.add_argument("--worker-id", default=f"{socket.gethostname()}-{time.time_ns()}")
     parser.add_argument("--once", action="store_true", help="Claim and process one batch, then exit.")
     parser.add_argument("--limit", type=int, default=1)

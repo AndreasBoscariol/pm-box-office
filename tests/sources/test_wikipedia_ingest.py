@@ -151,7 +151,17 @@ class WikipediaIngestTests(unittest.TestCase):
         ingest.upsert_wiki_match(self.conn, movie=movie, language="en", match=match)
         ingest.upsert_wiki_match(self.conn, movie=movie, language="en", match=match)
         self.assertEqual(1, self.conn.execute("SELECT COUNT(*) FROM wiki_pages").fetchone()[0])
-        self.assertEqual(1, self.conn.execute("SELECT COUNT(*) FROM movie_wiki_pages").fetchone()[0])
+        self.assertEqual(
+            1,
+            self.conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM movie_source_ids
+                WHERE source = 'wikipedia'
+                  AND source_movie_id = 'en:123'
+                """
+            ).fetchone()[0],
+        )
 
     def test_raw_pageviews_and_revisions_are_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -419,14 +429,14 @@ class WikipediaIngestTests(unittest.TestCase):
                 source_movie_title TEXT NOT NULL,
                 forecast_metric TEXT NOT NULL,
                 target_start_date DATE,
-                matched_movie_id BIGINT REFERENCES movies(movie_id)
+                movie_id BIGINT REFERENCES movies(movie_id)
             )
             """
         )
         self.conn.execute(
             """
             INSERT INTO boxofficepro_weekend_predictions (
-                source_movie_title, forecast_metric, target_start_date, matched_movie_id
+                source_movie_title, forecast_metric, target_start_date, movie_id
             ) VALUES (
                 'Young Washington', 'domestic_opening_weekend', '2026-07-03', 2
             )

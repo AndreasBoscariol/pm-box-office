@@ -256,49 +256,17 @@ class AmcPipelineUnitTests(unittest.TestCase):
         self.assertTrue(all(item.inclusion_probability > 0 for item in first))
         self.assertTrue(all(item.analysis_weight >= 1 for item in first))
 
-    def test_movie_options_group_showtimes_by_movie(self) -> None:
-        rows = [
-            ShowtimeRecord(
-                theatre_slug="amc-empire-25",
-                date="2026-07-01",
-                showtime_id="100",
-                when="2026-07-01T13:00:00-04:00",
-                movie_name="Big Movie",
-                movie_id="movie-big",
-                showtime_url="https://www.amctheatres.com/showtimes/100",
-                attribute_names="IMAX|Reserved Seating",
-            ),
-            ShowtimeRecord(
-                theatre_slug="amc-empire-25",
-                date="2026-07-01",
-                showtime_id="101",
-                when="2026-07-01T19:00:00-04:00",
-                movie_name="Big Movie",
-                movie_id="movie-big",
-                showtime_url="https://www.amctheatres.com/showtimes/101",
-                attribute_names="Dolby Cinema at AMC|Reserved Seating",
-            ),
-            ShowtimeRecord(
-                theatre_slug="amc-empire-25",
-                date="2026-07-01",
-                showtime_id="102",
-                when="2026-07-01T21:00:00-04:00",
-                movie_name="Small Movie",
-                movie_id="movie-small",
-                showtime_url="https://www.amctheatres.com/showtimes/102",
-                attribute_names="",
-            ),
-        ]
+    def test_collect_parser_keeps_durable_collection_surface(self) -> None:
+        parser = collect.build_parser()
 
-        options = collect.movie_options_from_showtimes(rows)
-        rendered = collect.format_movie_options(options)
-        selected = collect.choose_movie_option(options, selection=1)
+        inventory_args = parser.parse_args(["create-inventory-run", "2026-07-01"])
+        ingest_args = parser.parse_args(["--refresh", "ingest-theatres", "--offline"])
 
-        self.assertEqual(["Big Movie", "Small Movie"], [option.amc_movie_name for option in options])
-        self.assertEqual(2, options[0].showtime_count)
-        self.assertIn("1. Big Movie", rendered)
-        self.assertIn("AMC movie id: movie-big", rendered)
-        self.assertEqual("movie-big", selected.amc_movie_id)
+        self.assertEqual("create-inventory-run", inventory_args.command)
+        self.assertEqual(dt.date(2026, 7, 1), inventory_args.target_date)
+        self.assertEqual("ingest-theatres", ingest_args.command)
+        self.assertTrue(ingest_args.refresh)
+        self.assertTrue(ingest_args.offline)
 
 
 class AmcPipelinePostgresTests(unittest.TestCase):
@@ -510,9 +478,9 @@ class AmcPipelinePostgresTests(unittest.TestCase):
             """
             INSERT INTO movies (movie_id, movie_url, title)
             VALUES
-                (1, 'https://www.the-numbers.com/movie/Sample-One-(2026)', 'Sample One'),
-                (2, 'https://www.the-numbers.com/movie/Old-Movie-(2025)', 'Old Movie'),
-                (3, 'https://www.the-numbers.com/movie/Citizen-Kane-(1941)', 'Citizen Kane (Special Engagement, re-release)')
+                (101, 'https://www.the-numbers.com/movie/Sample-One-(2026)', 'Sample One'),
+                (102, 'https://www.the-numbers.com/movie/Old-Movie-(2025)', 'Old Movie'),
+                (103, 'https://www.the-numbers.com/movie/Citizen-Kane-(1941)', 'Citizen Kane (Special Engagement, re-release)')
             """
         )
         self.conn.execute(

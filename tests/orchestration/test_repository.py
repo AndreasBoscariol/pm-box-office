@@ -1,9 +1,50 @@
 from __future__ import annotations
 
+import tomllib
 import unittest
+from pathlib import Path
 
 from pm_box_office.orchestration import repository
+from pm_box_office.orchestration.registry import (
+    BOX_OFFICE_PREDICTION_SOURCE_KEYS,
+    RUN_ALL_SOURCE_KEYS,
+    SOURCE_DEFINITIONS,
+)
 from tests.postgres_test_utils import drop_isolated_postgres_schema, make_isolated_postgres_schema
+
+
+def test_project_ingest_scripts_are_registered_for_web_orchestration_without_database() -> None:
+    pyproject_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    script_entries = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))["project"]["scripts"]
+    script_modules = {
+        entry_point.split(":", 1)[0]
+        for script_name, entry_point in script_entries.items()
+        if script_name.endswith("-ingest")
+        or script_name in {
+            "pm-box-office-scrape-the-numbers",
+            "pm-box-office-the-numbers-predictions",
+        }
+    }
+    registered_modules = {source.command for source in SOURCE_DEFINITIONS}
+
+    assert set() == script_modules - registered_modules
+
+
+def test_manual_only_prediction_source_is_excluded_from_run_all_without_database() -> None:
+    source_by_key = {source.source_key: source for source in SOURCE_DEFINITIONS}
+
+    assert source_by_key["the_numbers_predictions"].command == "pm_box_office.sources.the_numbers.predictions"
+    assert "the_numbers_predictions" not in RUN_ALL_SOURCE_KEYS
+
+
+def test_box_office_prediction_ingests_are_registered_for_web_without_database() -> None:
+    source_by_key = {source.source_key: source for source in SOURCE_DEFINITIONS}
+
+    for source_key in BOX_OFFICE_PREDICTION_SOURCE_KEYS:
+        assert source_key in source_by_key
+        assert source_by_key[source_key].command.startswith("pm_box_office.sources.boxoffice")
+        assert "Predictions" in source_by_key[source_key].display_name
+        assert source_key in RUN_ALL_SOURCE_KEYS
 
 
 class OrchestrationRepositoryTests(unittest.TestCase):
@@ -55,6 +96,21 @@ class OrchestrationRepositoryTests(unittest.TestCase):
             ("Rotten Tomatoes Critics", "pm_box_office.sources.rotten_tomatoes.ingest", True),
             tuple(row),
         )
+
+    def test_seed_sources_registers_the_numbers_predictions_for_manual_runs(self) -> None:
+        row = self.conn.execute(
+            """
+            SELECT display_name, command, enabled
+            FROM ingest_sources
+            WHERE source_key = 'the_numbers_predictions'
+            """
+        ).fetchone()
+
+        self.assertEqual(
+            ("The Numbers Predictions", "pm_box_office.sources.the_numbers.predictions", True),
+            tuple(row),
+        )
+        self.assertNotIn("the_numbers_predictions", RUN_ALL_SOURCE_KEYS)
 
     def test_autorun_state_tracks_next_daily_run(self) -> None:
         state = repository.get_autorun_state(self.conn)

@@ -346,7 +346,7 @@ class ScrapeTheNumbersTests(unittest.TestCase):
             scraper.initialize_database(conn)
             conn.execute(
                 """
-                CREATE TABLE movie_source_ids (
+                CREATE TABLE IF NOT EXISTS movie_source_ids (
                     movie_id BIGINT REFERENCES movies(movie_id),
                     source TEXT NOT NULL,
                     source_movie_id TEXT NOT NULL,

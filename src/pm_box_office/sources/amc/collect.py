@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
-"""AMC one-film box-office signal collection CLI."""
+"""AMC campaign and collection queue CLI."""
 
 from __future__ import annotations
 
 import argparse
-import datetime as dt
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from pm_box_office.db.connection import connect_database
 from pm_box_office.sources.amc import db
 from pm_box_office.sources.amc.client import DEFAULT_CACHE_DIR, DEFAULT_USER_AGENT, HtmlFetcher
-from pm_box_office.sources.amc.parsers import (
-    extract_rendered_showtimes,
-    extract_showtimes,
-    maybe_parse_apollo_data,
-    showtimes_url,
-)
 from pm_box_office.sources.amc.services import (
     movie_service,
     progress_service,
@@ -26,24 +17,7 @@ from pm_box_office.sources.amc.services import (
     showtime_service,
     theatre_service,
 )
-from pm_box_office.sources.common.cli import parse_date_arg
-
-
-DATABASE_URL_HELP = "PostgreSQL URL. Defaults to DATABASE_URL/POSTGRES_DSN/.env."
-
-
-@dataclass(frozen=True)
-class MovieOption:
-    amc_movie_id: str
-    amc_movie_name: str
-    showtime_count: int
-    first_showtime: str
-    last_showtime: str
-    attribute_names: str
-
-
-def parse_date(value: str) -> dt.date:
-    return parse_date_arg(value)
+from pm_box_office.sources.common.cli import add_cache_args, add_database_arg, parse_date_arg
 
 
 def parse_offsets(value: str) -> tuple[int, ...]:
@@ -66,24 +40,20 @@ def build_fetcher(args: Any) -> HtmlFetcher:
     )
 
 
-def add_fetch_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--cache-dir",
-        type=Path,
-        default=DEFAULT_CACHE_DIR,
-        help=f"AMC cache directory. Default: {DEFAULT_CACHE_DIR}",
+def add_fetch_args(parser: argparse.ArgumentParser, *, suppress_default: bool = False) -> None:
+    add_cache_args(
+        parser,
+        default_cache_dir=DEFAULT_CACHE_DIR,
+        cache_help=f"AMC cache directory. Default: {DEFAULT_CACHE_DIR}",
+        include_dry_run=False,
+        suppress_default=suppress_default,
     )
-    parser.add_argument("--refresh", action="store_true", help="Refresh cached AMC pages.")
-    parser.add_argument("--offline", action="store_true", help="Use only cached AMC pages.")
-    parser.add_argument("--delay-seconds", type=float, default=1.0)
-    parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
-
-
-def add_database_arg(parser: argparse.ArgumentParser, *, suppress_default: bool = False) -> None:
-    kwargs: dict[str, Any] = {"help": DATABASE_URL_HELP}
-    if suppress_default:
-        kwargs["default"] = argparse.SUPPRESS
-    parser.add_argument("--database-url", **kwargs)
+    delay_kwargs: dict[str, object] = {"default": argparse.SUPPRESS} if suppress_default else {"default": 1.0}
+    user_agent_kwargs: dict[str, object] = (
+        {"default": argparse.SUPPRESS} if suppress_default else {"default": DEFAULT_USER_AGENT}
+    )
+    parser.add_argument("--delay-seconds", type=float, **delay_kwargs)
+    parser.add_argument("--user-agent", **user_agent_kwargs)
 
 
 def add_command_parser(
@@ -98,74 +68,6 @@ def add_command_parser(
 
 def connect_cli_database(args: Any) -> Any:
     return connect_database(getattr(args, "database_url", None))
-
-
-def fetch_showtime_rows(fetcher: HtmlFetcher, *, theatre_slug: str, target_date: dt.date) -> tuple[list[Any], str]:
-    url = showtimes_url(target_date, theatre_slug)
-    html_text, cache_path, _fetched = fetcher.get(url)
-    apollo = maybe_parse_apollo_data(html_text, source_url=url)
-    rows = (
-        extract_showtimes(apollo, theatre_slug=theatre_slug, date=target_date)
-        if apollo is not None
-        else extract_rendered_showtimes(html_text, theatre_slug=theatre_slug, date=target_date)
-    )
-    return rows, str(cache_path)
-
-
-def movie_options_from_showtimes(rows: list[Any]) -> list[MovieOption]:
-    grouped: dict[tuple[str, str], list[Any]] = {}
-    for row in rows:
-        key = (row.movie_id, row.movie_name)
-        grouped.setdefault(key, []).append(row)
-
-    options: list[MovieOption] = []
-    for (movie_id, movie_name), movie_rows in grouped.items():
-        sorted_rows = sorted(movie_rows, key=lambda row: row.when)
-        attributes = sorted(
-            {
-                attribute
-                for row in movie_rows
-                for attribute in row.attribute_names.split("|")
-                if attribute
-            }
-        )
-        options.append(
-            MovieOption(
-                amc_movie_id=movie_id,
-                amc_movie_name=movie_name,
-                showtime_count=len(movie_rows),
-                first_showtime=sorted_rows[0].when,
-                last_showtime=sorted_rows[-1].when,
-                attribute_names=", ".join(attributes),
-            )
-        )
-    return sorted(options, key=lambda option: (-option.showtime_count, option.amc_movie_name.lower()))
-
-
-def format_movie_options(options: list[MovieOption]) -> str:
-    lines = ["AMC movies found:"]
-    for index, option in enumerate(options, start=1):
-        attributes = f" | {option.attribute_names}" if option.attribute_names else ""
-        lines.append(
-            f"{index}. {option.amc_movie_name} "
-            f"(AMC movie id: {option.amc_movie_id}, showtimes: {option.showtime_count}, "
-            f"first: {option.first_showtime}, last: {option.last_showtime}{attributes})"
-        )
-    return "\n".join(lines)
-
-
-def choose_movie_option(options: list[MovieOption], *, selection: int | None = None) -> MovieOption:
-    if not options:
-        raise SystemExit("No AMC movie options found for that theatre/date.")
-    if selection is None:
-        raw_value = input("Select movie number: ").strip()
-        try:
-            selection = int(raw_value)
-        except ValueError as exc:
-            raise SystemExit(f"Expected a movie number, got {raw_value!r}") from exc
-    if selection < 1 or selection > len(options):
-        raise SystemExit(f"Selection must be between 1 and {len(options)}")
-    return options[selection - 1]
 
 
 def cmd_init_db(args: Any) -> int:
@@ -429,28 +331,31 @@ def build_parser() -> argparse.ArgumentParser:
     init_db.set_defaults(func=cmd_init_db)
 
     ingest = add_command_parser(subparsers, "ingest-theatres", help="Ingest AMC theatres from sitemap.")
-    add_fetch_args(ingest)
+    add_fetch_args(ingest, suppress_default=True)
     ingest.set_defaults(func=cmd_ingest_theatres)
 
-    inventory = add_command_parser(subparsers, 
+    inventory = add_command_parser(
+        subparsers,
         "create-inventory-run",
         help="Create a durable full-network showtime inventory run for a date.",
     )
-    inventory.add_argument("target_date", type=parse_date)
+    inventory.add_argument("target_date", type=parse_date_arg)
     inventory.set_defaults(func=cmd_create_inventory_run)
 
-    movies = add_command_parser(subparsers, 
+    movies = add_command_parser(
+        subparsers,
         "list-movies",
         help="List database-backed AMC movie inventory for a date.",
     )
-    movies.add_argument("target_date", type=parse_date)
+    movies.add_argument("target_date", type=parse_date_arg)
     movies.set_defaults(func=cmd_list_movies)
 
-    toggle = add_command_parser(subparsers, 
+    toggle = add_command_parser(
+        subparsers,
         "toggle-movie",
         help="Select or deselect an AMC movie for a campaign date.",
     )
-    toggle.add_argument("target_date", type=parse_date)
+    toggle.add_argument("target_date", type=parse_date_arg)
     toggle.add_argument("amc_movie_id")
     toggle_group = toggle.add_mutually_exclusive_group(required=True)
     toggle_group.add_argument("--selected", dest="selected", action="store_true")
@@ -462,7 +367,7 @@ def build_parser() -> argparse.ArgumentParser:
         "select-the-numbers-active",
         help="Select AMC movies still reporting recent The Numbers daily grosses.",
     )
-    select_active.add_argument("target_date", type=parse_date)
+    select_active.add_argument("target_date", type=parse_date_arg)
     select_active.add_argument(
         "--lookback-days",
         type=int,
@@ -471,11 +376,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     select_active.set_defaults(func=cmd_select_the_numbers_active)
 
-    seat_run = add_command_parser(subparsers, 
+    seat_run = add_command_parser(
+        subparsers,
         "create-seat-run",
         help="Create durable seat-scan tasks for selected movies on a date.",
     )
-    seat_run.add_argument("target_date", type=parse_date)
+    seat_run.add_argument("target_date", type=parse_date_arg)
     seat_run.add_argument(
         "--target-offset-minutes",
         dest="target_offsets_minutes",
@@ -506,7 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
         "sample-coverage",
         help="Report fixed theatre sample coverage for a date.",
     )
-    sample_coverage.add_argument("target_date", type=parse_date)
+    sample_coverage.add_argument("target_date", type=parse_date_arg)
     sample_coverage.add_argument("--sample-key", default=sample_service.DEFAULT_SAMPLE_KEY)
     sample_coverage.set_defaults(func=cmd_sample_coverage)
 
@@ -518,11 +424,12 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_run.add_argument("run_id")
     cancel_run.set_defaults(func=cmd_cancel_run)
 
-    cancel_campaign = add_command_parser(subparsers, 
+    cancel_campaign = add_command_parser(
+        subparsers,
         "cancel-campaign",
         help="Cancel queued/running durable tasks for a campaign date.",
     )
-    cancel_campaign.add_argument("target_date", type=parse_date)
+    cancel_campaign.add_argument("target_date", type=parse_date_arg)
     cancel_campaign.set_defaults(func=cmd_cancel_campaign)
 
     reset = add_command_parser(
@@ -530,7 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
         "reset-collection-state",
         help="Clear campaign queues and date-scoped seat snapshots while preserving theatres/sample/showtimes.",
     )
-    reset.add_argument("--date", dest="target_date", required=True, type=parse_date)
+    reset.add_argument("--date", dest="target_date", required=True, type=parse_date_arg)
     reset.add_argument("--confirm-reset", action="store_true", help="Required guard for deleting collection state.")
     reset.add_argument(
         "--keep-seat-snapshots",
@@ -544,7 +451,7 @@ def build_parser() -> argparse.ArgumentParser:
         "cleanup-seat-cache-duplicates",
         help="Delete top-level AMC seat cache files that duplicate archived seat snapshots.",
     )
-    add_fetch_args(cleanup_seat_cache)
+    add_fetch_args(cleanup_seat_cache, suppress_default=True)
     cleanup_seat_cache.add_argument(
         "--dry-run",
         action="store_true",

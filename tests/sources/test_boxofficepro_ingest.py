@@ -891,7 +891,7 @@ class BoxofficeProPostgresTests(unittest.TestCase):
                     p.forecast_metric,
                     p.showtime_market_share_pct
                 FROM boxofficepro_weekend_predictions p
-                LEFT JOIN movies m ON m.movie_id = p.matched_movie_id
+                LEFT JOIN movies m ON m.movie_id = p.movie_id
                 ORDER BY p.row_ordinal
                 """
             ).fetchall()
@@ -985,7 +985,7 @@ class BoxofficeProPostgresTests(unittest.TestCase):
             repointed = ingest.match_predictions(conn, young)
             conn.commit()
             self.assertEqual("matched", repointed[0].match_status)
-            self.assertEqual(int(canonical_movie_id), repointed[0].matched_movie_id)
+            self.assertEqual(int(canonical_movie_id), repointed[0].movie_id)
 
             source_row = conn.execute(
                 """
@@ -998,7 +998,7 @@ class BoxofficeProPostgresTests(unittest.TestCase):
             ).fetchone()
             prediction_row = conn.execute(
                 """
-                SELECT matched_movie_id, match_status, match_method
+                SELECT movie_id, match_status, match_method
                 FROM boxofficepro_weekend_predictions
                 WHERE source_movie_id = %s
                 """,

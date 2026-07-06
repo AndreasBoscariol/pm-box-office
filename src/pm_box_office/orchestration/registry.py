@@ -5,6 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+BOX_OFFICE_PREDICTION_SOURCE_KEYS = (
+    "boxofficepro",
+    "boxofficereport",
+    "boxofficetheory",
+    "boxofficeguru",
+)
+
+
 @dataclass(frozen=True)
 class SourceDefinition:
     source_key: str
@@ -14,6 +22,7 @@ class SourceDefinition:
     max_concurrency: int = 1
     enabled: bool = True
     requires_movies: bool = False
+    include_in_run_all: bool = True
 
 
 SOURCE_DEFINITIONS: tuple[SourceDefinition, ...] = (
@@ -23,14 +32,30 @@ SOURCE_DEFINITIONS: tuple[SourceDefinition, ...] = (
         command="pm_box_office.sources.the_numbers.ingest",
     ),
     SourceDefinition(
+        source_key="the_numbers_predictions",
+        display_name="The Numbers Predictions",
+        command="pm_box_office.sources.the_numbers.predictions",
+        include_in_run_all=False,
+    ),
+    SourceDefinition(
         source_key="boxofficepro",
-        display_name="Boxoffice Pro",
+        display_name="Boxoffice Pro Predictions",
         command="pm_box_office.sources.boxofficepro.ingest",
     ),
     SourceDefinition(
         source_key="boxofficereport",
-        display_name="Box Office Report",
+        display_name="Box Office Report Predictions",
         command="pm_box_office.sources.boxofficereport.ingest",
+    ),
+    SourceDefinition(
+        source_key="boxofficetheory",
+        display_name="Box Office Theory Predictions",
+        command="pm_box_office.sources.boxofficetheory.ingest",
+    ),
+    SourceDefinition(
+        source_key="boxofficeguru",
+        display_name="Box Office Guru Predictions",
+        command="pm_box_office.sources.boxofficeguru.ingest",
     ),
     SourceDefinition(
         source_key="wikipedia",
@@ -55,6 +80,7 @@ SOURCE_DEFINITIONS: tuple[SourceDefinition, ...] = (
         display_name="AMC Worker Batch",
         command="pm_box_office.sources.amc.jobs.worker",
         default_args=("--once", "--limit", "1", "--worker-id", "orchestrated-amc", "--verbose"),
+        include_in_run_all=False,
     ),
 )
 
@@ -63,5 +89,5 @@ SOURCE_BY_KEY = {source.source_key: source for source in SOURCE_DEFINITIONS}
 RUN_ALL_SOURCE_KEYS = tuple(
     source.source_key
     for source in SOURCE_DEFINITIONS
-    if source.enabled and source.source_key not in {"amc_worker"}
+    if source.enabled and source.include_in_run_all
 )

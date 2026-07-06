@@ -52,6 +52,10 @@ class AlembicMigrationTests(unittest.TestCase):
             self.assertIn("ingest_runs", names)
             self.assertIn("ingest_run_logs", names)
             self.assertIn("source_freshness", names)
+            self.assertNotIn("movie_imdb_titles", names)
+            self.assertNotIn("movie_letterboxd_films", names)
+            self.assertNotIn("movie_wiki_pages", names)
+            self.assertNotIn("movie_rotten_tomatoes_media", names)
             self.assertTrue(
                 migrated_conn.execute("SELECT to_regclass('analytics.amc_movie_day_blocks_v1')").fetchone()[0]
             )
@@ -68,6 +72,26 @@ class AlembicMigrationTests(unittest.TestCase):
             }
             self.assertIn("match_method", movie_source_columns)
             self.assertIn("match_score", movie_source_columns)
+            for table_name in (
+                "amc_movies",
+                "amc_showtimes",
+                "campaign_movies",
+                "collection_tasks",
+                "the_numbers_release_schedule",
+            ):
+                self.assertTrue(
+                    migrated_conn.execute(
+                        """
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = %s
+                          AND column_name = 'movie_id'
+                        """,
+                        (table_name,),
+                    ).fetchone(),
+                    f"{table_name} should expose canonical movie_id",
+                )
             self.assertGreater(
                 migrated_conn.execute("SELECT COUNT(*) FROM ingest_sources").fetchone()[0],
                 0,

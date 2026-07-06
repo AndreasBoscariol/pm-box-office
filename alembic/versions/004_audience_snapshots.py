@@ -25,7 +25,7 @@ class AlembicConnectionAdapter:
     def execute(self, sql: str, params: object | None = None) -> object:
         if params is not None:
             raise NotImplementedError("Alembic initializer does not use bound parameters.")
-        return self.connection.exec_driver_sql(sql)  # type: ignore[attr-defined]
+        return self.connection.exec_driver_sql(sql.replace("%", "%%"))  # type: ignore[attr-defined]
 
     def executescript(self, sql: str) -> None:
         for statement in split_sql_script(sql):
@@ -43,9 +43,7 @@ def downgrade() -> None:
         "audience_ingest_state",
         "letterboxd_film_snapshots",
         "imdb_title_snapshots",
-        "movie_letterboxd_films",
         "letterboxd_films",
-        "movie_imdb_titles",
         "imdb_titles",
         "the_numbers_release_schedule",
     ):

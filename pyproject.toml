@@ -24,9 +24,13 @@ pm-box-office-amc-seat-tolerance = "pm_box_office.sources.amc.seat_tolerance_dia
 pm-box-office-polymarket-accounts = "pm_box_office.sources.polymarket.accounts:main"
 pm-box-office-boxofficepro-ingest = "pm_box_office.sources.boxofficepro.ingest:main"
 pm-box-office-boxofficereport-ingest = "pm_box_office.sources.boxofficereport.ingest:main"
+pm-box-office-boxofficetheory-ingest = "pm_box_office.sources.boxofficetheory.ingest:main"
+pm-box-office-boxofficeguru-ingest = "pm_box_office.sources.boxofficeguru.ingest:main"
 pm-box-office-scrape-the-numbers = "pm_box_office.sources.the_numbers.ingest:main"
+pm-box-office-the-numbers-predictions = "pm_box_office.sources.the_numbers.predictions:main"
 pm-box-office-audience-ingest = "pm_box_office.sources.audience.ingest:main"
 pm-box-office-wikipedia-ingest = "pm_box_office.sources.wikipedia.ingest:main"
+pm-box-office-rotten-tomatoes-ingest = "pm_box_office.sources.rotten_tomatoes.ingest:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

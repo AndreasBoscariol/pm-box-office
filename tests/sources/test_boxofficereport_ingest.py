@@ -84,6 +84,48 @@ ARTICLE_HTML = """
 """
 
 
+LEGACY_ARTICLE_HTML = """
+<html>
+<head>
+<title>Box Office Report - Weekend Predictions: Dec. 2 - Dec. 4, 2016</title>
+</head>
+<body>
+<h2>Weekend Predictions<br>Dec. 2 - Dec. 4, 2016</h2>
+<table>
+<tr><td>Published on November 30, 2016 at 5:45PM Pacific<br>By Daniel Garris</td></tr>
+</table>
+<h4>Predictions for this weekend's top 10 films at the domestic box office.</h4>
+<table>
+<tr>
+<td></td>
+<td>Film (Distributor)</td>
+<td>WeekendGross</td>
+<td>TotalGross</td>
+<td>%Change</td>
+<td>Week#</td>
+</tr>
+<tr>
+<td>1</td>
+<td>Moana (Disney)</td>
+<td>$27.0 M</td>
+<td>$118.5 M</td>
+<td>-52%</td>
+<td>2</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Fantastic Beasts and Where to Find Them (Warner Bros.)</td>
+<td>$19.0 M</td>
+<td>$184.0 M</td>
+<td>-58%</td>
+<td>3</td>
+</tr>
+</table>
+</body>
+</html>
+"""
+
+
 class BoxOfficeReportParserTests(unittest.TestCase):
     def test_archive_parser_discovers_prediction_pages(self) -> None:
         pages = ingest.parse_archive(ARCHIVE_HTML)
@@ -136,6 +178,32 @@ class BoxOfficeReportParserTests(unittest.TestCase):
         self.assertEqual("domestic_weekend", toy_story.forecast_metric)
         self.assertEqual(-49.0, toy_story.percent_change)
         self.assertEqual(3, toy_story.week_number)
+
+    def test_legacy_compact_prediction_table_extracts_rows(self) -> None:
+        fallback = ingest.ArchivePredictionPage(
+            article_url="http://www.boxofficereport.com/predictions/predictions20161130.html",
+            title="Weekend Box Office Predictions for Dec. 2, 2016 - Dec. 4, 2016",
+            target_start_date="2016-12-02",
+            target_end_date="2016-12-04",
+            archive_top_film="Moana",
+            archive_top_prediction_usd=27_000_000,
+            archive_top_actual_usd=28_300_000,
+            source_url=ingest.ARCHIVE_URL,
+        )
+
+        article, predictions = ingest.parse_article(
+            LEGACY_ARTICLE_HTML,
+            article_url=fallback.article_url,
+            fallback=fallback,
+        )
+
+        self.assertEqual("2016-11-30T17:45:00-08:00", article.prediction_made_at)
+        self.assertEqual(2, len(predictions))
+        self.assertEqual("Moana", predictions[0].source_movie_title)
+        self.assertEqual("Disney", predictions[0].distributor)
+        self.assertEqual(27_000_000, predictions[0].weekend_gross_prediction_usd)
+        self.assertEqual(-52.0, predictions[0].percent_change)
+        self.assertEqual(2, predictions[0].week_number)
 
     def test_full_refresh_args_cover_entire_archive(self) -> None:
         args = ingest.build_arg_parser().parse_args(["--full-refresh"])

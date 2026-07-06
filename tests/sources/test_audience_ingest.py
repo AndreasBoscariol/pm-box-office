@@ -167,13 +167,15 @@ class AudienceParserTests(unittest.TestCase):
 
         class FakeConn:
             def __init__(self) -> None:
-                self.insert_params = None
+                self.source_insert_params = None
 
             def execute(self, sql, params=None):
-                if "SELECT movie_id" in sql and "FROM movie_imdb_titles" in sql:
+                if "to_regclass" in sql:
+                    return FakeCursor(("movie_source_ids",))
+                if "SELECT movie_id" in sql and "FROM movie_source_ids" in sql:
                     return FakeCursor((1,))
-                if "INSERT INTO movie_imdb_titles" in sql:
-                    self.insert_params = params
+                if "INSERT INTO movie_source_ids" in sql:
+                    self.source_insert_params = params
                 return FakeCursor()
 
         conn = FakeConn()
@@ -184,10 +186,7 @@ class AudienceParserTests(unittest.TestCase):
         )
 
         self.assertFalse(stored)
-        self.assertEqual(2, conn.insert_params[0])
-        self.assertIsNone(conn.insert_params[1])
-        self.assertEqual("ambiguous", conn.insert_params[2])
-        self.assertIn("already matched to movie_id 1", conn.insert_params[6])
+        self.assertIsNone(conn.source_insert_params)
 
     def test_imdb_ratings_parser(self) -> None:
         ratings = ingest.parse_imdb_ratings(
@@ -212,7 +211,7 @@ class AudienceParserTests(unittest.TestCase):
                 self.commits = 0
 
             def execute(self, sql, params=None):
-                if "SELECT tconst" in sql and "FROM movie_imdb_titles" in sql:
+                if "SELECT source_movie_id" in sql and "FROM movie_source_ids" in sql:
                     return FakeCursor(("tt11378946",))
                 if "INSERT INTO imdb_title_snapshots" in sql:
                     self.snapshots += 1
@@ -611,14 +610,14 @@ class AudiencePostgresTests(unittest.TestCase):
                 source_movie_title TEXT NOT NULL,
                 forecast_metric TEXT NOT NULL,
                 target_start_date DATE,
-                matched_movie_id BIGINT REFERENCES movies(movie_id)
+                movie_id BIGINT REFERENCES movies(movie_id)
             )
             """
         )
         self.conn.execute(
             """
             INSERT INTO boxofficepro_weekend_predictions (
-                source_movie_title, forecast_metric, target_start_date, matched_movie_id
+                source_movie_title, forecast_metric, target_start_date, movie_id
             ) VALUES (
                 'Young Washington', 'domestic_opening_weekend', '2026-07-03', 200
             )
@@ -820,14 +819,13 @@ class AudiencePostgresTests(unittest.TestCase):
 
         rows = self.conn.execute(
             """
-            SELECT movie_id, tconst, match_status, match_method, notes
-            FROM movie_imdb_titles
+            SELECT movie_id, source_movie_id, match_status, match_method
+            FROM movie_source_ids
+            WHERE source = 'imdb'
             ORDER BY movie_id
             """
         ).fetchall()
-        self.assertEqual("tt32104007", rows[0][1])
-        self.assertEqual((2, None, "ambiguous", "wikidata_sparql"), rows[1][:4])
-        self.assertIn("already matched to movie_id 1", rows[1][4])
+        self.assertEqual([(1, "tt32104007", "matched", "fixture")], rows)
 
     def test_letterboxd_match_duplicate_slug_marks_new_movie_ambiguous(self) -> None:
         self.conn.execute(
@@ -870,14 +868,13 @@ class AudiencePostgresTests(unittest.TestCase):
 
         rows = self.conn.execute(
             """
-            SELECT movie_id, letterboxd_slug, match_status, match_method, notes
-            FROM movie_letterboxd_films
+            SELECT movie_id, source_movie_id, match_status, match_method
+            FROM movie_source_ids
+            WHERE source = 'letterboxd'
             ORDER BY movie_id
             """
         ).fetchall()
-        self.assertEqual("young-washington", rows[0][1])
-        self.assertEqual((2, None, "ambiguous", "wikidata_sparql"), rows[1][:4])
-        self.assertIn("already matched to movie_id 1", rows[1][4])
+        self.assertEqual([(1, "young-washington", "matched", "fixture")], rows)
 
     def test_failed_state_can_be_reset(self) -> None:
         self.conn.execute(

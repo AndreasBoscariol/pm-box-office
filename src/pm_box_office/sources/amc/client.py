@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import datetime as dt
 import os
 import time
@@ -12,11 +11,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pm_box_office.sources.amc import diagnostics
+from pm_box_office.sources.common.fetch import (
+    DEFAULT_TRANSIENT_STATUSES,
+    cache_path_for_url,
+    retry_delay_seconds,
+)
 
 
 DEFAULT_CACHE_DIR = Path("data/raw/amc")
 DEFAULT_USER_AGENT = "pm-box-office-amc/0.1"
-TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+TRANSIENT_STATUSES = DEFAULT_TRANSIENT_STATUSES
 
 
 @dataclass(frozen=True)
@@ -71,8 +75,7 @@ class HtmlFetcher:
 
     def cache_path(self, url: str) -> Path:
         suffix = ".xml" if url.endswith(".xml") else ".html"
-        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
-        return self.cache_dir / f"{digest}{suffix}"
+        return cache_path_for_url(self.cache_dir, url, suffix=suffix)
 
     def get_result(
         self,
@@ -189,7 +192,7 @@ class HtmlFetcher:
                         metadata={"error_type": type(exc).__name__, "error_message": diagnostics.short_error(exc)},
                     )
                     raise
-                delay = float(retry_after) if retry_after else self.delay_seconds * (attempt + 1)
+                delay = retry_delay_seconds(exc, fallback_seconds=self.delay_seconds * (attempt + 1))
                 diagnostics.log_backoff_event(
                     "http_retry",
                     url=url,

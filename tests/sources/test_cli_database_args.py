@@ -6,6 +6,8 @@ from pm_box_office.sources.amc import collect
 from pm_box_office.sources.amc.jobs import worker
 from pm_box_office.sources.audience import ingest as audience
 from pm_box_office.sources.boxofficereport import ingest as boxofficereport
+from pm_box_office.sources.boxofficetheory import ingest as boxofficetheory
+from pm_box_office.sources.boxofficeguru import ingest as boxofficeguru
 from pm_box_office.sources.boxofficepro import ingest as boxofficepro
 from pm_box_office.sources.rotten_tomatoes import ingest as rotten_tomatoes
 from pm_box_office.sources.the_numbers import ingest as the_numbers
@@ -19,6 +21,8 @@ class CliDatabaseArgTests(unittest.TestCase):
             worker.build_parser(),
             audience.build_arg_parser(),
             boxofficereport.build_arg_parser(),
+            boxofficetheory.build_arg_parser(),
+            boxofficeguru.build_arg_parser(),
             boxofficepro.build_arg_parser(),
             rotten_tomatoes.build_parser(),
             the_numbers.build_arg_parser(),

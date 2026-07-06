@@ -117,6 +117,7 @@ class JsonFetcher(CacheFirstFetcher):
 
 
 def initialize_wikipedia_database(conn: Any) -> None:
+    movie_identity.ensure_movie_identity_schema(conn)
     conn.executescript(
         """
             CREATE TABLE IF NOT EXISTS wiki_pages (
@@ -127,22 +128,6 @@ def initialize_wikipedia_database(conn: Any) -> None:
                 first_seen_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
                 last_seen_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
                 PRIMARY KEY(language, wiki_page_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS movie_wiki_pages (
-                movie_id BIGINT NOT NULL REFERENCES movies(movie_id),
-                language TEXT NOT NULL,
-                wiki_page_id INTEGER,
-                match_status TEXT NOT NULL CHECK (
-                    match_status IN ('matched', 'not_found', 'ambiguous', 'manual_override')
-                ),
-                match_method TEXT NOT NULL,
-                match_query TEXT,
-                match_rank INTEGER,
-                match_score DOUBLE PRECISION,
-                matched_at TEXT NOT NULL,
-                notes TEXT,
-                UNIQUE(movie_id, language)
             );
 
             CREATE TABLE IF NOT EXISTS wiki_pageviews_daily (
@@ -209,8 +194,6 @@ def initialize_wikipedia_database(conn: Any) -> None:
                 ON wiki_pageviews_daily(language, wiki_page_id, view_date);
             CREATE INDEX IF NOT EXISTS idx_wiki_revisions_page_timestamp
                 ON wiki_revisions(language, wiki_page_id, rev_timestamp);
-            CREATE INDEX IF NOT EXISTS idx_movie_wiki_pages_movie_language
-                ON movie_wiki_pages(movie_id, language);
             CREATE INDEX IF NOT EXISTS idx_wiki_ingest_state_status_stage
                 ON wiki_ingest_state(status, stage);
 
@@ -255,18 +238,19 @@ def initialize_wikipedia_database(conn: Any) -> None:
             CREATE VIEW wiki_movie_time_features AS
             WITH matched AS (
                 SELECT
-                    mwp.movie_id,
-                    mwp.language,
-                    mwp.wiki_page_id,
+                    src.movie_id,
+                    split_part(src.source_movie_id, ':', 1) AS language,
+                    split_part(src.source_movie_id, ':', 2)::integer AS wiki_page_id,
                     bof.release_run_id,
                     bof.opening_date,
                     bof.opening_theaters,
                     bof.opening_day_gross_usd,
                     bof.opening_weekend_revenue_usd
-                FROM movie_wiki_pages mwp
-                JOIN box_office_opening_features bof ON bof.movie_id = mwp.movie_id
-                WHERE mwp.match_status IN ('matched', 'manual_override')
-                  AND mwp.wiki_page_id IS NOT NULL
+                FROM movie_source_ids src
+                JOIN box_office_opening_features bof ON bof.movie_id = src.movie_id
+                WHERE src.source = 'wikipedia'
+                  AND src.match_status IN ('matched', 'manual_override')
+                  AND src.source_movie_id ~ '^[a-z-]+:[0-9]+$'
             ),
             days AS (
                 SELECT
@@ -441,10 +425,10 @@ def select_candidate_movies(
                 NULL::integer AS opening_weekend_revenue_usd,
                 1 AS source_priority
             FROM boxofficepro_weekend_predictions p
-            JOIN movies m ON m.movie_id = p.matched_movie_id
+            JOIN movies m ON m.movie_id = p.movie_id
             WHERE p.forecast_metric = 'domestic_opening_weekend'
               AND p.target_start_date IS NOT NULL
-              AND p.matched_movie_id IS NOT NULL
+              AND p.movie_id IS NOT NULL
               AND p.source_movie_title NOT ILIKE '%%untitled%%'
               AND p.source_movie_title NOT ILIKE '%%re-release%%'
               AND COALESCE(m.title, p.source_movie_title) NOT ILIKE '%%re-release%%'
@@ -465,10 +449,10 @@ def select_candidate_movies(
                 NULL::integer AS opening_weekend_revenue_usd,
                 2 AS source_priority
             FROM the_numbers_release_schedule tn
-            JOIN movie_source_ids msi
+            LEFT JOIN movie_source_ids msi
               ON msi.source = 'the_numbers'
              AND msi.source_movie_id = tn.movie_url
-            JOIN movies m ON m.movie_id = msi.movie_id
+            JOIN movies m ON m.movie_id = msi.movie_id OR m.movie_url = tn.movie_url
             WHERE tn.release_date IS NOT NULL
               AND tn.title NOT ILIKE '%%untitled%%'
               AND tn.title NOT ILIKE '%%re-release%%'
@@ -739,43 +723,30 @@ def upsert_wiki_match(
                 now,
             ),
         )
-    conn.execute(
-        """
-        INSERT INTO movie_wiki_pages (
-            movie_id, language, wiki_page_id, match_status, match_method,
-            match_query, match_rank, match_score, matched_at, notes
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT(movie_id, language) DO UPDATE SET
-            wiki_page_id = excluded.wiki_page_id,
-            match_status = excluded.match_status,
-            match_method = excluded.match_method,
-            match_query = excluded.match_query,
-            match_rank = excluded.match_rank,
-            match_score = excluded.match_score,
-            matched_at = excluded.matched_at,
-            notes = excluded.notes
-        """,
-        (
-            movie.movie_id,
-            language,
-            match.page_id,
-            match.status,
-            match.method,
-            match.query,
-            match.rank,
-            match.score,
-            now,
-            match.notes,
-        ),
-    )
     if match.page_id is not None and match.status in {"matched", "manual_override"}:
+        conn.execute(
+            """
+            DELETE FROM movie_source_ids
+            WHERE source = %s
+              AND movie_id = %s
+              AND source_movie_id LIKE %s
+              AND source_movie_id <> %s
+              AND match_status != 'manual_override'
+            """,
+            (
+                movie_identity.SOURCE_WIKIPEDIA,
+                movie.movie_id,
+                f"{language}:%",
+                f"{language}:{match.page_id}",
+            ),
+        )
         movie_identity.upsert_movie_source_id(
             conn,
             movie_id=movie.movie_id,
             source=movie_identity.SOURCE_WIKIPEDIA,
             source_movie_id=f"{language}:{match.page_id}",
             source_title=match.page_title,
-            match_status="matched" if match.status == "manual_override" else match.status,
+            match_status=match.status,
             match_method=match.method,
             match_score=match.score,
         )

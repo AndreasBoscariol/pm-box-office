@@ -564,6 +564,27 @@ def refresh_all_source_freshness(conn: Any) -> None:
     )
     refresh_table_metric(
         conn,
+        source_key="boxofficetheory",
+        metric_key="movie_predictions",
+        table_name="boxofficetheory_predictions",
+        timestamp_column="fetched_at",
+    )
+    refresh_table_metric(
+        conn,
+        source_key="boxofficeguru",
+        metric_key="weekend_predictions",
+        table_name="boxofficeguru_predictions",
+        timestamp_column="fetched_at",
+    )
+    refresh_table_metric(
+        conn,
+        source_key="the_numbers_predictions",
+        metric_key="prediction_rows",
+        table_name="the_numbers_prediction_rows",
+        timestamp_column="fetched_at",
+    )
+    refresh_table_metric(
+        conn,
         source_key="wikipedia",
         metric_key="pageviews",
         table_name="wiki_pageviews_daily",
@@ -601,8 +622,9 @@ def refresh_all_source_freshness(conn: Any) -> None:
         conn,
         source_key="rotten_tomatoes",
         metric_key="movie_matches",
-        table_name="movie_rotten_tomatoes_media",
+        table_name="movie_source_ids",
         timestamp_column="matched_at",
+        where_clause="source = 'rottentomatoes'",
     )
     refresh_table_metric(
         conn,
@@ -620,15 +642,17 @@ def refresh_table_metric(
     metric_key: str,
     table_name: str,
     timestamp_column: str,
+    where_clause: str | None = None,
 ) -> None:
     if not relation_exists(conn, table_name):
         upsert_freshness(conn, source_key=source_key, metric_key=metric_key, latest_collected_at=None, row_count=0)
         return
+    where_sql = f" AND {where_clause}" if where_clause else ""
     row = conn.execute(
         f"""
         SELECT MAX({timestamp_column}::timestamptz), COUNT(*)::bigint
         FROM {table_name}
-        WHERE {timestamp_column} IS NOT NULL
+        WHERE {timestamp_column} IS NOT NULL{where_sql}
         """
     ).fetchone()
     upsert_freshness(

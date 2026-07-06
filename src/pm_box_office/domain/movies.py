@@ -9,6 +9,10 @@ from typing import Any
 
 
 SOURCE_BOXOFFICEPRO = "boxofficepro"
+SOURCE_BOXOFFICEREPORT = "boxofficereport"
+SOURCE_BOXOFFICETHEORY = "boxofficetheory"
+SOURCE_BOXOFFICEGURU = "boxofficeguru"
+SOURCE_AMC = "amc"
 SOURCE_IMDB = "imdb"
 SOURCE_LETTERBOXD = "letterboxd"
 SOURCE_ROTTEN_TOMATOES = "rottentomatoes"
@@ -32,7 +36,7 @@ def relation_exists(conn: Any, relation_name: str) -> bool:
     return bool(row and row[0])
 
 
-def ensure_movie_identity_schema(conn: Any) -> None:
+def ensure_movie_identity_schema(conn: Any, *, backfill_sources: bool = False) -> None:
     """Ensure every source can attach its own stable id to movies.movie_id."""
     conn.executescript(
         """
@@ -53,6 +57,7 @@ def ensure_movie_identity_schema(conn: Any) -> None:
             ADD COLUMN IF NOT EXISTS movie_url TEXT,
             ADD COLUMN IF NOT EXISTS release_year INTEGER,
             ADD COLUMN IF NOT EXISTS opusdata_id TEXT,
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
             ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;
 
         ALTER TABLE movies
@@ -131,6 +136,687 @@ def ensure_movie_identity_schema(conn: Any) -> None:
             match_method = excluded.match_method,
             match_score = excluded.match_score,
             matched_at = excluded.matched_at;
+        """
+    )
+    if backfill_sources:
+        ensure_source_identity_backfills(conn)
+
+
+def ensure_source_identity_backfills(conn: Any) -> None:
+    """Backfill canonical movie ids from legacy source-specific references."""
+    conn.executescript(
+        """
+        ALTER TABLE IF EXISTS the_numbers_release_schedule
+            ADD COLUMN IF NOT EXISTS movie_id BIGINT REFERENCES movies(movie_id);
+        ALTER TABLE IF EXISTS daily_chart_pages
+            ADD COLUMN IF NOT EXISTS movie_id BIGINT REFERENCES movies(movie_id);
+        ALTER TABLE IF EXISTS boxofficepro_weekend_predictions
+            ADD COLUMN IF NOT EXISTS movie_id BIGINT REFERENCES movies(movie_id);
+        ALTER TABLE IF EXISTS boxofficereport_weekend_predictions
+            ADD COLUMN IF NOT EXISTS movie_id BIGINT REFERENCES movies(movie_id);
+        ALTER TABLE IF EXISTS amc_movies
+            ADD COLUMN IF NOT EXISTS movie_id BIGINT REFERENCES movies(movie_id);
+        ALTER TABLE IF EXISTS amc_showtimes
+            ADD COLUMN IF NOT EXISTS movie_id BIGINT REFERENCES movies(movie_id);
+        ALTER TABLE IF EXISTS campaign_movies
+            ADD COLUMN IF NOT EXISTS movie_id BIGINT REFERENCES movies(movie_id);
+        ALTER TABLE IF EXISTS collection_tasks
+            ADD COLUMN IF NOT EXISTS movie_id BIGINT REFERENCES movies(movie_id);
+        ALTER TABLE IF EXISTS amc_collection_diagnostic_events
+            ADD COLUMN IF NOT EXISTS movie_id BIGINT REFERENCES movies(movie_id);
+
+        CREATE INDEX IF NOT EXISTS idx_movie_source_ids_movie
+            ON movie_source_ids(movie_id);
+        CREATE INDEX IF NOT EXISTS idx_movie_source_ids_source_status
+            ON movie_source_ids(source, match_status);
+        CREATE INDEX IF NOT EXISTS idx_movie_source_ids_source_title
+            ON movie_source_ids(source, source_title);
+        """
+    )
+    backfill_the_numbers_source_references(conn)
+    backfill_imdb_source_references(conn)
+    backfill_letterboxd_source_references(conn)
+    backfill_wikipedia_source_references(conn)
+    backfill_rotten_tomatoes_source_references(conn)
+    backfill_boxofficepro_source_references(conn)
+    backfill_boxofficereport_source_references(conn)
+    backfill_amc_source_references(conn)
+
+
+def backfill_the_numbers_source_references(conn: Any) -> None:
+    if relation_exists(conn, "the_numbers_release_schedule"):
+        conn.executescript(
+            """
+            INSERT INTO movies (movie_url, title, release_date, release_year, updated_at)
+            SELECT DISTINCT ON (schedule.movie_url)
+                schedule.movie_url,
+                COALESCE(NULLIF(schedule.title, ''), schedule.movie_url),
+                schedule.release_date,
+                EXTRACT(YEAR FROM schedule.release_date)::integer,
+                CURRENT_TIMESTAMP
+            FROM the_numbers_release_schedule schedule
+            WHERE schedule.movie_url IS NOT NULL
+            ORDER BY schedule.movie_url, schedule.release_date NULLS LAST, schedule.fetched_at DESC NULLS LAST
+            ON CONFLICT (movie_url) WHERE movie_url IS NOT NULL DO UPDATE SET
+                release_date = COALESCE(movies.release_date, excluded.release_date),
+                release_year = COALESCE(movies.release_year, excluded.release_year),
+                updated_at = CURRENT_TIMESTAMP;
+
+            INSERT INTO movie_source_ids (
+                movie_id, source, source_movie_id, source_title,
+                match_status, match_method, match_score, matched_at
+            )
+            SELECT
+                movie.movie_id,
+                'the_numbers',
+                movie.movie_url,
+                movie.title,
+                'matched',
+                'backfilled_movie_url',
+                1.0,
+                CURRENT_TIMESTAMP
+            FROM movies movie
+            WHERE movie.movie_url IS NOT NULL
+            ON CONFLICT(source, source_movie_id) DO UPDATE SET
+                movie_id = excluded.movie_id,
+                source_title = excluded.source_title,
+                match_status = excluded.match_status,
+                match_method = excluded.match_method,
+                match_score = excluded.match_score,
+                matched_at = excluded.matched_at;
+
+            UPDATE the_numbers_release_schedule schedule
+            SET movie_id = src.movie_id
+            FROM movie_source_ids src
+            WHERE src.source = 'the_numbers'
+              AND src.source_movie_id = schedule.movie_url
+              AND schedule.movie_id IS DISTINCT FROM src.movie_id;
+
+            CREATE INDEX IF NOT EXISTS idx_tn_release_schedule_movie_id
+                ON the_numbers_release_schedule(movie_id);
+            """
+        )
+    if relation_exists(conn, "daily_chart_pages"):
+        conn.executescript(
+            """
+            INSERT INTO movies (movie_url, title, updated_at)
+            SELECT DISTINCT ON (chart.movie_url)
+                chart.movie_url,
+                COALESCE(NULLIF(chart.title, ''), chart.movie_url),
+                CURRENT_TIMESTAMP
+            FROM daily_chart_pages chart
+            WHERE chart.movie_url IS NOT NULL
+            ORDER BY chart.movie_url, chart.chart_date DESC NULLS LAST, chart.fetched_at DESC NULLS LAST
+            ON CONFLICT (movie_url) WHERE movie_url IS NOT NULL DO UPDATE SET
+                updated_at = CURRENT_TIMESTAMP;
+
+            INSERT INTO movie_source_ids (
+                movie_id, source, source_movie_id, source_title,
+                match_status, match_method, match_score, matched_at
+            )
+            SELECT
+                movie.movie_id,
+                'the_numbers',
+                movie.movie_url,
+                movie.title,
+                'matched',
+                'backfilled_movie_url',
+                1.0,
+                CURRENT_TIMESTAMP
+            FROM movies movie
+            WHERE movie.movie_url IS NOT NULL
+            ON CONFLICT(source, source_movie_id) DO UPDATE SET
+                movie_id = excluded.movie_id,
+                source_title = excluded.source_title,
+                match_status = excluded.match_status,
+                match_method = excluded.match_method,
+                match_score = excluded.match_score,
+                matched_at = excluded.matched_at;
+
+            UPDATE daily_chart_pages chart
+            SET movie_id = src.movie_id
+            FROM movie_source_ids src
+            WHERE src.source = 'the_numbers'
+              AND src.source_movie_id = chart.movie_url
+              AND chart.movie_id IS DISTINCT FROM src.movie_id;
+
+            CREATE INDEX IF NOT EXISTS idx_daily_chart_pages_movie_id
+                ON daily_chart_pages(movie_id);
+            """
+        )
+
+
+def backfill_imdb_source_references(conn: Any) -> None:
+    if not relation_exists(conn, "movie_imdb_titles"):
+        return
+    conn.executescript(
+        """
+        INSERT INTO movie_source_ids (
+            movie_id, source, source_movie_id, source_title,
+            match_status, match_method, match_score, matched_at
+        )
+        SELECT DISTINCT ON (mit.tconst)
+            mit.movie_id,
+            'imdb',
+            mit.tconst,
+            it.primary_title,
+            mit.match_status,
+            mit.match_method,
+            mit.match_score,
+            COALESCE(mit.matched_at::timestamptz, CURRENT_TIMESTAMP)
+        FROM movie_imdb_titles mit
+        LEFT JOIN imdb_titles it ON it.tconst = mit.tconst
+        WHERE mit.tconst IS NOT NULL
+          AND mit.match_status IN ('matched', 'manual_override')
+        ORDER BY
+            mit.tconst,
+            CASE WHEN mit.match_status = 'manual_override' THEN 0 ELSE 1 END,
+            mit.match_score DESC NULLS LAST,
+            mit.matched_at DESC NULLS LAST,
+            mit.movie_id
+        ON CONFLICT(source, source_movie_id) DO UPDATE SET
+            movie_id = excluded.movie_id,
+            source_title = excluded.source_title,
+            match_status = excluded.match_status,
+            match_method = excluded.match_method,
+            match_score = excluded.match_score,
+            matched_at = excluded.matched_at;
+        """
+    )
+
+
+def backfill_letterboxd_source_references(conn: Any) -> None:
+    if not relation_exists(conn, "movie_letterboxd_films"):
+        return
+    conn.executescript(
+        """
+        INSERT INTO movie_source_ids (
+            movie_id, source, source_movie_id, source_title,
+            match_status, match_method, match_score, matched_at
+        )
+        SELECT DISTINCT ON (mlf.letterboxd_slug)
+            mlf.movie_id,
+            'letterboxd',
+            mlf.letterboxd_slug,
+            lf.source_title,
+            mlf.match_status,
+            mlf.match_method,
+            mlf.match_score,
+            COALESCE(mlf.matched_at::timestamptz, CURRENT_TIMESTAMP)
+        FROM movie_letterboxd_films mlf
+        LEFT JOIN letterboxd_films lf ON lf.letterboxd_slug = mlf.letterboxd_slug
+        WHERE mlf.letterboxd_slug IS NOT NULL
+          AND mlf.match_status IN ('matched', 'manual_override')
+        ORDER BY
+            mlf.letterboxd_slug,
+            CASE WHEN mlf.match_status = 'manual_override' THEN 0 ELSE 1 END,
+            mlf.match_score DESC NULLS LAST,
+            mlf.matched_at DESC NULLS LAST,
+            mlf.movie_id
+        ON CONFLICT(source, source_movie_id) DO UPDATE SET
+            movie_id = excluded.movie_id,
+            source_title = excluded.source_title,
+            match_status = excluded.match_status,
+            match_method = excluded.match_method,
+            match_score = excluded.match_score,
+            matched_at = excluded.matched_at;
+        """
+    )
+
+
+def backfill_wikipedia_source_references(conn: Any) -> None:
+    if not relation_exists(conn, "movie_wiki_pages"):
+        return
+    conn.executescript(
+        """
+        INSERT INTO movie_source_ids (
+            movie_id, source, source_movie_id, source_title,
+            match_status, match_method, match_score, matched_at
+        )
+        SELECT DISTINCT ON (mwp.language, mwp.wiki_page_id)
+            mwp.movie_id,
+            'wikipedia',
+            mwp.language || ':' || mwp.wiki_page_id::text,
+            wp.page_title,
+            mwp.match_status,
+            mwp.match_method,
+            mwp.match_score,
+            COALESCE(mwp.matched_at::timestamptz, CURRENT_TIMESTAMP)
+        FROM movie_wiki_pages mwp
+        LEFT JOIN wiki_pages wp
+          ON wp.language = mwp.language
+         AND wp.wiki_page_id = mwp.wiki_page_id
+        WHERE mwp.wiki_page_id IS NOT NULL
+          AND mwp.match_status IN ('matched', 'manual_override')
+        ORDER BY
+            mwp.language,
+            mwp.wiki_page_id,
+            CASE WHEN mwp.match_status = 'manual_override' THEN 0 ELSE 1 END,
+            mwp.match_score DESC NULLS LAST,
+            mwp.matched_at DESC NULLS LAST,
+            mwp.movie_id
+        ON CONFLICT(source, source_movie_id) DO UPDATE SET
+            movie_id = excluded.movie_id,
+            source_title = excluded.source_title,
+            match_status = excluded.match_status,
+            match_method = excluded.match_method,
+            match_score = excluded.match_score,
+            matched_at = excluded.matched_at;
+        """
+    )
+
+
+def backfill_rotten_tomatoes_source_references(conn: Any) -> None:
+    if relation_exists(conn, "movie_rotten_tomatoes_media"):
+        conn.executescript(
+            """
+            INSERT INTO movie_source_ids (
+                movie_id, source, source_movie_id, source_title,
+                match_status, match_method, match_score, matched_at
+            )
+            SELECT DISTINCT ON (mrtm.ems_id)
+                mrtm.movie_id,
+                'rottentomatoes',
+                mrtm.ems_id,
+                media.title,
+                mrtm.match_status,
+                mrtm.match_method,
+                mrtm.match_score,
+                COALESCE(mrtm.matched_at, CURRENT_TIMESTAMP)
+            FROM movie_rotten_tomatoes_media mrtm
+            LEFT JOIN rotten_tomatoes_media media ON media.ems_id = mrtm.ems_id
+            WHERE mrtm.ems_id IS NOT NULL
+              AND mrtm.match_status IN ('matched', 'manual_override')
+            ORDER BY
+                mrtm.ems_id,
+                CASE WHEN mrtm.match_status = 'manual_override' THEN 0 ELSE 1 END,
+                mrtm.match_score DESC NULLS LAST,
+                mrtm.matched_at DESC NULLS LAST,
+                mrtm.movie_id
+            ON CONFLICT(source, source_movie_id) DO UPDATE SET
+                movie_id = excluded.movie_id,
+                source_title = excluded.source_title,
+                match_status = excluded.match_status,
+                match_method = excluded.match_method,
+                match_score = excluded.match_score,
+                matched_at = excluded.matched_at;
+            """
+        )
+    if relation_exists(conn, "rotten_tomatoes_reviews"):
+        conn.executescript(
+            """
+            INSERT INTO movie_source_ids (
+                movie_id, source, source_movie_id, source_title,
+                match_status, match_method, match_score, matched_at
+            )
+            SELECT DISTINCT ON (r.ems_id)
+                r.movie_id,
+                'rottentomatoes',
+                r.ems_id,
+                media.title,
+                'matched',
+                'review_movie_id',
+                1.0,
+                CURRENT_TIMESTAMP
+            FROM rotten_tomatoes_reviews r
+            LEFT JOIN rotten_tomatoes_media media ON media.ems_id = r.ems_id
+            WHERE r.ems_id IS NOT NULL
+            ORDER BY r.ems_id, r.updated_at DESC NULLS LAST
+            ON CONFLICT(source, source_movie_id) DO UPDATE SET
+                movie_id = excluded.movie_id,
+                source_title = COALESCE(excluded.source_title, movie_source_ids.source_title),
+                match_status = excluded.match_status,
+                match_method = excluded.match_method,
+                match_score = excluded.match_score,
+                matched_at = excluded.matched_at;
+            """
+        )
+
+
+def backfill_boxofficepro_source_references(conn: Any) -> None:
+    if not relation_exists(conn, "boxofficepro_weekend_predictions"):
+        return
+    conn.executescript(
+        """
+        WITH source_rows AS (
+            SELECT DISTINCT ON (source_movie_id)
+                source_movie_id,
+                COALESCE(NULLIF(source_movie_title, ''), source_movie_id) AS source_title,
+                match_status,
+                COALESCE(match_method, 'source_primary_key_backfill') AS match_method,
+                match_score
+            FROM boxofficepro_weekend_predictions
+            WHERE source_movie_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM movie_source_ids existing
+                  WHERE existing.source = 'boxofficepro'
+                    AND existing.source_movie_id = boxofficepro_weekend_predictions.source_movie_id
+              )
+            ORDER BY
+                source_movie_id,
+                CASE
+                    WHEN match_status = 'manual_override' THEN 0
+                    WHEN match_status = 'matched' THEN 1
+                    WHEN match_status = 'provisional' THEN 2
+                    ELSE 3
+                END,
+                match_score DESC NULLS LAST,
+                fetched_at DESC NULLS LAST,
+                prediction_id DESC
+        ),
+        keyed AS (
+            SELECT
+                nextval(pg_get_serial_sequence('movies', 'movie_id'))::bigint AS movie_id,
+                source_movie_id,
+                source_title,
+                match_status,
+                match_method,
+                match_score
+            FROM source_rows
+        ),
+        inserted_movies AS (
+            INSERT INTO movies (movie_id, title, updated_at)
+            SELECT movie_id, source_title, CURRENT_TIMESTAMP
+            FROM keyed
+            RETURNING movie_id
+        )
+        INSERT INTO movie_source_ids (
+            movie_id, source, source_movie_id, source_title,
+            match_status, match_method, match_score, matched_at
+        )
+        SELECT
+            keyed.movie_id,
+            'boxofficepro',
+            keyed.source_movie_id,
+            keyed.source_title,
+            CASE WHEN keyed.match_status IN ('matched', 'manual_override') THEN keyed.match_status ELSE 'provisional' END,
+            keyed.match_method,
+            keyed.match_score,
+            CURRENT_TIMESTAMP
+        FROM keyed
+        JOIN inserted_movies USING (movie_id);
+
+        INSERT INTO movie_source_ids (
+            movie_id, source, source_movie_id, source_title,
+            match_status, match_method, match_score, matched_at
+        )
+        SELECT DISTINCT ON (source_movie_id)
+            movie_id,
+            'boxofficepro',
+            source_movie_id,
+            source_movie_title,
+            match_status,
+            match_method,
+            match_score,
+            CURRENT_TIMESTAMP
+        FROM boxofficepro_weekend_predictions
+        WHERE source_movie_id IS NOT NULL
+          AND movie_id IS NOT NULL
+          AND match_status IN ('matched', 'provisional', 'manual_override')
+        ORDER BY source_movie_id, fetched_at DESC NULLS LAST, prediction_id DESC
+        ON CONFLICT(source, source_movie_id) DO UPDATE SET
+            movie_id = excluded.movie_id,
+            source_title = excluded.source_title,
+            match_status = excluded.match_status,
+            match_method = excluded.match_method,
+            match_score = excluded.match_score,
+            matched_at = excluded.matched_at;
+
+        UPDATE boxofficepro_weekend_predictions prediction
+        SET movie_id = src.movie_id
+        FROM movie_source_ids src
+        WHERE src.source = 'boxofficepro'
+          AND src.source_movie_id = prediction.source_movie_id
+          AND prediction.movie_id IS DISTINCT FROM src.movie_id;
+
+        CREATE INDEX IF NOT EXISTS idx_boxofficepro_weekend_predictions_movie_id
+            ON boxofficepro_weekend_predictions(movie_id);
+        """
+    )
+
+
+def backfill_boxofficereport_source_references(conn: Any) -> None:
+    if not relation_exists(conn, "boxofficereport_weekend_predictions"):
+        return
+    conn.executescript(
+        """
+        WITH source_rows AS (
+            SELECT DISTINCT ON (source_movie_id)
+                source_movie_id,
+                COALESCE(NULLIF(source_movie_title, ''), source_movie_id) AS source_title,
+                match_status,
+                COALESCE(match_method, 'source_primary_key_backfill') AS match_method,
+                match_score
+            FROM boxofficereport_weekend_predictions
+            WHERE source_movie_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM movie_source_ids existing
+                  WHERE existing.source = 'boxofficereport'
+                    AND existing.source_movie_id = boxofficereport_weekend_predictions.source_movie_id
+              )
+            ORDER BY
+                source_movie_id,
+                CASE
+                    WHEN match_status = 'manual_override' THEN 0
+                    WHEN match_status = 'matched' THEN 1
+                    WHEN match_status = 'provisional' THEN 2
+                    ELSE 3
+                END,
+                match_score DESC NULLS LAST,
+                fetched_at DESC NULLS LAST,
+                prediction_id DESC
+        ),
+        keyed AS (
+            SELECT
+                nextval(pg_get_serial_sequence('movies', 'movie_id'))::bigint AS movie_id,
+                source_movie_id,
+                source_title,
+                match_status,
+                match_method,
+                match_score
+            FROM source_rows
+        ),
+        inserted_movies AS (
+            INSERT INTO movies (movie_id, title, updated_at)
+            SELECT movie_id, source_title, CURRENT_TIMESTAMP
+            FROM keyed
+            RETURNING movie_id
+        )
+        INSERT INTO movie_source_ids (
+            movie_id, source, source_movie_id, source_title,
+            match_status, match_method, match_score, matched_at
+        )
+        SELECT
+            keyed.movie_id,
+            'boxofficereport',
+            keyed.source_movie_id,
+            keyed.source_title,
+            CASE WHEN keyed.match_status IN ('matched', 'manual_override') THEN keyed.match_status ELSE 'provisional' END,
+            keyed.match_method,
+            keyed.match_score,
+            CURRENT_TIMESTAMP
+        FROM keyed
+        JOIN inserted_movies USING (movie_id);
+
+        INSERT INTO movie_source_ids (
+            movie_id, source, source_movie_id, source_title,
+            match_status, match_method, match_score, matched_at
+        )
+        SELECT DISTINCT ON (source_movie_id)
+            movie_id,
+            'boxofficereport',
+            source_movie_id,
+            source_movie_title,
+            match_status,
+            match_method,
+            match_score,
+            CURRENT_TIMESTAMP
+        FROM boxofficereport_weekend_predictions
+        WHERE source_movie_id IS NOT NULL
+          AND movie_id IS NOT NULL
+          AND match_status IN ('matched', 'provisional', 'manual_override')
+        ORDER BY source_movie_id, fetched_at DESC NULLS LAST, prediction_id DESC
+        ON CONFLICT(source, source_movie_id) DO UPDATE SET
+            movie_id = excluded.movie_id,
+            source_title = excluded.source_title,
+            match_status = excluded.match_status,
+            match_method = excluded.match_method,
+            match_score = excluded.match_score,
+            matched_at = excluded.matched_at;
+
+        UPDATE boxofficereport_weekend_predictions prediction
+        SET movie_id = src.movie_id
+        FROM movie_source_ids src
+        WHERE src.source = 'boxofficereport'
+          AND src.source_movie_id = prediction.source_movie_id
+          AND prediction.movie_id IS DISTINCT FROM src.movie_id;
+
+        CREATE INDEX IF NOT EXISTS idx_boxofficereport_predictions_movie_id
+            ON boxofficereport_weekend_predictions(movie_id);
+        """
+    )
+
+
+def backfill_amc_source_references(conn: Any) -> None:
+    if not relation_exists(conn, "amc_movies"):
+        return
+    conn.executescript(
+        """
+        WITH exact_title_matches AS (
+            SELECT
+                amc.amc_movie_id,
+                movie.movie_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY amc.amc_movie_id
+                    ORDER BY (movie.movie_url IS NULL), movie.release_date NULLS LAST, movie.movie_id
+                ) AS match_rank
+            FROM amc_movies amc
+            JOIN movies movie ON lower(movie.title) = lower(amc.amc_movie_name)
+        )
+        UPDATE amc_movies amc
+        SET movie_id = matches.movie_id
+        FROM exact_title_matches matches
+        WHERE matches.match_rank = 1
+          AND matches.amc_movie_id = amc.amc_movie_id
+          AND amc.movie_id IS NULL;
+
+        WITH source_rows AS (
+            SELECT DISTINCT ON (amc_movie_id)
+                amc_movie_id,
+                COALESCE(NULLIF(amc_movie_name, ''), amc_movie_id) AS source_title
+            FROM amc_movies
+            WHERE amc_movie_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM movie_source_ids existing
+                  WHERE existing.source = 'amc'
+                    AND existing.source_movie_id = amc_movies.amc_movie_id
+              )
+            ORDER BY amc_movie_id, last_seen_at DESC NULLS LAST, first_seen_at DESC NULLS LAST
+        ),
+        keyed AS (
+            SELECT
+                nextval(pg_get_serial_sequence('movies', 'movie_id'))::bigint AS movie_id,
+                amc_movie_id,
+                source_title
+            FROM source_rows
+        ),
+        inserted_movies AS (
+            INSERT INTO movies (movie_id, title, updated_at)
+            SELECT movie_id, source_title, CURRENT_TIMESTAMP
+            FROM keyed
+            RETURNING movie_id
+        )
+        INSERT INTO movie_source_ids (
+            movie_id, source, source_movie_id, source_title,
+            match_status, match_method, match_score, matched_at
+        )
+        SELECT
+            keyed.movie_id,
+            'amc',
+            keyed.amc_movie_id,
+            keyed.source_title,
+            'provisional',
+            'amc_movie_id_backfill',
+            NULL,
+            CURRENT_TIMESTAMP
+        FROM keyed
+        JOIN inserted_movies USING (movie_id);
+
+        INSERT INTO movie_source_ids (
+            movie_id, source, source_movie_id, source_title,
+            match_status, match_method, match_score, matched_at
+        )
+        SELECT
+            movie_id,
+            'amc',
+            amc_movie_id,
+            amc_movie_name,
+            'matched',
+            'amc_exact_title_backfill',
+            0.75,
+            CURRENT_TIMESTAMP
+        FROM amc_movies
+        WHERE movie_id IS NOT NULL
+        ON CONFLICT(source, source_movie_id) DO UPDATE SET
+            movie_id = excluded.movie_id,
+            source_title = excluded.source_title,
+            match_status = excluded.match_status,
+            match_method = excluded.match_method,
+            match_score = excluded.match_score,
+            matched_at = excluded.matched_at;
+
+        UPDATE amc_movies amc
+        SET movie_id = src.movie_id
+        FROM movie_source_ids src
+        WHERE src.source = 'amc'
+          AND src.source_movie_id = amc.amc_movie_id
+          AND amc.movie_id IS DISTINCT FROM src.movie_id;
+
+        UPDATE amc_showtimes showtime
+        SET movie_id = COALESCE(amc.movie_id, src.movie_id)
+        FROM amc_movies amc
+        LEFT JOIN movie_source_ids src
+          ON src.source = 'amc'
+         AND src.source_movie_id = amc.amc_movie_id
+        WHERE amc.amc_movie_id = showtime.amc_movie_id
+          AND showtime.movie_id IS DISTINCT FROM COALESCE(amc.movie_id, src.movie_id);
+
+        UPDATE campaign_movies campaign
+        SET movie_id = COALESCE(amc.movie_id, src.movie_id)
+        FROM amc_movies amc
+        LEFT JOIN movie_source_ids src
+          ON src.source = 'amc'
+         AND src.source_movie_id = amc.amc_movie_id
+        WHERE amc.amc_movie_id = campaign.amc_movie_id
+          AND campaign.movie_id IS DISTINCT FROM COALESCE(amc.movie_id, src.movie_id);
+
+        UPDATE collection_tasks task
+        SET movie_id = COALESCE(amc.movie_id, src.movie_id)
+        FROM amc_movies amc
+        LEFT JOIN movie_source_ids src
+          ON src.source = 'amc'
+         AND src.source_movie_id = amc.amc_movie_id
+        WHERE amc.amc_movie_id = task.amc_movie_id
+          AND task.movie_id IS DISTINCT FROM COALESCE(amc.movie_id, src.movie_id);
+
+        UPDATE amc_collection_diagnostic_events event
+        SET movie_id = COALESCE(amc.movie_id, src.movie_id)
+        FROM amc_movies amc
+        LEFT JOIN movie_source_ids src
+          ON src.source = 'amc'
+         AND src.source_movie_id = amc.amc_movie_id
+        WHERE amc.amc_movie_id = event.amc_movie_id
+          AND event.movie_id IS DISTINCT FROM COALESCE(amc.movie_id, src.movie_id);
+
+        CREATE INDEX IF NOT EXISTS idx_amc_movies_movie_id
+            ON amc_movies(movie_id);
+        CREATE INDEX IF NOT EXISTS idx_amc_showtimes_movie_id_date
+            ON amc_showtimes(movie_id, exhibition_date);
+        CREATE INDEX IF NOT EXISTS idx_collection_tasks_movie_id
+            ON collection_tasks(movie_id);
         """
     )
 
