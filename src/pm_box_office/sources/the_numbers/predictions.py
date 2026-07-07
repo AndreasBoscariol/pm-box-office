@@ -37,6 +37,7 @@ DEFAULT_CACHE_DIR = Path("data/raw/the_numbers_predictions")
 DEFAULT_USER_AGENT = "pm-box-office-the-numbers-prediction-bot/1.0 (+personal research; set --user-agent contact)"
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 MIN_DELAY_SECONDS = 1.0
+DEFAULT_MIN_OCR_CONFIDENCE = 70.0
 IMAGE_EXTENSIONS = {".gif", ".jpg", ".jpeg", ".png", ".webp"}
 PREDICTION_TERMS = ("prediction", "predictions", "projection", "projections", "forecast", "forecasts")
 COMMON_DISTRIBUTORS = (
@@ -454,8 +455,11 @@ def parse_prediction_rows(image: PredictionImage, ocr: OcrResult) -> list[Predic
     lines = normalize_ocr_text(ocr.text).splitlines()
     rows: list[PredictionRow] = []
     for line in lines:
+        comparison_rows = parse_comparison_line(image, ocr, line, len(rows) + 1)
+        if comparison_rows:
+            rows.extend(comparison_rows)
+            continue
         rows.extend(parse_projection_line(image, ocr, line, len(rows) + 1))
-        rows.extend(parse_comparison_line(image, ocr, line, len(rows) + 1))
     return [finalize_prediction_row(row) for row in rows]
 
 
@@ -502,8 +506,37 @@ def parse_comparison_line(
     line: str,
     row_ordinal: int,
 ) -> list[PredictionRow]:
+    predicted_matches = list(
+        re.finditer(
+            r"\b(?P<label>Predicted\s+Fri[- ]Sun|Predicted\s+Opening|Final\s+opening\s+prediction|Predicted\s+Total)\b\s*"
+            r"(?P<value>\$[\d,]+)",
+            line,
+            re.IGNORECASE,
+        )
+    )
+    if predicted_matches:
+        rows: list[PredictionRow] = []
+        for index, predicted_match in enumerate(predicted_matches):
+            row_label = clean_text(predicted_match.group("label")).title().replace("Fri-Sun", "Fri-Sun")
+            metric = comparison_prediction_metric(row_label)
+            rows.append(
+                base_prediction_row(
+                    image,
+                    ocr,
+                    table_kind="comparison_prediction",
+                    row_ordinal=row_ordinal + index,
+                    row_label=row_label,
+                    source_movie_title=None,
+                    distributor=None,
+                    metric=metric,
+                    value_usd=parse_money(predicted_match.group("value")),
+                    predicted_usd=parse_money(predicted_match.group("value")),
+                    raw_text=line,
+                )
+            )
+        return rows
     predicted_match = re.search(
-        r"\b(?P<label>Predicted\s+Fri[- ]Sun|Predicted\s+Opening|Final\s+opening\s+prediction)\b\s*"
+        r"\b(?P<label>Previews\s+Prediction|Fundamentals\s+Prediction)\b\s*"
         r"(?P<value>\$[\d,]+)",
         line,
         re.IGNORECASE,
@@ -519,7 +552,7 @@ def parse_comparison_line(
                 row_label=row_label,
                 source_movie_title=None,
                 distributor=None,
-                metric="predicted_opening",
+                metric="opening_prediction_component",
                 value_usd=parse_money(predicted_match.group("value")),
                 predicted_usd=parse_money(predicted_match.group("value")),
                 raw_text=line,
@@ -540,7 +573,7 @@ def parse_comparison_line(
     tail = clean_text(line[money_matches[-1].end() :])
     multiplier_match = re.search(r"\b(\d+(?:\.\d+)?)\b", tail)
     if multiplier_match:
-        multiplier = float(multiplier_match.group(1))
+        multiplier = parse_multiplier(multiplier_match.group(1))
     weekend_usd = parse_money(money_matches[2].group(0)) if len(money_matches) >= 3 else None
     return [
         base_prediction_row(
@@ -569,9 +602,29 @@ def should_skip_ocr_line(line: str) -> bool:
         or lowered.startswith("movie ")
         or lowered.startswith("release date ")
         or lowered.startswith("top 10 ")
+        or lowered.startswith("medians")
         or "reported weekend box office" in lowered
         or "actual predicted" in lowered
     )
+
+
+def parse_multiplier(value: str) -> float | None:
+    multiplier = parse_float(value)
+    if multiplier is None:
+        return None
+    if "." not in value and 100 <= multiplier < 1000:
+        return multiplier / 100
+    return multiplier
+
+
+def comparison_prediction_metric(row_label: str) -> str:
+    if re.search(r"\bFri[- ]Sun\b", row_label, flags=re.IGNORECASE):
+        return "predicted_weekend"
+    if re.search(r"\btotal\b", row_label, flags=re.IGNORECASE):
+        return "predicted_total"
+    if re.search(r"\bfinal\b", row_label, flags=re.IGNORECASE):
+        return "final_opening_prediction"
+    return "predicted_opening"
 
 
 def split_title_distributor(prefix: str) -> tuple[str | None, str | None]:
@@ -708,7 +761,14 @@ def collect_prediction_image_results(args: argparse.Namespace) -> list[Predictio
             ocr = None
         else:
             ocr = ocr_engine.read(image_path)
-        parsed_rows = parse_prediction_rows(image, ocr) if ocr is not None else []
+        if (
+            ocr is not None
+            and ocr.mean_confidence is not None
+            and ocr.mean_confidence < args.min_ocr_confidence
+        ):
+            parsed_rows = []
+        else:
+            parsed_rows = parse_prediction_rows(image, ocr) if ocr is not None else []
         if parsed_rows or args.include_empty:
             results.append(
                 PredictionImageResult(
@@ -1286,10 +1346,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tesseract-command", default="tesseract")
     parser.add_argument("--tesseract-psm", type=int, default=6)
     parser.add_argument("--tesseract-language", default="eng")
+    parser.add_argument("--min-ocr-confidence", type=float, default=DEFAULT_MIN_OCR_CONFIDENCE)
     parser.add_argument("--include-empty", action="store_true", help="Process images even when OCR yields no rows.")
     parser.add_argument("--include-raw-ocr", action="store_true")
     parser.add_argument("--format", choices=("csv", "json"), default="csv")
-    parser.add_argument("--output", default="-")
+    parser.add_argument("--output", help="Write parsed rows to CSV/JSON instead of importing to PostgreSQL. Use - for stdout.")
     parser.add_argument("--dry-run", action="store_true", help="Parse but do not write database changes.")
     return parser
 
@@ -1297,9 +1358,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     if args.list_images:
+        if args.output is None:
+            args.output = "-"
         write_images(collect_prediction_images(args), args)
         return 0
-    if args.database_url:
+    if args.output is None:
         article_count, image_count, row_count = import_prediction_results_from_args(args)
         action = "Would import" if args.dry_run else "Imported"
         print(

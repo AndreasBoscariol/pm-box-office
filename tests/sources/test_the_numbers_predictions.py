@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 import tempfile
+from unittest import mock
 
 from pm_box_office.sources.the_numbers import predictions
 from tests.postgres_test_utils import drop_isolated_postgres_schema, make_isolated_postgres_schema
@@ -57,7 +58,26 @@ Final opening prediction $54,000,000
 """
 
 
+BASELINE_PREDICTION_OCR = """
+Masters of the Universe
+Released: June 5, 2026
+Comparable Opening Weekends
+Predicted Opening $41,089,759 Predicted Total $99,478,550
+Previews Prediction $35,293,420
+Fundamentals Prediction $41,089,759
+Final opening prediction $36,452,688
+"""
+
+
 class TheNumbersPredictionTests(unittest.TestCase):
+    def test_main_imports_to_default_database_when_no_output_is_requested(self) -> None:
+        with mock.patch.object(predictions, "import_prediction_results_from_args", return_value=(1, 1, 3)) as importer:
+            exit_code = predictions.main(["--dry-run"])
+
+        self.assertEqual(0, exit_code)
+        importer.assert_called_once()
+        self.assertIsNone(importer.call_args.args[0].output)
+
     def test_discovers_news_prediction_images_only(self) -> None:
         images = predictions.discover_prediction_images(
             NEWS_HTML,
@@ -118,17 +138,41 @@ class TheNumbersPredictionTests(unittest.TestCase):
         jurassic = [row for row in rows if row.source_movie_title == "Jurassic World Rebirth"][0]
 
         self.assertEqual("comparison_prediction", summary.table_kind)
-        self.assertEqual("predicted_opening", summary.metric)
+        self.assertEqual("predicted_weekend", summary.metric)
         self.assertEqual(52095281, summary.predicted_usd)
+        self.assertEqual("predicted_opening", predicted_opening.metric)
         self.assertEqual(53000000, predicted_opening.predicted_usd)
+        self.assertEqual("final_opening_prediction", final_prediction.metric)
         self.assertEqual(54000000, final_prediction.predicted_usd)
         self.assertEqual("opening_comparison", jurassic.table_kind)
         self.assertEqual("2025-07-02", jurassic.release_date)
         self.assertEqual(30503855, jurassic.actual_usd)
         self.assertEqual(92016065, jurassic.weekend_usd)
         self.assertEqual(1.65, jurassic.multiplier)
-        self.assertEqual("opening_comparison:4", jurassic.source_row_key)
+        self.assertEqual("opening_comparison:2", jurassic.source_row_key)
         self.assertEqual("jurassic world rebirth", jurassic.normalized_movie_title)
+
+    def test_parses_baseline_opening_and_total_predictions_as_separate_metrics(self) -> None:
+        image = predictions.discover_prediction_images(
+            NEWS_HTML,
+            page_url="https://www.the-numbers.com/news/",
+        )[1]
+
+        rows = predictions.parse_prediction_rows(
+            image,
+            predictions.ocr_result_from_text(BASELINE_PREDICTION_OCR),
+        )
+
+        rows_by_label = {row.row_label: row for row in rows}
+
+        self.assertNotIn("weekend_projection", {row.table_kind for row in rows})
+        self.assertEqual("predicted_opening", rows_by_label["Predicted Opening"].metric)
+        self.assertEqual(41089759, rows_by_label["Predicted Opening"].predicted_usd)
+        self.assertEqual("predicted_total", rows_by_label["Predicted Total"].metric)
+        self.assertEqual(99478550, rows_by_label["Predicted Total"].predicted_usd)
+        self.assertEqual("opening_prediction_component", rows_by_label["Previews Prediction"].metric)
+        self.assertEqual("opening_prediction_component", rows_by_label["Fundamentals Prediction"].metric)
+        self.assertEqual("final_opening_prediction", rows_by_label["Final Opening Prediction"].metric)
 
 
 class TheNumbersPredictionDatabaseTests(unittest.TestCase):
