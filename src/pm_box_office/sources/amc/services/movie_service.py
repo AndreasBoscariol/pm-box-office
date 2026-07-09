@@ -9,7 +9,7 @@ from pm_box_office.sources.amc import db
 from pm_box_office.sources.amc.services import sample_service
 
 
-DEFAULT_SEAT_TARGET_OFFSETS_MINUTES = (-15,)
+DEFAULT_SEAT_TARGET_OFFSETS_MINUTES = (10,)
 
 
 def list_movies_for_date(

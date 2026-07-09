@@ -12,9 +12,10 @@ import uuid
 from pm_box_office.config import REPO_ROOT
 from pm_box_office.db.connection import connect_database, database_url_from_env
 from pm_box_office.orchestration import repository
-from pm_box_office.orchestration.registry import RUN_ALL_SOURCE_KEYS
+from pm_box_office.orchestration.registry import BOX_OFFICE_PREDICTION_SOURCE_KEYS, RUN_ALL_SOURCE_KEYS
 
 
+ESTIMATE_RUN_ALL_LOOKBACK_DAYS = 7
 THE_NUMBERS_AUTORUN_LOOKBACK_DAYS = 7
 THE_NUMBERS_AUTORUN_PUBLISH_LAG_DAYS = 1
 THE_NUMBERS_AUTORUN_REFRESH_DAYS = 2
@@ -31,7 +32,9 @@ def start_source_run(
     try:
         repository.initialize_orchestration_database(conn)
         repository.seed_sources(conn)
-        run_id = repository.create_run(conn, source_key=source_key, trigger=trigger, extra_args=extra_args)
+        repository.fail_stale_queued_runs(conn, source_key=source_key)
+        resolved_extra_args = extra_args if extra_args is not None else autorun_extra_args(source_key, trigger=trigger)
+        run_id = repository.create_run(conn, source_key=source_key, trigger=trigger, extra_args=resolved_extra_args)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -118,6 +121,8 @@ def start_run_all(
 
 
 def autorun_extra_args(source_key: str, *, trigger: str, today: dt.date | None = None) -> list[str]:
+    if source_key in BOX_OFFICE_PREDICTION_SOURCE_KEYS:
+        return rolling_week_args(today=today)
     if trigger != "auto_daily" or source_key != "the_numbers":
         return []
     run_date = today or dt.date.today()
@@ -131,6 +136,12 @@ def autorun_extra_args(source_key: str, *, trigger: str, today: dt.date | None =
         "--refresh-recent-days",
         str(THE_NUMBERS_AUTORUN_REFRESH_DAYS),
     ]
+
+
+def rolling_week_args(*, today: dt.date | None = None) -> list[str]:
+    run_date = today or dt.date.today()
+    start_date = run_date - dt.timedelta(days=ESTIMATE_RUN_ALL_LOOKBACK_DAYS - 1)
+    return ["--start-date", start_date.isoformat(), "--end-date", run_date.isoformat(), "--refresh"]
 
 
 def cancel_run(run_id: str | uuid.UUID, *, database_url: str | None = None) -> None:

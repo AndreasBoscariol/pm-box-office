@@ -1,0 +1,70 @@
+{
+  "amc": {
+    "live_plugin_nowcasts_path": null,
+    "origins": [
+      "10:00",
+      "12:00",
+      "14:00",
+      "16:00",
+      "18:00",
+      "20:00",
+      "EOD"
+    ]
+  },
+  "composition": {
+    "fallback_daily_sigma_log": 0.45,
+    "fallback_to_independent_components": true,
+    "interval_levels": [
+      80,
+      95
+    ],
+    "n_sim": 50000,
+    "use_daily_error_covariance": false
+  },
+  "created_at_utc": "2026-07-09T03:50:04Z",
+  "daily_baseline": {
+    "baseline_path": "daily_regime_baseline_forecasts.csv"
+  },
+  "model_version": "boxoffice_local_002",
+  "pre_release": {
+    "interval_policy": {
+      "default_sigma_log": 0.4185025056389084,
+      "levels": [
+        80,
+        95
+      ],
+      "method": "selected_interval_panel_with_sigma_fallback",
+      "sigma_log_by_origin_day": {
+        "-1": 0.2783841069759018,
+        "-10": 0.4185025056389084,
+        "-11": 0.4185025056389084,
+        "-12": 0.4185025056389084,
+        "-13": 0.4185025056389084,
+        "-14": 0.4185025056389084,
+        "-2": 0.4417719808338169,
+        "-3": 0.4185025056389081,
+        "-4": 0.4185025056389083,
+        "-5": 0.4185025056389083,
+        "-6": 0.4185025056389083,
+        "-7": 0.4185025056389083,
+        "-8": 0.41850250563890834,
+        "-9": 0.4185025056389084
+      }
+    },
+    "interval_policy_path": "pre_release_interval_policy.json",
+    "panel_path": "pre_release_panel.csv",
+    "point_policy": {
+      "by_origin_day": {
+        "-1": "recency_weighted_log_consensus_lambda_1_usd"
+      },
+      "default": "dollar_median_consensus_usd",
+      "excluded_sources": [
+        "the_numbers_predictions",
+        "boxofficeguru"
+      ],
+      "promotion_rule": "training scripts decide policies; production scripts apply policies"
+    },
+    "point_policy_path": "pre_release_point_policy.json"
+  },
+  "training_data_cutoff_utc": "2026-07-09T03:50:04Z"
+}

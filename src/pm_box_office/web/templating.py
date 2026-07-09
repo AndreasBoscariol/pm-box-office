@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi.templating import Jinja2Templates
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from pm_box_office.web.services import forecasts
 from pm_box_office.web.time_format import duration_until, local_clock_time, local_short_datetime, time_ago
 
 
@@ -19,6 +20,11 @@ templates = Jinja2Templates(
     )
 )
 templates.env.filters["duration_until"] = duration_until
+templates.env.filters["forecast_interval"] = forecasts.interval_label
+templates.env.filters["forecast_percent"] = forecasts.percent
+templates.env.filters["forecast_signed"] = forecasts.signed_number
+templates.env.filters["forecast_usd"] = forecasts.compact_usd
+templates.env.filters["forecast_date_value"] = forecasts.date_value
 templates.env.filters["local_short_datetime"] = local_short_datetime
 templates.env.filters["local_time"] = local_clock_time
 templates.env.filters["time_ago"] = time_ago

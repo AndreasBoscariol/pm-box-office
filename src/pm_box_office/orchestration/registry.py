@@ -9,6 +9,7 @@ BOX_OFFICE_PREDICTION_SOURCE_KEYS = (
     "boxofficepro",
     "boxofficereport",
     "boxofficetheory",
+    "boxofficetheory_substack",
     "boxofficeguru",
 )
 
@@ -51,6 +52,11 @@ SOURCE_DEFINITIONS: tuple[SourceDefinition, ...] = (
         source_key="boxofficetheory",
         display_name="Box Office Theory Predictions",
         command="pm_box_office.sources.boxofficetheory.ingest",
+    ),
+    SourceDefinition(
+        source_key="boxofficetheory_substack",
+        display_name="Box Office Theory Substack Predictions",
+        command="pm_box_office.sources.boxofficetheory_substack.ingest",
     ),
     SourceDefinition(
         source_key="boxofficeguru",

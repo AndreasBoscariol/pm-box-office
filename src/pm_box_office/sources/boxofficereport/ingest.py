@@ -22,6 +22,7 @@ from pm_box_office.db.connection import connect_database, database_url_from_env
 from pm_box_office.domain import movies as movie_identity
 from pm_box_office.sources.common.cli import parse_date_arg
 from pm_box_office.sources.common.parsing import clean_text
+from pm_box_office.sources.common.schema import acquire_schema_init_lock
 
 
 BASE_URL = "http://www.boxofficereport.com"
@@ -710,6 +711,7 @@ def boxofficereport_source_movie_id(
 
 
 def initialize_database(conn: Any) -> None:
+    acquire_schema_init_lock(conn)
     movie_identity.ensure_movie_identity_schema(conn)
     conn.executescript(
         """

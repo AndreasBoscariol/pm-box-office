@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block title %}Forecasts{% endblock %}
+{% block content %}
+      <header class="topbar">
+        <div>
+          <h1>Forecasts</h1>
+          <span class="subtle">Stored movie opening-weekend forecast timelines</span>
+        </div>
+        <div class="actions">
+          <a class="button-link" href="/sources">Pull data</a>
+          <a class="button-link" href="/amc">AMC Campaigns</a>
+        </div>
+      </header>
+
+      {% if not tables_ready %}
+      <div class="notice">
+        Forecast tables are not available yet. Run the production forecast timeline backfill before using this page.
+      </div>
+      {% endif %}
+
+      <section class="status-strip" aria-label="Forecast status">
+        <div>
+          <span class="label">Movies</span>
+          <strong>{{ summary.movie_count }}</strong>
+          <small>with stored forecasts</small>
+        </div>
+        <div>
+          <span class="label">Model</span>
+          <strong>{{ summary.latest_model_version or "-" }}</strong>
+          <small>{{ model_versions|length }} versions</small>
+        </div>
+        <div>
+          <span class="label">Latest run</span>
+          <strong>{{ summary.latest_run_time|time_ago }}</strong>
+          <small>{{ summary.latest_run_time|local_short_datetime }}</small>
+        </div>
+        <div>
+          <span class="label">Rows</span>
+          <strong>{{ summary.row_count }}</strong>
+          <small>{{ summary.backtest_rows }} backtest · {{ summary.live_rows }} live</small>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head compact-head">
+          <h1>Movie Lookup</h1>
+          <span>{{ rows|length }} shown</span>
+        </div>
+        <form class="toolbar forecast-toolbar" method="get" action="/forecasts">
+          <input
+            type="search"
+            name="q"
+            placeholder="Search movies"
+            aria-label="Search movies"
+            value="{{ filters.q }}"
+          >
+          <input class="date-input" type="date" name="release_start" aria-label="Release start" value="{{ filters.release_start }}">
+          <input class="date-input" type="date" name="release_end" aria-label="Release end" value="{{ filters.release_end }}">
+          <select name="model_version" aria-label="Model version">
+            {% for version in model_versions %}
+            <option value="{{ version }}" {% if version == filters.model_version %}selected{% endif %}>{{ version }}</option>
+            {% endfor %}
+            {% if not model_versions %}
+            <option value="">No model versions</option>
+            {% endif %}
+          </select>
+          <select name="target" aria-label="Target">
+            {% for target in ["opening_weekend", "friday", "saturday", "sunday", "remaining_weekend"] %}
+            <option value="{{ target }}" {% if target == filters.target %}selected{% endif %}>{{ target|replace("_", " ") }}</option>
+            {% endfor %}
+          </select>
+          <button type="submit">Filter</button>
+          <a class="button-link shaded-link" href="/forecasts">Reset</a>
+        </form>
+
+        <div class="table forecast-table forecast-dashboard-table">
+          <div class="forecast-row forecast-dashboard-row head">
+            <span>Movie</span>
+            <span>Weekend</span>
+            <span>Origin</span>
+            <span>Point</span>
+            <span>80% PI</span>
+            <span>95% PI</span>
+            <span>Actual</span>
+            <span>Error</span>
+            <span>Source</span>
+            <span>Quality</span>
+          </div>
+          {% for row in rows %}
+          <div class="forecast-row forecast-dashboard-row">
+            <span>
+              <a href="/forecasts/{{ row.release_run_id }}?model_version={{ row.model_version }}">{{ row.title }}</a>
+              <small><code>{{ row.release_run_id }}</code></small>
+            </span>
+            <span>{{ row.opening_weekend_start|forecast_date_value }}</span>
+            <span>
+              <strong>{{ row.origin_key }}</strong>
+              <small>{{ row.as_of_utc|local_short_datetime }}</small>
+            </span>
+            <span>{{ row.point_usd|forecast_usd }}</span>
+            <span>{{ row.lo80_usd|forecast_interval(row.hi80_usd) }}</span>
+            <span>{{ row.lo95_usd|forecast_interval(row.hi95_usd) }}</span>
+            <span>{{ row.actual_usd|forecast_usd }}</span>
+            <span>
+              {{ row.log_error|forecast_signed }}
+              <small>{{ row.abs_pct_error|forecast_percent }}</small>
+            </span>
+            <span><span class="status-pill source-{{ (row.component_source or 'unknown')|lower|replace('_', '-') }}">{{ row.component_source or "-" }}</span></span>
+            <span>{{ row.feature_quality_bucket or "-" }}</span>
+          </div>
+          {% else %}
+          <div class="empty-row">No stored forecasts match these filters.</div>
+          {% endfor %}
+        </div>
+      </section>
+{% endblock %}

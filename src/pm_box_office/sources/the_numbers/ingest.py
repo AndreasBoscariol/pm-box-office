@@ -27,6 +27,7 @@ from pm_box_office.db.connection import connect_database, insert_ignore_sql
 from pm_box_office.sources.common.cli import add_cache_args, add_database_arg, parse_date_arg
 from pm_box_office.sources.common.fetch import CacheFirstFetcher
 from pm_box_office.sources.common.parsing import clean_text, parse_int, parse_money
+from pm_box_office.sources.common.schema import acquire_schema_init_lock
 
 
 BASE_URL = "https://www.the-numbers.com"
@@ -429,6 +430,7 @@ def parse_opusdata_id(html: str) -> str | None:
 
 
 def initialize_database(conn: Any) -> None:
+    acquire_schema_init_lock(conn)
     movie_identity.ensure_movie_identity_schema(conn)
     conn.executescript(
         """

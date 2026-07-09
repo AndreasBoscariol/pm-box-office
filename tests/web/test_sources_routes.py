@@ -49,6 +49,15 @@ class SourceRouteTests(unittest.TestCase):
         self.assertIn("Started%20the_numbers", response.headers["location"])
         start_source_run.assert_called_once_with("the_numbers", trigger="manual")
 
+    def test_run_substack_source_uses_standard_manual_ui_runner_path(self) -> None:
+        run_id = uuid.uuid4()
+        with patch.object(sources.runner, "start_source_run", return_value=run_id) as start_source_run:
+            response = sources.run_source("boxofficetheory_substack")
+
+        self.assertEqual(303, response.status_code)
+        self.assertIn("Started%20boxofficetheory_substack", response.headers["location"])
+        start_source_run.assert_called_once_with("boxofficetheory_substack", trigger="manual")
+
     def test_run_source_redirects_with_orchestration_error(self) -> None:
         with patch.object(
             sources.runner,

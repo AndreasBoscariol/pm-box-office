@@ -387,7 +387,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="target_offsets_minutes",
         type=parse_offsets,
         default=movie_service.DEFAULT_SEAT_TARGET_OFFSETS_MINUTES,
-        help="Comma-separated smoothing window minutes before showtime. Default: 20,19,...,1.",
+        help="Comma-separated target minutes before showtime. Default: 10.",
     )
     seat_run.add_argument(
         "--sample-key",

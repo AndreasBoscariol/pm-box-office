@@ -14,6 +14,8 @@ from pm_box_office.orchestration.registry import SOURCE_DEFINITIONS, SourceDefin
 ACTIVE_STATUSES = ("queued", "running")
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled")
 DAILY_RUN_ALL_SCHEDULE_KEY = "daily_run_all"
+STALE_QUEUED_GRACE_MINUTES = 5
+ORCHESTRATION_SCHEMA_LOCK_KEY = "pm_box_office_orchestration_schema"
 NEXT_11PM_SQL = """
 CASE
     WHEN CURRENT_DATE + TIME '23:00' > CURRENT_TIMESTAMP
@@ -59,6 +61,7 @@ class SourceRecord:
 
 
 def initialize_orchestration_database(conn: Any) -> None:
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (ORCHESTRATION_SCHEMA_LOCK_KEY,))
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS ingest_sources (
@@ -206,6 +209,7 @@ def create_run(
     extra_args: Iterable[str] | None = None,
 ) -> uuid.UUID:
     conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"ingest_source:{source_key}",))
+    fail_stale_queued_runs(conn, source_key=source_key)
     source = get_source(conn, source_key)
     if not source.enabled:
         raise SourceDisabledError(f"{source.display_name} is disabled")
@@ -236,6 +240,38 @@ def create_run(
         (str(run_id), source_key, trigger, source.command, json.dumps(args)),
     )
     return run_id
+
+
+def fail_stale_queued_runs(
+    conn: Any,
+    *,
+    source_key: str | None = None,
+    grace_minutes: int = STALE_QUEUED_GRACE_MINUTES,
+) -> int:
+    source_filter = "AND source_key = %s" if source_key is not None else ""
+    params: tuple[Any, ...] = (source_key, grace_minutes) if source_key is not None else (grace_minutes,)
+    row = conn.execute(
+        f"""
+        WITH stale AS (
+            UPDATE ingest_runs
+            SET status = 'failed',
+                finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP),
+                heartbeat_at = CURRENT_TIMESTAMP,
+                error_summary = COALESCE(
+                    error_summary,
+                    'Run stayed queued past supervisor startup grace period'
+                )
+            WHERE status = 'queued'
+              {source_filter}
+              AND COALESCE(heartbeat_at, requested_at)
+                    < CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
+            RETURNING run_id
+        )
+        SELECT COUNT(*) FROM stale
+        """,
+        params,
+    ).fetchone()
+    return int(row[0] if row else 0)
 
 
 def get_autorun_state(conn: Any, *, schedule_key: str = DAILY_RUN_ALL_SCHEDULE_KEY) -> dict[str, Any]:

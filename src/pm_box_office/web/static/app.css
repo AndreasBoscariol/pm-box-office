@@ -665,6 +665,251 @@ dd {
   color: #34434d;
 }
 
+.forecast-toolbar {
+  align-items: center;
+}
+
+.forecast-toolbar .date-input {
+  min-height: 36px;
+  border: 1px solid #aeb8bf;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #182026;
+  padding: 0 10px;
+}
+
+.forecast-table {
+  overflow-x: auto;
+}
+
+.forecast-row {
+  display: grid;
+  align-items: center;
+  gap: 10px;
+  min-width: 1180px;
+  min-height: 42px;
+  padding: 0 12px;
+  border-top: 1px solid #edf1f3;
+}
+
+.forecast-row:first-child {
+  border-top: 0;
+}
+
+.forecast-row.head {
+  color: #5d6b75;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  background: #f1f4f6;
+}
+
+.forecast-row span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.forecast-row small {
+  display: block;
+  margin-top: 2px;
+  color: #6d7a83;
+  font-size: 12px;
+}
+
+.forecast-dashboard-row {
+  grid-template-columns:
+    minmax(210px, 1.5fr) 100px 108px 90px 128px 128px 90px 90px 128px 110px;
+}
+
+.forecast-timeline-row {
+  grid-template-columns:
+    100px 100px 90px 128px 128px 112px 112px 112px 90px 110px 110px;
+}
+
+.forecast-component-row {
+  min-width: 1080px;
+  grid-template-columns: 84px 120px 92px 76px 128px 128px minmax(150px, 1fr) 120px minmax(140px, 1fr);
+}
+
+.forecast-chart-card {
+  border: 1px solid #d5dde2;
+  border-radius: 8px;
+  background: #ffffff;
+  overflow-x: auto;
+}
+
+.forecast-chart {
+  display: block;
+  min-width: 960px;
+  width: 100%;
+  height: auto;
+}
+
+.forecast-chart rect {
+  fill: #ffffff;
+}
+
+.forecast-chart .grid-line {
+  stroke: #e4eaee;
+  stroke-width: 1;
+}
+
+.forecast-chart .regime-line {
+  stroke: #d4dde3;
+  stroke-dasharray: 4 4;
+  stroke-width: 1;
+}
+
+.forecast-chart .axis-label {
+  fill: #5d6b75;
+  font-size: 12px;
+}
+
+.forecast-chart .regime-label {
+  font-weight: 700;
+}
+
+.forecast-chart .interval-band {
+  stroke: none;
+}
+
+.forecast-chart .band-95 {
+  fill: rgba(47, 95, 131, 0.14);
+}
+
+.forecast-chart .band-80 {
+  fill: rgba(36, 122, 85, 0.18);
+}
+
+.forecast-chart .point-line {
+  fill: none;
+  stroke: #182026;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  stroke-width: 2.5;
+}
+
+.forecast-chart .point-dot {
+  fill: #ffffff;
+  stroke: #182026;
+  stroke-width: 2;
+}
+
+.forecast-chart .actual-line {
+  stroke: #8c2727;
+  stroke-dasharray: 5 4;
+  stroke-width: 2;
+}
+
+.forecast-chart .actual-label {
+  fill: #8c2727;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.forecast-chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  padding: 0 14px 12px;
+  color: #5d6b75;
+  font-size: 12px;
+}
+
+.forecast-chart-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-swatch {
+  display: inline-block;
+  width: 18px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+.legend-swatch.point {
+  height: 3px;
+  background: #182026;
+}
+
+.legend-swatch.band80 {
+  background: rgba(36, 122, 85, 0.28);
+}
+
+.legend-swatch.band95 {
+  background: rgba(47, 95, 131, 0.22);
+}
+
+.legend-swatch.actual {
+  height: 3px;
+  background: #8c2727;
+}
+
+.forecast-components-detail {
+  margin-top: 12px;
+}
+
+.forecast-components {
+  margin: 0;
+  border-width: 1px 0 0;
+  border-radius: 0;
+}
+
+.forecast-components .forecast-component-table {
+  border-width: 1px 0 0;
+  border-radius: 0;
+}
+
+.forecast-timeline-row.regime-pre_release {
+  background: #ffffff;
+}
+
+.forecast-timeline-row.regime-live_friday {
+  background: #fbfcf5;
+}
+
+.forecast-timeline-row.regime-live_saturday {
+  background: #f7fbff;
+}
+
+.forecast-timeline-row.regime-live_sunday {
+  background: #fbf8ff;
+}
+
+.forecast-timeline-row.pending {
+  color: #6d7a83;
+  background: #f7f9fa;
+}
+
+.source-consensus,
+.source-daily-baseline,
+.source-baseline {
+  border-color: #c8d1d7;
+  background: #f3f5f6;
+  color: #41515c;
+}
+
+.source-amc-nowcast,
+.source-amc-plugin {
+  border-color: #9eb7ca;
+  background: #edf5fb;
+  color: #2d5f83;
+}
+
+.source-actual {
+  border-color: #9fc7b5;
+  background: #eef7f2;
+  color: #1f6549;
+}
+
+.source-fallback {
+  border-color: #dbc18c;
+  background: #fff7df;
+  color: #795d18;
+}
+
 .log-tail {
   max-height: 260px;
   overflow: auto;
@@ -754,6 +999,12 @@ dd {
   .toolbar,
   .toolbar form,
   .toolbar input[type="search"] {
+    width: 100%;
+  }
+
+  .forecast-toolbar select,
+  .forecast-toolbar .date-input,
+  .forecast-toolbar .button-link {
     width: 100%;
   }
 

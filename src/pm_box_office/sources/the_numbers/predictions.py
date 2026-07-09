@@ -29,6 +29,7 @@ from pm_box_office.domain import movies as movie_identity
 from pm_box_office.sources.common.cli import add_database_arg
 from pm_box_office.sources.common.fetch import CacheFirstFetcher
 from pm_box_office.sources.common.parsing import clean_text, parse_money
+from pm_box_office.sources.common.schema import acquire_schema_init_lock
 
 
 BASE_URL = "https://www.the-numbers.com"
@@ -879,6 +880,7 @@ def write_rows(rows: list[PredictionRow], args: argparse.Namespace) -> None:
 
 
 def initialize_database(conn: Any) -> None:
+    acquire_schema_init_lock(conn)
     movie_identity.ensure_movie_identity_schema(conn)
     conn.executescript(
         """

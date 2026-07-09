@@ -4,6 +4,12 @@ import tomllib
 import unittest
 from pathlib import Path
 
+from pm_box_office.sources.boxofficeguru import ingest as boxofficeguru_ingest
+from pm_box_office.sources.boxofficepro import ingest as boxofficepro_ingest
+from pm_box_office.sources.boxofficereport import ingest as boxofficereport_ingest
+from pm_box_office.sources.boxofficetheory import ingest as boxofficetheory_ingest
+from pm_box_office.sources.boxofficetheory_substack import ingest as boxofficetheory_substack_ingest
+from pm_box_office.sources.the_numbers import ingest as the_numbers_ingest
 from pm_box_office.orchestration import repository
 from pm_box_office.orchestration.registry import (
     BOX_OFFICE_PREDICTION_SOURCE_KEYS,
@@ -47,6 +53,23 @@ def test_box_office_prediction_ingests_are_registered_for_web_without_database()
         assert source_key in RUN_ALL_SOURCE_KEYS
 
 
+def test_run_all_source_schema_initializers_take_advisory_lock_before_movie_schema_without_database() -> None:
+    modules = [
+        the_numbers_ingest,
+        boxofficepro_ingest,
+        boxofficereport_ingest,
+        boxofficetheory_ingest,
+        boxofficetheory_substack_ingest,
+        boxofficeguru_ingest,
+    ]
+
+    for module in modules:
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        lock_index = source.index("acquire_schema_init_lock(conn)")
+        movie_schema_index = source.index("movie_identity.ensure_movie_identity_schema(conn)")
+        assert lock_index < movie_schema_index
+
+
 class OrchestrationRepositoryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.conn, self.schema = make_isolated_postgres_schema()
@@ -68,6 +91,33 @@ class OrchestrationRepositoryTests(unittest.TestCase):
             (str(run_id),),
         ).fetchone()
         self.assertEqual(("the_numbers", "queued"), tuple(row))
+
+    def test_create_run_fails_stale_queued_runs_before_concurrency_check(self) -> None:
+        stale_run_id = repository.create_run(self.conn, source_key="the_numbers", trigger="manual")
+        self.conn.execute(
+            """
+            UPDATE ingest_runs
+            SET requested_at = CURRENT_TIMESTAMP - INTERVAL '10 minutes',
+                heartbeat_at = NULL
+            WHERE run_id = %s
+            """,
+            (str(stale_run_id),),
+        )
+
+        new_run_id = repository.create_run(self.conn, source_key="the_numbers", trigger="manual")
+
+        rows = self.conn.execute(
+            """
+            SELECT run_id, status, error_summary
+            FROM ingest_runs
+            ORDER BY requested_at
+            """
+        ).fetchall()
+        self.assertEqual(str(stale_run_id), str(rows[0][0]))
+        self.assertEqual("failed", rows[0][1])
+        self.assertIn("queued past supervisor startup", rows[0][2])
+        self.assertEqual(str(new_run_id), str(rows[1][0]))
+        self.assertEqual("queued", rows[1][1])
 
     def test_movie_dependent_sources_require_movies(self) -> None:
         with self.assertRaises(repository.SourceDependencyError):
@@ -111,6 +161,26 @@ class OrchestrationRepositoryTests(unittest.TestCase):
             tuple(row),
         )
         self.assertNotIn("the_numbers_predictions", RUN_ALL_SOURCE_KEYS)
+
+    def test_seed_sources_registers_boxofficetheory_substack_for_web_runs(self) -> None:
+        row = self.conn.execute(
+            """
+            SELECT display_name, command, enabled, requires_movies
+            FROM ingest_sources
+            WHERE source_key = 'boxofficetheory_substack'
+            """
+        ).fetchone()
+
+        self.assertEqual(
+            (
+                "Box Office Theory Substack Predictions",
+                "pm_box_office.sources.boxofficetheory_substack.ingest",
+                True,
+                False,
+            ),
+            tuple(row),
+        )
+        self.assertIn("boxofficetheory_substack", RUN_ALL_SOURCE_KEYS)
 
     def test_autorun_state_tracks_next_daily_run(self) -> None:
         state = repository.get_autorun_state(self.conn)

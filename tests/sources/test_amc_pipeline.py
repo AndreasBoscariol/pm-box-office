@@ -833,6 +833,52 @@ class AmcPipelinePostgresTests(unittest.TestCase):
         self.assertEqual(3, movies[0].sampled_showtime_count)
         self.assertEqual(3, movies[0].sampled_theatre_count)
 
+    def test_default_theatre_sample_uses_top_hybrid_universe_order(self) -> None:
+        theatres = [
+            AmcTheatre(
+                amc_theatre_id=2000 + index,
+                slug=f"amc-top-hybrid-{index}",
+                theatre_url=f"https://www.amctheatres.com/movie-theatres/test/amc-top-hybrid-{index}",
+                name=name,
+                address_line1="1 Sample Way",
+                city="Sample",
+                state=state,
+                postal_code=f"{index:05d}",
+                latitude=None,
+                longitude=None,
+                timezone="America/New_York",
+                inferred_screen_count=10,
+            )
+            for index, (name, state) in enumerate(sample_service.TOP_HYBRID_THEATRES, start=1)
+        ]
+        extra_theatre = AmcTheatre(
+            amc_theatre_id=2999,
+            slug="amc-extra-24",
+            theatre_url="https://www.amctheatres.com/movie-theatres/test/amc-extra-24",
+            name="AMC Extra 24",
+            address_line1="1 Sample Way",
+            city="Sample",
+            state="CA",
+            postal_code="99999",
+            latitude=None,
+            longitude=None,
+            timezone="America/Los_Angeles",
+            inferred_screen_count=24,
+        )
+        db.upsert_theatres(self.conn, [*theatres, extra_theatre])
+
+        sample_set = sample_service.ensure_default_theatre_sample(self.conn)
+        members = db.select_theatre_sample_members(self.conn, sample_set.sample_set_id)
+
+        self.assertEqual("top_hybrid_30", sample_set.sample_key)
+        self.assertEqual(30, sample_set.sample_size)
+        self.assertEqual(30, len(members))
+        self.assertEqual(
+            [theatre.amc_theatre_id for theatre in theatres],
+            [member.amc_theatre_id for member in members],
+        )
+        self.assertNotIn(extra_theatre.amc_theatre_id, {member.amc_theatre_id for member in members})
+
     def test_seat_collection_run_uses_saved_theatre_sample(self) -> None:
         theatres = [
             synthetic_theatre(index, state="CA", timezone="America/Los_Angeles", screens=10 + index)
@@ -955,7 +1001,7 @@ class AmcPipelinePostgresTests(unittest.TestCase):
         self.assertTrue(all("Reserved Seating" in row[0] for row in task_rows))
         self.assertTrue(all(1 <= int(row[1]) <= 20 for row in task_rows))
         self.assertTrue(all(row[2] is None for row in task_rows))
-        self.assertTrue(all(int(row[3]) == -15 for row in task_rows))
+        self.assertTrue(all(int(row[3]) == 10 for row in task_rows))
 
     def test_reset_collection_state_preserves_sample_and_inventory(self) -> None:
         theatres = [

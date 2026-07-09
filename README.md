@@ -62,6 +62,14 @@ Boxoffice Pro:
 .venv/bin/python -m pm_box_office.sources.boxofficepro.ingest --start-date 2026-06-01 --end-date 2026-06-30
 ```
 
+Box Office Theory Substack:
+
+```sh
+.venv/bin/python -m pm_box_office.sources.boxofficetheory_substack.ingest --dry-run
+.venv/bin/python -m pm_box_office.sources.boxofficetheory_substack.ingest --start-date 2026-06-01 --end-date 2026-06-30
+.venv/bin/python -m pm_box_office.sources.boxofficetheory_substack.ingest --full-refresh
+```
+
 Audience snapshots:
 
 ```sh
