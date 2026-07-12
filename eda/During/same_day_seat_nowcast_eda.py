@@ -177,7 +177,7 @@ def fetch_schedule(conn: Any) -> pd.DataFrame:
             SELECT sample_set_id
             FROM amc_theatre_sample_sets
             WHERE status = 'active'
-            ORDER BY sample_key
+            ORDER BY (sample_key = 'top_hybrid_30') DESC, sample_key
             LIMIT 1
         ),
         sample_weights AS (
@@ -223,7 +223,7 @@ def fetch_snapshots(conn: Any) -> pd.DataFrame:
             SELECT sample_set_id
             FROM amc_theatre_sample_sets
             WHERE status = 'active'
-            ORDER BY sample_key
+            ORDER BY (sample_key = 'top_hybrid_30') DESC, sample_key
             LIMIT 1
         ),
         sample_weights AS (

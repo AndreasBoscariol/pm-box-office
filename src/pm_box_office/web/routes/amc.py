@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 from pathlib import Path
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from pm_box_office.config import REPO_ROOT
 from pm_box_office.db.connection import connect_database
@@ -14,12 +15,13 @@ from pm_box_office.sources.amc import db
 from pm_box_office.sources.amc.client import HtmlFetcher
 from pm_box_office.sources.amc.services import movie_service, sample_service, showtime_service, theatre_service
 from pm_box_office.web.db_init import ensure_initialized
-from pm_box_office.web.services import amc_workers
+from pm_box_office.web.services import amc_workers, forecast_workers
 from pm_box_office.web.templating import templates
 
 
 router = APIRouter()
 AMC_DISMISSED_RUNS_PATH = REPO_ROOT / "data" / "run" / "amc_dashboard_dismissed_runs.json"
+logger = logging.getLogger(__name__)
 
 
 @router.get("/amc")
@@ -92,8 +94,12 @@ def campaign(request: Request, date_value: str) -> object:
         conn.close()
     backoff_summary = amc_workers.recent_backoff_summary()
     autoscale_target = amc_workers.autoscaled_worker_target(queue_health, backoff_summary=backoff_summary)
-    amc_workers.ensure_local_workers_started(target_count=autoscale_target)
+    try:
+        amc_workers.ensure_local_workers_started(target_count=autoscale_target)
+    except OSError:
+        logger.exception("Failed to start AMC local workers while rendering campaign page")
     worker_status = amc_workers.local_worker_status(target_count=autoscale_target)
+    forecast_worker_status = forecast_workers.status()
     return templates.TemplateResponse(
         name="amc_campaign.html",
         context={
@@ -112,6 +118,7 @@ def campaign(request: Request, date_value: str) -> object:
             "recent_runs": recent_runs,
             "worker_running": worker_status["running_count"] > 0,
             "worker_status": worker_status,
+            "forecast_worker_status": forecast_worker_status,
             "queue_health": queue_health,
             "collection_diagnostics": collection_diagnostics,
             "sample_set": sample_set,
@@ -217,6 +224,8 @@ async def toggle_movie(date_value: str, amc_movie_id: str, request: Request) -> 
         conn.commit()
     finally:
         conn.close()
+    if request.headers.get("HX-Request", "").lower() == "true":
+        return Response(status_code=204)
     return RedirectResponse(url=f"/amc/campaigns/{date_value}", status_code=303)
 
 
@@ -275,7 +284,10 @@ async def start_seat_collection(date_value: str, request: Request) -> object:
         conn.close()
     backoff_summary = amc_workers.recent_backoff_summary()
     autoscale_target = amc_workers.autoscaled_worker_target(queue_health, backoff_summary=backoff_summary)
-    amc_workers.ensure_local_workers_started(target_count=autoscale_target)
+    try:
+        amc_workers.ensure_local_workers_started(target_count=autoscale_target)
+    except OSError:
+        logger.exception("Failed to start AMC local workers after scheduling seat collection")
     return RedirectResponse(url=f"/amc/campaigns/{date_value}", status_code=303)
 
 
@@ -312,6 +324,20 @@ def start_worker(request: Request) -> object:
 def restart_worker(request: Request) -> object:
     amc_workers.restart_local_workers()
     target = request.headers.get("referer") or "/"
+    return RedirectResponse(url=target, status_code=303)
+
+
+@router.post("/amc/forecast-worker/start")
+def start_forecast_worker(request: Request) -> object:
+    forecast_workers.ensure_worker_started()
+    target = request.headers.get("referer") or "/amc"
+    return RedirectResponse(url=target, status_code=303)
+
+
+@router.post("/amc/forecast-worker/restart")
+def restart_forecast_worker(request: Request) -> object:
+    forecast_workers.restart_worker()
+    target = request.headers.get("referer") or "/amc"
     return RedirectResponse(url=target, status_code=303)
 
 

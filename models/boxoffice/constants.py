@@ -63,5 +63,7 @@ ACTUAL_COLUMNS = {
 
 FORECAST_TABLE = "analytics.movie_opening_weekend_forecasts"
 COMPONENT_TABLE = "analytics.movie_forecast_components"
+EMISSION_TABLE = "analytics.movie_forecast_emissions"
+EMISSION_COMPONENT_TABLE = "analytics.movie_forecast_emission_components"
+EMISSION_CONFLICT_TABLE = "analytics.movie_forecast_emission_conflicts"
 RUN_TABLE = "analytics.forecast_runs"
-

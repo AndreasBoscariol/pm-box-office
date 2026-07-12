@@ -182,6 +182,27 @@ LEGACY_STANDALONE_HEADING_HTML = """
 """
 
 
+LEGACY_PODIUM_AGGREGATE_HTML = """
+<html>
+  <head>
+    <meta property="article:published_time" content="2024-06-26T12:00:00-04:00" />
+  </head>
+  <body>
+    <h1>Weekend Preview: Sample</h1>
+    <h2>The Boxoffice Podium</h2>
+    <h3>Forecasting the Top 3 Movies at the Domestic Box Office | June 21 – 23, 2024</h3>
+    <h3>Week 26 | June 28 – 30, 2024</h3>
+    <h3>Top 10 Range | Weekend 26, 2024: $135M — $175M</h3>
+    <h3>
+      1. Actual Movie<br>
+      Actual Studio | NEW<br>
+      Opening Weekend Range: $50M - $55M
+    </h3>
+  </body>
+</html>
+"""
+
+
 LONG_RANGE_FORECAST_HTML = """
 <html>
   <head>
@@ -651,6 +672,16 @@ class BoxofficeProParserTests(unittest.TestCase):
         self.assertEqual("2023-12-22", predictions[0].target_start_date)
         self.assertEqual("2023-12-25", predictions[0].target_end_date)
         self.assertEqual("legacy_forecast_heading", predictions[0].source_context)
+
+    def test_podium_aggregate_heading_is_not_parsed_as_a_movie(self) -> None:
+        _article, predictions, rejected = ingest.parse_article(
+            LEGACY_PODIUM_AGGREGATE_HTML,
+            article_url="https://www.boxofficepro.com/weekend-preview-podium-aggregate/",
+        )
+
+        self.assertEqual([], rejected)
+        self.assertEqual(["Actual Movie"], [prediction.source_movie_title for prediction in predictions])
+        self.assertEqual(["weekend_podium"], [prediction.source_context for prediction in predictions])
 
     def test_long_range_forecast_text_extracts_opening_and_total_ranges(self) -> None:
         article, predictions, rejected = ingest.parse_article(

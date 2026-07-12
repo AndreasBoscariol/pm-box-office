@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -253,6 +254,99 @@ class BoxOfficeTheoryDatabaseTests(unittest.TestCase):
         self.assertEqual("Disclosure Day", row[0])
         self.assertEqual(50_500_000, row[1])
         self.assertEqual(159_000_000, row[2])
+
+    def test_match_prediction_does_not_reuse_single_stale_title_match(self) -> None:
+        old_movie_id = self.conn.execute(
+            """
+            INSERT INTO movies (title, release_date, release_year)
+            VALUES ('Ballerina', '2017-08-25', 2017)
+            RETURNING movie_id
+            """
+        ).fetchone()[0]
+        prediction = replace(
+            ingest.parse_predictions(post_record(TRACKING_TABLE_HTML))[0],
+            source_movie_title="Ballerina",
+            normalized_movie_title="ballerina",
+            source_movie_id="boxofficetheory:US_CA:ballerina:2025-06-06",
+            release_date="2025-06-06",
+        )
+
+        matched = ingest.match_predictions(self.conn, [prediction])[0]
+
+        self.assertNotEqual(old_movie_id, matched.movie_id)
+        self.assertEqual("provisional", matched.match_status)
+        self.assertEqual("provisional_boxofficetheory_identity", matched.match_method)
+
+    def test_match_prediction_prefers_daily_chart_alias_over_stale_title(self) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO movies (title, release_date, release_year)
+            VALUES ('Ballerina', '2017-08-25', 2017)
+            """
+        )
+        canonical_movie_id = self.conn.execute(
+            """
+            INSERT INTO movies (title, release_date, release_year, movie_url)
+            VALUES (
+                'From the World of John Wick: Ballerina',
+                '2025-06-06',
+                2025,
+                '/movie/From-the-World-of-John-Wick-Ballerina-(2025)'
+            )
+            RETURNING movie_id
+            """
+        ).fetchone()[0]
+        self.conn.execute(
+            """
+            CREATE TABLE daily_chart_pages (
+                movie_id integer,
+                title text,
+                chart_date date
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO daily_chart_pages (movie_id, title, chart_date)
+            VALUES (%s, 'From the World of John Wick: Ballerina', '2025-06-06')
+            """,
+            (canonical_movie_id,),
+        )
+        prediction = replace(
+            ingest.parse_predictions(post_record(TRACKING_TABLE_HTML))[0],
+            source_movie_title="Ballerina",
+            normalized_movie_title="ballerina",
+            source_movie_id="boxofficetheory:US_CA:ballerina:2025-06-06",
+            release_date="2025-06-06",
+        )
+
+        matched = ingest.match_predictions(self.conn, [prediction])[0]
+
+        self.assertEqual(canonical_movie_id, matched.movie_id)
+        self.assertEqual("matched", matched.match_status)
+        self.assertEqual("daily_chart_alias_release_window", matched.match_method)
+
+    def test_match_prediction_accepts_same_opening_weekend_window(self) -> None:
+        movie_id = self.conn.execute(
+            """
+            INSERT INTO movies (title, release_date, release_year, movie_url)
+            VALUES ('Minions & Monsters', '2026-07-03', 2026, '/movie/Minions-and-Monsters-(2026)')
+            RETURNING movie_id
+            """
+        ).fetchone()[0]
+        prediction = replace(
+            ingest.parse_predictions(post_record(TRACKING_TABLE_HTML))[0],
+            source_movie_title="Minions & Monsters",
+            normalized_movie_title="minions and monsters",
+            source_movie_id="boxofficetheory:US_CA:minions-and-monsters:2026-07-01",
+            release_date="2026-07-01",
+        )
+
+        matched = ingest.match_predictions(self.conn, [prediction])[0]
+
+        self.assertEqual(movie_id, matched.movie_id)
+        self.assertEqual("matched", matched.match_status)
+        self.assertEqual("normalized_exact_release_window", matched.match_method)
 
 
 if __name__ == "__main__":

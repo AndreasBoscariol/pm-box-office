@@ -19,6 +19,7 @@ ESTIMATE_RUN_ALL_LOOKBACK_DAYS = 7
 THE_NUMBERS_AUTORUN_LOOKBACK_DAYS = 7
 THE_NUMBERS_AUTORUN_PUBLISH_LAG_DAYS = 1
 THE_NUMBERS_AUTORUN_REFRESH_DAYS = 2
+THE_NUMBERS_SOURCE_POLL_LOOKBACK_DAYS = 2
 
 
 def start_source_run(
@@ -123,18 +124,25 @@ def start_run_all(
 def autorun_extra_args(source_key: str, *, trigger: str, today: dt.date | None = None) -> list[str]:
     if source_key in BOX_OFFICE_PREDICTION_SOURCE_KEYS:
         return rolling_week_args(today=today)
-    if trigger != "auto_daily" or source_key != "the_numbers":
+    if source_key == "the_numbers_predictions" and trigger == "auto_source_poll":
+        return ["--refresh"]
+    if trigger not in {"auto_daily", "auto_source_poll"} or source_key != "the_numbers":
         return []
     run_date = today or dt.date.today()
     end_date = run_date - dt.timedelta(days=THE_NUMBERS_AUTORUN_PUBLISH_LAG_DAYS)
-    start_date = end_date - dt.timedelta(days=THE_NUMBERS_AUTORUN_LOOKBACK_DAYS - 1)
+    lookback_days = (
+        THE_NUMBERS_SOURCE_POLL_LOOKBACK_DAYS
+        if trigger == "auto_source_poll"
+        else THE_NUMBERS_AUTORUN_LOOKBACK_DAYS
+    )
+    start_date = end_date - dt.timedelta(days=lookback_days - 1)
     return [
         "--start-date",
         start_date.isoformat(),
         "--end-date",
         end_date.isoformat(),
         "--refresh-recent-days",
-        str(THE_NUMBERS_AUTORUN_REFRESH_DAYS),
+        str(min(THE_NUMBERS_AUTORUN_REFRESH_DAYS, lookback_days)),
     ]
 
 

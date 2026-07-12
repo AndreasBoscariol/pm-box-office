@@ -23,10 +23,10 @@
 
       <section class="autorun-strip">
         <div>
-          <strong>Daily autorun</strong>
+          <strong>Scheduled ingestion</strong>
           <span class="subtle">
             {% if autorun_state.enabled %}
-            All visible ingest sources will run in {{ autorun_state.seconds_until_next_run|duration_until }}
+            Prediction sources poll in their publishing windows; background sources run in {{ autorun_state.seconds_until_next_run|duration_until }}
             {% else %}
             Paused
             {% endif %}
@@ -38,6 +38,15 @@
           <div><dt>Last batch</dt><dd>{{ autorun_state.last_triggered_at|time_ago }}</dd></div>
         </dl>
       </section>
+
+      {% if pipeline_health %}
+      <section class="status-strip" aria-label="Pipeline health">
+        <div><span class="label">Current forecasts</span><strong>{{ pipeline_health.current_forecasts|default("-") }}</strong><small>UI projections</small></div>
+        <div><span class="label">Refresh queued</span><strong>{{ pipeline_health.refresh_queued|default("-") }}</strong><small>{{ pipeline_health.refresh_failed|default("-") }} failed</small></div>
+        <div><span class="label">Recent UI events</span><strong>{{ pipeline_health.ui_events_pending|default("-") }}</strong><small>last 5 minutes</small></div>
+        <div><span class="label">Unmatched identities</span><strong>{{ pipeline_health.unmatched_movie_sources|default("-") }}</strong><small>need review</small></div>
+      </section>
+      {% endif %}
 
       <section class="source-grid">
         {% for source in sources %}
@@ -58,6 +67,16 @@
             <div><dt>Active PID</dt><dd>{{ source.running_pid or "-" }}</dd></div>
             <div><dt>Max concurrency</dt><dd>{{ source.max_concurrency }}</dd></div>
           </dl>
+
+          {% if source.polling_policy %}
+          <div class="freshness-list polling-policy">
+            <div>
+              <span>Polling policy</span>
+              <strong>{{ source.polling_policy.status }}</strong>
+              <small>{{ source.polling_policy.schedule }}</small>
+            </div>
+          </div>
+          {% endif %}
 
           <div class="source-actions">
             <form method="post" action="/sources/{{ source.source_key }}/run">

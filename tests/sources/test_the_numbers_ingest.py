@@ -215,6 +215,11 @@ class ScrapeTheNumbersTests(unittest.TestCase):
         self.assertTrue(args.metadata_backfill)
         self.assertTrue(args.metadata_backfill_all)
 
+    def test_money_reconciliation_allows_rounded_chart_values(self) -> None:
+        self.assertTrue(scraper.money_values_match(34000, 33582))
+        self.assertTrue(scraper.money_values_match(2300000, 2301514))
+        self.assertFalse(scraper.money_values_match(16000, 16699))
+
     def test_metadata_backfill_all_selects_complete_rows(self) -> None:
         conn, schema = make_isolated_postgres_schema()
         scraper.initialize_database(conn)
@@ -546,6 +551,59 @@ class ScrapeTheNumbersTests(unittest.TestCase):
                     raw_cache_path=cache_path,
                 )
                 self.assertTrue(scraper.movie_metadata_imported(conn, movie_url=chart_rows[0].movie_url))
+            finally:
+                drop_isolated_postgres_schema(conn, schema)
+
+    def test_movie_page_imported_requires_current_chart_date_coverage(self) -> None:
+        chart_rows = scraper.parse_daily_chart(
+            DAILY_CHART_HTML,
+            chart_date=dt.date(2026, 5, 1),
+            source_url="https://www.the-numbers.com/box-office-chart/daily/2026/05/01",
+        )
+        movie_rows = scraper.parse_movie_page(
+            MOVIE_PAGE_HTML,
+            movie_url=chart_rows[0].movie_url,
+            source_url=chart_rows[0].movie_url,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "fixture.html"
+            cache_path.write_text("fixture", encoding="utf-8")
+            conn, schema = make_isolated_postgres_schema()
+            scraper.initialize_database(conn)
+            try:
+                scraper.insert_movie_daily_rows(
+                    conn,
+                    [movie_rows[0]],
+                    fetched_at="2026-06-28T00:00:00+00:00",
+                    raw_cache_path=cache_path,
+                )
+                conn.commit()
+
+                self.assertTrue(scraper.movie_page_imported(conn, movie_url=chart_rows[0].movie_url))
+                self.assertFalse(
+                    scraper.movie_page_imported(
+                        conn,
+                        movie_url=chart_rows[0].movie_url,
+                        chart_dates=["2026-05-01"],
+                    )
+                )
+
+                scraper.insert_movie_daily_rows(
+                    conn,
+                    [movie_rows[1]],
+                    fetched_at="2026-06-28T00:00:00+00:00",
+                    raw_cache_path=cache_path,
+                )
+                conn.commit()
+
+                self.assertTrue(
+                    scraper.movie_page_imported(
+                        conn,
+                        movie_url=chart_rows[0].movie_url,
+                        chart_dates=["2026-05-01"],
+                    )
+                )
             finally:
                 drop_isolated_postgres_schema(conn, schema)
 

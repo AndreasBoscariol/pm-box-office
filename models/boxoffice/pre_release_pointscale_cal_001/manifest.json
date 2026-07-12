@@ -1,0 +1,72 @@
+{
+  "artifact": "pre_release_pointscale_cal_001",
+  "artifact_checksum": "a4748ccc38e2e7af7593cde0fbfd9db748c0594f5c716a39d79bd8564a1b24d9",
+  "artifact_created_utc": "2026-07-10T23:51:28.252910+00:00",
+  "artifact_freeze_utc": "2026-07-10T23:51:28.252910+00:00",
+  "base_distribution_policy": "pre_release_pointscale_splitt_001",
+  "base_parameters": {
+    "candidate": "point_scale_split_student_t",
+    "degrees_of_freedom": 49.99999999999999,
+    "location": -0.14098211585049095,
+    "location_group_offsets": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "log_sigma_lower": -0.9158063636495665,
+    "log_sigma_upper": -0.9394905465101193,
+    "lower_group_offsets": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "lower_point_slope": -0.0165949712621027,
+    "upper_group_offsets": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "upper_point_slope": 0.00014782113881534045
+  },
+  "calibration_candidate": "beta",
+  "calibration_parameters": {
+    "alpha": 1.0226235223970828,
+    "beta": 0.9419373167963195,
+    "regularization": 1.0
+  },
+  "fallback": "global beta calibration",
+  "historical_development_metrics": {
+    "outcome": "provisional_beta",
+    "outer_test_movies": 51
+  },
+  "interval_policy": "007",
+  "latest_included_movie_id": 371,
+  "latest_included_release_date": "2026-07-03",
+  "minimum_prior_movies": 50,
+  "minimum_prior_movies_per_group": 25,
+  "minimum_prospective_movies": 30,
+  "point_policy": "production_pre_release_point",
+  "primary_origin_policy": "latest_valid_pre_release_origin",
+  "probability_policy": "pre_release_pointscale_cal_001",
+  "production_probability_eligible": false,
+  "source_commit": "1459fd9968d21eb7f83522352477bc13f8423fb2",
+  "source_dirty_at_freeze": true,
+  "status": "provisional_awaiting_prospective_validation",
+  "target_prospective_movies": 50,
+  "threshold_grid_usd": [
+    10000000.0,
+    15000000.0,
+    20000000.0,
+    25000000.0,
+    30000000.0,
+    35000000.0,
+    40000000.0,
+    50000000.0,
+    60000000.0,
+    75000000.0,
+    100000000.0,
+    125000000.0,
+    150000000.0
+  ],
+  "training_data_checksum": "9e4d51796f1802e666f5782c1c2b4eed2bd67e4bdaa76a5f6bf556382f98b11d"
+}

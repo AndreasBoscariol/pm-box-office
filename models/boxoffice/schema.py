@@ -94,6 +94,7 @@ class ForecastResult:
     component_source: str
     model_version: str
     run_id: str
+    distribution_payload: dict[str, Any] | None = None
     components: list[DailyComponent] = field(default_factory=list)
     feature_quality_bucket: str | None = None
     source_count: int | None = None
@@ -154,6 +155,7 @@ class ForecastResult:
             "hi95_usd": self.hi95_usd,
             "point_model": self.point_model,
             "interval_model": self.interval_model,
+            "distribution_payload": self.distribution_payload,
             "component_source": self.component_source,
             "feature_quality_bucket": self.feature_quality_bucket,
             "source_count": self.source_count,

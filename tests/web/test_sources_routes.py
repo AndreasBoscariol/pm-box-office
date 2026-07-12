@@ -40,6 +40,40 @@ class SourceRouteTests(unittest.TestCase):
     def test_duration_until_formats_hours(self) -> None:
         self.assertEqual("3 hours", sources.duration_until(3 * 60 * 60 + 30))
 
+    def test_polling_policy_displays_schedule_and_stops_after_publication(self) -> None:
+        policy = sources.polling_policy(
+            "boxofficepro",
+            now=dt.datetime(2026, 7, 8, 19, 30, tzinfo=dt.UTC),
+            publication_found=True,
+        )
+
+        self.assertIsNotNone(policy)
+        assert policy is not None
+        self.assertIn("Wed", policy["schedule"])
+        self.assertEqual("Publication found — polling paused until the next window", policy["status"])
+
+    def test_unpolled_source_has_no_polling_policy(self) -> None:
+        self.assertIsNone(
+            sources.polling_policy(
+                "wikipedia",
+                now=dt.datetime(2026, 7, 8, 19, 30, tzinfo=dt.UTC),
+                publication_found=False,
+            )
+        )
+
+    def test_new_estimate_sources_expose_polling_policies(self) -> None:
+        for source_key in ("edwarddouglas_substack", "boxofficeguru", "toddmthatcher", "joblo"):
+            with self.subTest(source_key=source_key):
+                policy = sources.polling_policy(
+                    source_key,
+                    now=dt.datetime(2026, 7, 10, 16, 0, tzinfo=dt.UTC),
+                    publication_found=False,
+                )
+
+                self.assertIsNotNone(policy)
+                assert policy is not None
+                self.assertIn("ET", policy["schedule"])
+
     def test_run_source_redirects_with_started_message(self) -> None:
         run_id = uuid.uuid4()
         with patch.object(sources.runner, "start_source_run", return_value=run_id) as start_source_run:

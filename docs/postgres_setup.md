@@ -27,7 +27,6 @@ DATABASE_URL=postgresql://localhost/pm_box_office
 Install the project:
 
 ```sh
-.venv/bin/pip install -r requirements.txt
 .venv/bin/pip install -e .
 ```
 
@@ -56,6 +55,6 @@ The Polymarket account scanner currently writes file outputs only:
 .venv/bin/python -m pm_box_office.sources.polymarket.accounts
 ```
 
-Legacy Python modules under `scripts/` and root `web.app` have been removed.
-Use `pm_box_office.*` package entrypoints or the console scripts from
-`pyproject.toml`.
+Operational commands live under `pm_box_office.*` or the console scripts in
+`pyproject.toml`. The remaining `scripts/` module is a tested AMC diagnostic,
+not an operational entry point.

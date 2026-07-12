@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import difflib
 import hashlib
 from html.parser import HTMLParser
 import html
@@ -41,6 +42,8 @@ DOMESTIC_MARKET = "US_CA"
 DOMESTIC_CURRENCY = "USD"
 PARSER_VERSION = "boxofficetheory_public_predictions_v1"
 WP_API_FIELDS = "id,date_gmt,link,title,content,excerpt,categories"
+RELEASE_DATE_MATCH_WINDOW_DAYS = 2
+DAILY_CHART_ALIAS_MATCH_THRESHOLD = 0.88
 
 
 @dataclass(frozen=True)
@@ -779,6 +782,38 @@ def normalize_movie_title(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def normalize_daily_chart_alias_title(value: str) -> str:
+    text = normalize_movie_title(value)
+    text = re.sub(r"\b(?:wide|limited)\s+expansion\b", " ", text)
+    text = re.sub(r"\b(?:wide|limited)\s+release\b", " ", text)
+    text = re.sub(r"\b(?:re\s*issue|rerelease|re\s*release)\b", " ", text)
+    text = re.sub(r"\b\d+(?:st|nd|rd|th)?\s+anniversary\b", " ", text)
+    text = re.sub(r"\b(?:imax engagement|live in 3d)\b", " ", text)
+    text = re.sub(r"\b(?:the movie)\b", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def daily_chart_alias_score(prediction_title: str, daily_title: str) -> float:
+    prediction_base = normalize_daily_chart_alias_title(prediction_title)
+    daily_base = normalize_daily_chart_alias_title(daily_title)
+    if not prediction_base or not daily_base:
+        return 0.0
+    if prediction_base == daily_base:
+        return 1.0
+    prediction_tokens = set(prediction_base.split())
+    daily_tokens = set(daily_base.split())
+    if prediction_tokens and daily_tokens:
+        shorter_tokens = prediction_tokens if len(prediction_tokens) <= len(daily_tokens) else daily_tokens
+        longer_tokens = daily_tokens if shorter_tokens is prediction_tokens else prediction_tokens
+        if shorter_tokens <= longer_tokens:
+            if len(shorter_tokens) >= 2:
+                return 0.92
+            token = next(iter(shorter_tokens))
+            if len(token) >= 2 and (daily_base.startswith(f"{token} ") or prediction_base.startswith(f"{token} ")):
+                return 0.9
+    return difflib.SequenceMatcher(None, prediction_base, daily_base).ratio()
+
+
 def boxofficetheory_source_movie_id(
     *,
     normalized_movie_title: str,
@@ -1237,13 +1272,25 @@ def load_movie_candidates(conn: Any) -> list[MovieCandidate]:
     columns = movie_table_columns(conn)
     movie_url_expr = "movie_url" if "movie_url" in columns else "NULL AS movie_url"
     release_year_expr = "release_year" if "release_year" in columns else "NULL AS release_year"
-    release_date_expr = "release_date" if "release_date" in columns else "NULL AS release_date"
+    release_date_expr = "movie.release_date" if "release_date" in columns else "NULL::date"
+    daily_join = ""
+    if relation_exists(conn, "daily_chart_pages"):
+        daily_join = """
+        LEFT JOIN (
+            SELECT movie_id, MIN(chart_date::date) AS first_daily_date
+            FROM daily_chart_pages
+            WHERE movie_id IS NOT NULL
+            GROUP BY movie_id
+        ) daily_first ON daily_first.movie_id = movie.movie_id
+        """
+        release_date_expr = f"COALESCE(daily_first.first_daily_date, {release_date_expr})"
     rows = conn.execute(
         f"""
-        SELECT movie_id, {movie_url_expr}, title, {release_year_expr}, {release_date_expr}
-        FROM movies
+        SELECT movie.movie_id, {movie_url_expr}, movie.title, {release_year_expr}, {release_date_expr} AS match_release_date
+        FROM movies movie
+        {daily_join}
         WHERE title IS NOT NULL
-        ORDER BY movie_id
+        ORDER BY movie.movie_id
         """
     ).fetchall()
     return [
@@ -1276,11 +1323,16 @@ def relation_exists(conn: Any, relation_name: str) -> bool:
     return bool(row and row[0])
 
 
-def match_predictions(conn: Any, predictions: list[TheoryPrediction]) -> list[TheoryPrediction]:
+def match_predictions(
+    conn: Any,
+    predictions: list[TheoryPrediction],
+    *,
+    source_key: str = movie_identity.SOURCE_BOXOFFICETHEORY,
+) -> list[TheoryPrediction]:
     candidates = load_movie_candidates(conn)
     matched: list[TheoryPrediction] = []
     for prediction in predictions:
-        match = match_prediction(conn, prediction, candidates)
+        match = match_prediction(conn, prediction, candidates, source_key=source_key)
         if match.movie_id is not None:
             upsert_movie_source_id(
                 conn,
@@ -1289,6 +1341,7 @@ def match_predictions(conn: Any, predictions: list[TheoryPrediction]) -> list[Th
                 match_status=match.status,
                 match_method=match.method,
                 match_score=match.score,
+                source_key=source_key,
             )
         matched.append(
             replace(
@@ -1307,14 +1360,20 @@ def match_prediction(
     conn: Any,
     prediction: TheoryPrediction,
     candidates: list[MovieCandidate],
+    *,
+    source_key: str = movie_identity.SOURCE_BOXOFFICETHEORY,
 ) -> MovieMatch:
-    source_id_match = find_source_id_match(conn, prediction)
+    if source_key == movie_identity.SOURCE_EDWARD_DOUGLAS_SUBSTACK and prediction.prediction_scope == "weekend_forecast":
+        weekly_match = find_weekly_forecast_match(conn, prediction)
+        if weekly_match is not None:
+            return weekly_match
+    source_id_match = find_source_id_match_for_source(conn, prediction, source_key=source_key)
     if source_id_match is not None:
         return source_id_match
     matches = [candidate for candidate in candidates if candidate.normalized_title == prediction.normalized_movie_title]
     if not matches:
         if can_provision_movie(prediction):
-            return provision_movie(conn, prediction)
+            return provision_movie(conn, prediction, source_key=source_key)
         return MovieMatch(None, "unmatched", "normalized_exact", 0.0, "No movie title matched")
     if prediction.release_date is not None:
         exact = [candidate for candidate in matches if candidate.release_date == prediction.release_date]
@@ -1322,29 +1381,176 @@ def match_prediction(
             candidate = preferred_movie_candidate(exact)
             status = "matched" if candidate.movie_url is not None else "provisional"
             return MovieMatch(candidate.movie_id, status, "normalized_exact_release_date", 1.0, None)
-    if len(matches) == 1:
+
+        compatible = [candidate for candidate in matches if release_dates_compatible(candidate.release_date, prediction.release_date)]
+        if compatible:
+            candidate = preferred_movie_candidate(compatible)
+            status = "matched" if candidate.movie_url is not None else "provisional"
+            return MovieMatch(candidate.movie_id, status, "normalized_exact_release_window", 0.95, None)
+
+    if len(matches) == 1 and prediction.release_date is None:
         candidate = matches[0]
         status = "matched" if candidate.movie_url is not None else "provisional"
         return MovieMatch(candidate.movie_id, status, "normalized_exact", 1.0, None)
+    if can_provision_movie(prediction):
+        return provision_movie(conn, prediction, source_key=source_key)
     return MovieMatch(None, "ambiguous", "normalized_exact", 0.5, "Multiple movies share the title")
 
 
+def find_weekly_forecast_match(conn: Any, prediction: TheoryPrediction) -> MovieMatch | None:
+    if prediction.release_date is None or not relation_exists(conn, "release_runs"):
+        return None
+    if not relation_exists(conn, "daily_box_office"):
+        return None
+    row = conn.execute(
+        """
+        WITH title_candidates AS (
+            SELECT
+                m.movie_id,
+                m.movie_url,
+                MIN(dbo.box_office_date::date) AS first_daily_date,
+                MAX(dbo.box_office_date::date) AS last_daily_date,
+                COUNT(*) AS daily_rows
+            FROM movies m
+            JOIN release_runs rr ON rr.movie_id = m.movie_id
+            JOIN daily_box_office dbo ON dbo.release_run_id = rr.release_run_id
+            WHERE regexp_replace(
+                    regexp_replace(
+                        replace(
+                            lower(regexp_replace(COALESCE(m.title, ''), '\\s*\\(\\d{4}\\)\\s*$', '', 'g')),
+                            '&',
+                            ' and '
+                        ),
+                        '[^a-z0-9]+',
+                        ' ',
+                        'g'
+                    ),
+                    '\\s+',
+                    ' ',
+                    'g'
+                  ) = %s
+              AND dbo.box_office_date::date <= %s::date + 6
+            GROUP BY m.movie_id, m.movie_url
+        ),
+        scored AS (
+            SELECT *,
+                   CASE
+                     WHEN %s::date BETWEEN first_daily_date AND last_daily_date + 21 THEN 3
+                     WHEN %s::date >= first_daily_date AND %s::date <= first_daily_date + 120 THEN 2
+                     WHEN %s::date >= first_daily_date - 7 AND %s::date <= first_daily_date + 14 THEN 1
+                     ELSE 0
+                   END AS activity_score
+            FROM title_candidates
+        )
+        SELECT movie_id, movie_url, first_daily_date, last_daily_date, daily_rows, activity_score
+        FROM scored
+        WHERE activity_score > 0
+        ORDER BY activity_score DESC, (movie_url IS NOT NULL) DESC, daily_rows DESC, first_daily_date DESC, movie_id
+        LIMIT 2
+        """,
+        (
+            prediction.normalized_movie_title,
+            prediction.release_date,
+            prediction.release_date,
+            prediction.release_date,
+            prediction.release_date,
+            prediction.release_date,
+            prediction.release_date,
+        ),
+    ).fetchall()
+    if not row:
+        return find_weekly_forecast_daily_alias_match(conn, prediction)
+    best = row[0]
+    if len(row) > 1 and row[1][5] == best[5] and row[1][0] != best[0]:
+        return None
+    status = "matched" if best[1] is not None else "provisional"
+    return MovieMatch(
+        int(best[0]),
+        status,
+        "weekly_forecast_title_activity_window",
+        0.95 if best[1] is not None else 0.85,
+        f"Matched weekly forecast to active release window {best[2]} through {best[3]}",
+    )
+
+
+def find_weekly_forecast_daily_alias_match(conn: Any, prediction: TheoryPrediction) -> MovieMatch | None:
+    if prediction.release_date is None or not relation_exists(conn, "daily_chart_pages"):
+        return None
+    rows = conn.execute(
+        """
+        WITH candidates AS (
+            SELECT
+                d.movie_id,
+                m.movie_url,
+                MIN(d.title) AS daily_title,
+                MIN(d.chart_date::date) AS first_daily_date,
+                MAX(d.chart_date::date) AS last_daily_date,
+                COUNT(*) AS daily_rows
+            FROM daily_chart_pages d
+            JOIN movies m ON m.movie_id = d.movie_id
+            WHERE d.movie_id IS NOT NULL
+              AND d.chart_date::date <= %s::date + 6
+            GROUP BY d.movie_id, m.movie_url
+        )
+        SELECT movie_id, movie_url, daily_title, first_daily_date, last_daily_date, daily_rows
+        FROM candidates
+        WHERE %s::date BETWEEN first_daily_date - 7 AND last_daily_date + 21
+           OR (%s::date >= first_daily_date AND %s::date <= first_daily_date + 120)
+        ORDER BY daily_rows DESC, movie_id
+        """,
+        (prediction.release_date, prediction.release_date, prediction.release_date, prediction.release_date),
+    ).fetchall()
+    scored_rows = [
+        (daily_chart_alias_score(prediction.source_movie_title, str(row[2])), row)
+        for row in rows
+    ]
+    scored_rows = [
+        (score, row)
+        for score, row in scored_rows
+        if score >= DAILY_CHART_ALIAS_MATCH_THRESHOLD
+    ]
+    if not scored_rows:
+        return None
+    scored_rows.sort(key=lambda item: (-item[0], -int(item[1][5]), int(item[1][0])))
+    score, row = scored_rows[0]
+    if len(scored_rows) > 1 and scored_rows[1][0] == score and scored_rows[1][1][0] != row[0]:
+        return None
+    status = "matched" if row[1] is not None else "provisional"
+    return MovieMatch(
+        int(row[0]),
+        status,
+        "weekly_forecast_daily_alias_activity_window",
+        score,
+        f"Matched weekly forecast to daily chart title '{row[2]}' active {row[3]} through {row[4]}",
+    )
+
+
 def find_source_id_match(conn: Any, prediction: TheoryPrediction) -> MovieMatch | None:
+    return find_source_id_match_for_source(conn, prediction, source_key=movie_identity.SOURCE_BOXOFFICETHEORY)
+
+
+def find_source_id_match_for_source(conn: Any, prediction: TheoryPrediction, *, source_key: str) -> MovieMatch | None:
     if not relation_exists(conn, "movie_source_ids"):
         return None
     row = conn.execute(
         """
-        SELECT m.movie_id, m.movie_url, src.match_status, src.match_score
+        SELECT m.movie_id, m.movie_url, src.match_status, src.match_score, m.release_date
         FROM movie_source_ids src
         JOIN movies m ON m.movie_id = src.movie_id
-        WHERE src.source = 'boxofficetheory'
+        WHERE src.source = %s
           AND src.source_movie_id = %s
         LIMIT 1
         """,
-        (prediction.source_movie_id,),
+        (source_key, prediction.source_movie_id),
     ).fetchone()
     if row is None:
         return None
+    if prediction.release_date is not None and not release_dates_compatible(row[4], prediction.release_date):
+        return None
+    if row[1] is None:
+        daily_match = find_daily_chart_match(conn, prediction)
+        if daily_match is not None:
+            return daily_match
     status = "matched" if row[1] is not None else "provisional"
     stored_status = str(row[2]) if row[2] is not None else status
     if stored_status in {"matched", "provisional"}:
@@ -1352,17 +1558,91 @@ def find_source_id_match(conn: Any, prediction: TheoryPrediction) -> MovieMatch 
     return MovieMatch(
         int(row[0]),
         status,
-        "boxofficetheory_source_id",
+        f"{source_key}_source_id",
         float(row[3]) if row[3] is not None else 1.0,
-        f"Matched existing Box Office Theory source id {prediction.source_movie_id}",
+        f"Matched existing {source_key} source id {prediction.source_movie_id}",
     )
+
+
+def find_daily_chart_match(conn: Any, prediction: TheoryPrediction) -> MovieMatch | None:
+    if prediction.release_date is None or not relation_exists(conn, "daily_chart_pages"):
+        return None
+    rows = conn.execute(
+        """
+        WITH candidates AS (
+            SELECT
+                d.movie_id,
+                m.movie_url,
+                MIN(d.title) AS daily_title,
+                MIN(d.chart_date::date) AS first_daily_date,
+                COUNT(*) AS daily_rows
+            FROM daily_chart_pages d
+            JOIN movies m ON m.movie_id = d.movie_id
+            WHERE d.movie_id IS NOT NULL
+              AND (d.chart_date::date - %s::date) >= -3
+              AND (d.chart_date::date - %s::date) <= 35
+            GROUP BY d.movie_id, m.movie_url
+        )
+        SELECT movie_id, movie_url, daily_title, first_daily_date, daily_rows
+        FROM candidates
+        ORDER BY daily_rows DESC, movie_id
+        """,
+        (prediction.release_date, prediction.release_date),
+    ).fetchall()
+    scored_rows = [
+        (daily_chart_alias_score(prediction.source_movie_title, str(row[2])), row)
+        for row in rows
+    ]
+    scored_rows = [
+        (score, row)
+        for score, row in scored_rows
+        if score >= DAILY_CHART_ALIAS_MATCH_THRESHOLD
+    ]
+    if not scored_rows:
+        return None
+    scored_rows.sort(key=lambda item: (-item[0], -int(item[1][4]), int(item[1][0])))
+    score, row = scored_rows[0]
+    if len(scored_rows) > 1 and scored_rows[1][0] == score and scored_rows[1][1][0] != row[0]:
+        return None
+    status = "matched" if row[1] is not None else "provisional"
+    return MovieMatch(
+        int(row[0]),
+        status,
+        "daily_chart_alias_release_window",
+        score,
+        f"Matched daily chart movie identity '{row[2]}' using first daily date {row[3]} and {row[4]} daily rows",
+    )
+
+
+def release_dates_compatible(candidate_release_date: Any, prediction_release_date: str | None) -> bool:
+    if candidate_release_date is None or prediction_release_date is None:
+        return False
+    try:
+        candidate_day = dt.date.fromisoformat(str(candidate_release_date))
+        prediction_day = dt.date.fromisoformat(str(prediction_release_date))
+    except ValueError:
+        return False
+    if candidate_day == prediction_day:
+        return True
+    if opening_weekend_start(candidate_day) == opening_weekend_start(prediction_day):
+        return True
+    return abs((candidate_day - prediction_day).days) <= RELEASE_DATE_MATCH_WINDOW_DAYS
+
+
+def opening_weekend_start(value: dt.date) -> dt.date:
+    return value + dt.timedelta(days=(4 - value.weekday()) % 7)
 
 
 def can_provision_movie(prediction: TheoryPrediction) -> bool:
     return prediction.release_date is not None and prediction.prediction_scope == "pre_release_tracking"
 
 
-def provision_movie(conn: Any, prediction: TheoryPrediction) -> MovieMatch:
+def provision_movie(
+    conn: Any,
+    prediction: TheoryPrediction,
+    *,
+    source_key: str = movie_identity.SOURCE_BOXOFFICETHEORY,
+) -> MovieMatch:
     row = conn.execute(
         """
         INSERT INTO movies (title, release_year, release_date, updated_at)
@@ -1381,10 +1661,11 @@ def provision_movie(conn: Any, prediction: TheoryPrediction) -> MovieMatch:
         movie_id=movie_id,
         prediction=prediction,
         match_status="provisional",
-        match_method="provisional_boxofficetheory_identity",
+        match_method=f"provisional_{source_key}_identity",
         match_score=1.0,
+        source_key=source_key,
     )
-    return MovieMatch(movie_id, "provisional", "provisional_boxofficetheory_identity", 1.0, None)
+    return MovieMatch(movie_id, "provisional", f"provisional_{source_key}_identity", 1.0, None)
 
 
 def upsert_movie_source_id(
@@ -1395,11 +1676,12 @@ def upsert_movie_source_id(
     match_status: str,
     match_method: str | None,
     match_score: float | None,
+    source_key: str = movie_identity.SOURCE_BOXOFFICETHEORY,
 ) -> None:
     movie_identity.upsert_movie_source_id(
         conn,
         movie_id=movie_id,
-        source=movie_identity.SOURCE_BOXOFFICETHEORY,
+        source=source_key,
         source_movie_id=prediction.source_movie_id,
         source_title=prediction.source_movie_title,
         match_status=match_status,

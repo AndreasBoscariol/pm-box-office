@@ -1,0 +1,13 @@
+{
+  "base_distribution_policy": "pre_release_pointscale_splitt_001",
+  "point_policy": "production_pre_release_point",
+  "interval_policy": "007",
+  "status": "development_base",
+  "production_probability_eligible": false,
+  "reuse_reason": "passed Phase 6 proper-score gate but failed calibration gate",
+  "parameter_bounds": {
+    "sigma_positive": true,
+    "degrees_of_freedom": [2.5, 50.0],
+    "upper_lower_scale_ratio": [0.5, 5.0]
+  }
+}

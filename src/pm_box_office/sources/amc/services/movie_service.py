@@ -97,6 +97,7 @@ def create_seat_collection_run(
     sample_key: str = sample_service.DEFAULT_SAMPLE_KEY,
 ) -> tuple[str, int]:
     campaign_id = db.ensure_campaign(conn, exhibition_date)
+    db.activate_campaign(conn, campaign_id)
     active_run = db.find_active_run(conn, campaign_id=campaign_id, run_type="seat_collection")
     if active_run is not None:
         run_id, task_count = active_run
@@ -112,17 +113,17 @@ def create_seat_collection_run(
         target_offsets_minutes=target_offsets_minutes,
         schedule_strategy="smooth_once",
     )
-    selected_rows = [
-        row
-        for row in db.list_movies_for_date(
-            conn,
-            exhibition_date,
-            sample_set_id=sample_set.sample_set_id,
-        )
-        if row.selected
-    ]
+    # Seat collection follows the live AMC inventory, not the dashboard's
+    # optional movie-selection annotations.  The sample set and the reserved
+    # seating predicate below still bound the collection to the configured
+    # live-data scope.
+    live_movie_rows = db.list_movies_for_date(
+        conn,
+        exhibition_date,
+        sample_set_id=sample_set.sample_set_id,
+    )
     task_count = 0
-    for movie in selected_rows:
+    for movie in live_movie_rows:
         showtimes = db.select_showtimes_for_sampled_target(
             conn,
             target_date=exhibition_date.isoformat(),

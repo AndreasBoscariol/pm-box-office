@@ -1,0 +1,21 @@
+{
+  "policy_name": "production_distribution_v3_d1_from_p3_t4_tail_safe",
+  "policy_version": "v3",
+  "status": "production",
+  "base_distribution_policy": "production_distribution_v3_bounded_transition",
+  "base_distribution_status": "P_-14_through_P_-4_retain_v2_base__P_-3_through_P_-1_D1_point_size",
+  "early_origin_base_distribution": "production_distribution_v2_base",
+  "d1_base_distribution": "D1_point_size",
+  "d1_start_origin": -3,
+  "point_policy_status": "frozen_unchanged",
+  "tail_safety_enabled": true,
+  "tail_contamination_weight": 0.02,
+  "tail_reference_family": "student_t",
+  "tail_reference_df": 4,
+  "tail_center_policy": "frozen_point_forecast_usd",
+  "tail_scale_policy": "median_abs_prior_same_origin_log_residual_divided_by_t4_ppf_0_75_minimum_0_03_fallback_0_35_if_n_lt_30",
+  "promotion_evidence": "consensus_cdf_fixed_market_v1_transition_policy_audit",
+  "source_shrinkage_status": "shadow_only",
+  "pit_beta_calibration_status": "not_promoted",
+  "market_calibration_status": "external_confirmation_only"
+}

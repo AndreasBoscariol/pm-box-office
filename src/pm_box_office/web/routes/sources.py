@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import datetime as dt
 from typing import Any
 from urllib.parse import quote
 
@@ -9,6 +10,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from pm_box_office.db.connection import connect_database
 from pm_box_office.orchestration import repository, runner
+from pm_box_office.orchestration.registry import (
+    AUTORUN_TIMEZONE,
+    CONTINUOUS_POLL_SOURCE_KEYS,
+    SOURCE_POLLING_WINDOWS,
+    SourcePollingWindow,
+    source_poll_due,
+)
 from pm_box_office.web.db_init import ensure_initialized
 from pm_box_office.web.templating import templates
 from pm_box_office.web.time_format import duration_until, time_ago
@@ -17,6 +25,7 @@ from pm_box_office.web.time_format import duration_until, time_ago
 router = APIRouter()
 HIDDEN_SOURCE_KEYS = {"amc_worker", "social_x", "nitter"}
 HIDDEN_SOURCE_NAMES = {"social x", "social x/nitter poc", "nitter", "nitter poc"}
+WEEKDAY_LABELS = {1: "Mon", 2: "Tue", 3: "Wed", 4: "Thu", 5: "Fri", 6: "Sat", 7: "Sun"}
 
 
 def visible_ingest_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -29,6 +38,28 @@ def is_hidden_ingest_item(item: dict[str, Any]) -> bool:
     return source_key in HIDDEN_SOURCE_KEYS or display_name in HIDDEN_SOURCE_NAMES
 
 
+def format_polling_window(window: SourcePollingWindow) -> str:
+    days = "/".join(WEEKDAY_LABELS[day] for day in window.weekdays)
+    start = window.start.strftime("%I:%M %p").lstrip("0")
+    end = window.end.strftime("%I:%M %p").lstrip("0")
+    return f"{days} {start}–{end} ET, every {window.interval_minutes} min"
+
+
+def polling_policy(source_key: str, *, now: dt.datetime, publication_found: bool) -> dict[str, str] | None:
+    windows = SOURCE_POLLING_WINDOWS.get(source_key)
+    if not windows:
+        return None
+    if source_key in CONTINUOUS_POLL_SOURCE_KEYS:
+        status = "Continuous live synchronization"
+    elif publication_found:
+        status = "Publication found — polling paused until the next window"
+    elif source_poll_due(source_key, now):
+        status = "Polling for this window's publication"
+    else:
+        status = "Waiting for the next polling window"
+    return {"schedule": "; ".join(format_polling_window(window) for window in windows), "status": status}
+
+
 @router.get("/sources")
 def sources_dashboard(request: Request) -> object:
     conn = connect_database()
@@ -36,7 +67,28 @@ def sources_dashboard(request: Request) -> object:
         ensure_initialized(conn)
         repository.refresh_all_source_freshness(conn)
         sources = visible_ingest_items(repository.list_source_summaries(conn))
+        now = dt.datetime.now(dt.UTC)
+        local_date = now.astimezone(AUTORUN_TIMEZONE).date()
+        for source in sources:
+            source_key = str(source["source_key"])
+            policy = polling_policy(
+                source_key,
+                now=now,
+                publication_found=repository.source_window_publication_found(
+                    conn,
+                    source_key=source_key,
+                    local_date=local_date,
+                ),
+            )
+            if policy is not None:
+                source["polling_policy"] = policy
         autorun_state = repository.get_autorun_state(conn)
+        try:
+            from models.boxoffice.ui_projection import pipeline_health
+
+            health = pipeline_health(conn)
+        except Exception:
+            health = {}
         recent_runs = visible_ingest_items(repository.list_recent_runs(conn, limit=50))[:12]
         log_tails = {str(run["run_id"]): repository.list_log_tail(conn, run["run_id"], limit=40) for run in recent_runs[:4]}
         conn.commit()
@@ -48,6 +100,7 @@ def sources_dashboard(request: Request) -> object:
             "request": request,
             "sources": sources,
             "autorun_state": autorun_state,
+            "pipeline_health": health,
             "recent_runs": recent_runs,
             "log_tails": log_tails,
             "message": request.query_params.get("message"),

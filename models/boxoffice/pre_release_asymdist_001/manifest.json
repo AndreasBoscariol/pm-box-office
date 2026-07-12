@@ -1,0 +1,7 @@
+{
+  "policy": "pre_release_asymdist_001",
+  "status": "rejected",
+  "production_probability_eligible": false,
+  "decision_source": "data/diagnostics/pre_release_asymdist_validation/19_candidate_selection.csv",
+  "reason": "no candidate passed the frozen Phase 6 calibration and proper-score gates"
+}

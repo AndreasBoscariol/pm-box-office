@@ -36,8 +36,9 @@ DATABASE_URL=postgresql://localhost/pm_box_office
 
 ```sh
 cd /Users/andreasboscariol/Desktop/PolyMarket/pm-box-office
-.venv/bin/pip install -r requirements.txt
 .venv/bin/pip install -e .
+# Only needed for historical/research notebooks and diagnostics:
+.venv/bin/pip install -e '.[research]'
 ```
 
 Run migrations:
@@ -70,6 +71,14 @@ Box Office Theory Substack:
 .venv/bin/python -m pm_box_office.sources.boxofficetheory_substack.ingest --full-refresh
 ```
 
+Edward Douglas Substack:
+
+```sh
+.venv/bin/python -m pm_box_office.sources.edwarddouglas_substack.ingest --dry-run
+.venv/bin/python -m pm_box_office.sources.edwarddouglas_substack.ingest --start-date 2026-06-01 --end-date 2026-06-30
+.venv/bin/python -m pm_box_office.sources.edwarddouglas_substack.ingest --full-refresh
+```
+
 Audience snapshots:
 
 ```sh
@@ -99,6 +108,20 @@ AMC collection:
 .venv/bin/python -m pm_box_office.sources.amc.collect init-db
 ```
 
+Live forecast refreshes:
+
+```sh
+.venv/bin/python -m models.boxoffice.refresh_worker --help
+.venv/bin/python -m models.boxoffice.refresh_worker
+```
+
+AMC seat snapshots enqueue debounced forecast refreshes by default. Set
+`AMC_FORECAST_REFRESH_ENABLED=0` to disable enqueueing, or
+`AMC_FORECAST_REFRESH_DEBOUNCE_SECONDS=20` and `FORECAST_REFRESH_MODEL_VERSION=latest`
+to tune refresh behavior. Starting sampled seat collection schedules every
+movie in the live AMC inventory; the movie checkboxes are informational and do
+not gate seat collection.
+
 Polymarket accounts:
 
 ```sh
@@ -119,9 +142,17 @@ Open:
 - `http://127.0.0.1:8000/` or `/sources` for ingest source orchestration
 - `http://127.0.0.1:8000/amc` for AMC campaign collection
 
-Forecast modeling UI and research/model training modules were removed on the
-`cleanup-core-ingest-web` branch. A future forecast page should read from
-database tables directly instead of importing research/model code.
+The forecast refresh worker reads the explicitly selected artifact version from
+`models/boxoffice/ACTIVE_MODEL`. Historical research and diagnostic runners are
+not part of the operational workflow.
+
+## Model Documentation
+
+The production opening-weekend model is documented in
+[`docs/production_model.md`](docs/production_model.md), including the
+pre-release policy, live daily composition, opening-Thursday and preview prior
+updates, AMC same-day plug-in behavior, simulation intervals, and emission
+idempotency rules.
 
 ## Tests
 

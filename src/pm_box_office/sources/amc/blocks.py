@@ -16,6 +16,24 @@ PREMIUM_ATTRIBUTE_KEYWORDS = (
     "d-box",
 )
 
+THURSDAY_BUSINESS_DAY_CUTOFF_MINUTE = 180
+
+
+def belongs_to_exhibition_business_day(
+    local_start_at: dt.datetime,
+    *,
+    exhibition_date: dt.date,
+    next_day_cutoff_minute: int = THURSDAY_BUSINESS_DAY_CUTOFF_MINUTE,
+) -> bool:
+    """Whether a local showtime belongs to the labelled theatrical day.
+
+    Midnight through 02:59 on the next calendar day remains part of the prior
+    exhibition day. 03:00 is the first minute outside it.
+    """
+    delta = (local_start_at.date() - exhibition_date).days
+    minute = local_start_at.hour * 60 + local_start_at.minute
+    return delta == 0 or (delta == 1 and minute < next_day_cutoff_minute)
+
 
 def business_minute_for_showtime(
     local_start_at: dt.datetime,

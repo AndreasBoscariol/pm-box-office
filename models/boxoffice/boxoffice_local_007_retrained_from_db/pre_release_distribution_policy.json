@@ -1,0 +1,18 @@
+{
+  "base_distribution_policy": "production_distribution_v1_raw",
+  "base_distribution_policy_path": "frozen_pre_release_distribution_policy_v1.json",
+  "base_distribution_status": "frozen_unchanged",
+  "market_calibration_status": "not_started_insufficient_market_history",
+  "pit_beta_calibration_status": "not_promoted",
+  "point_policy_status": "frozen_unchanged",
+  "policy_name": "production_distribution_v2_t4_tail_safe",
+  "promotion_evidence": "locked_distribution_tail_calibration_audit",
+  "source_shrinkage_status": "shadow_only",
+  "status": "production",
+  "tail_center_policy": "frozen_point_forecast_usd",
+  "tail_contamination_weight": 0.02,
+  "tail_reference_df": 4,
+  "tail_reference_family": "student_t",
+  "tail_safety_enabled": true,
+  "tail_scale_policy": "median_abs_prior_same_origin_log_residual_divided_by_t4_ppf_0_75_minimum_0_03_fallback_0_35_if_n_lt_30"
+}

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from models.boxoffice import refresh_queue
+from models.boxoffice.input_snapshots import record_ingest_event
 from pm_box_office.sources.amc import db
 from pm_box_office.sources.amc.client import HtmlFetcher
 from pm_box_office.sources.amc.parsers import (
@@ -16,6 +19,12 @@ from pm_box_office.sources.amc.parsers import (
     current_showtime_seats_url,
     fetch_seat_fill,
 )
+
+
+LOGGER = logging.getLogger(__name__)
+FORECAST_REFRESH_ENABLED_ENV = "AMC_FORECAST_REFRESH_ENABLED"
+FORECAST_REFRESH_DEBOUNCE_SECONDS_ENV = "AMC_FORECAST_REFRESH_DEBOUNCE_SECONDS"
+FORECAST_REFRESH_MODEL_VERSION_ENV = "FORECAST_REFRESH_MODEL_VERSION"
 
 
 @dataclass(frozen=True)
@@ -46,15 +55,65 @@ def collect_snapshot(
         showtime_id=showtime.showtime_id,
         prefer_rsc=True,
     )
+    observed = observed_at or db.utc_now()
     db.upsert_seat_snapshot(
         conn,
         showtime=showtime,
         seat_fill=fill,
-        snapshot_utc_at=observed_at or db.utc_now(),
+        snapshot_utc_at=observed,
         minutes_before_showtime=target_offset_minutes,
         raw_cache_path=fill.raw_cache_path,
-        fetched_at=observed_at or db.utc_now(),
+        fetched_at=observed,
     )
+    try:
+        record_ingest_event(
+            conn,
+            source_key="amc_worker",
+            source_run_id=None,
+            available_at_utc=observed,
+            payload={
+                "showtime_id": showtime.showtime_id,
+                "amc_movie_id": showtime.amc_movie_id,
+                "observed_at": observed,
+                "event": "seat_snapshot_collected",
+            },
+        )
+    except Exception:
+        # Seat capture is the source of truth; provenance is best-effort when
+        # a deployment is still catching up on the pipeline schema.
+        LOGGER.exception("could not record AMC ingest event for showtime_id=%s", showtime.showtime_id)
+    enqueue_forecast_refresh(conn, showtime=showtime, observed_at=observed)
+
+
+def enqueue_forecast_refresh(conn: Any, *, showtime: db.StoredShowtime, observed_at: dt.datetime) -> int | None:
+    if not forecast_refresh_enabled():
+        return None
+    try:
+        return refresh_queue.enqueue_from_amc_showtime(
+            conn,
+            showtime_id=showtime.showtime_id,
+            model_version=os.environ.get(FORECAST_REFRESH_MODEL_VERSION_ENV, refresh_queue.DEFAULT_MODEL_VERSION),
+            debounce_seconds=forecast_refresh_debounce_seconds(),
+            source_updated_at=observed_at,
+        )
+    except Exception:
+        LOGGER.exception("could not enqueue forecast refresh for showtime_id=%s", showtime.showtime_id)
+        return None
+
+
+def forecast_refresh_enabled() -> bool:
+    raw = os.environ.get(FORECAST_REFRESH_ENABLED_ENV, "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def forecast_refresh_debounce_seconds() -> int:
+    raw = os.environ.get(FORECAST_REFRESH_DEBOUNCE_SECONDS_ENV)
+    if raw is None:
+        return refresh_queue.DEFAULT_DEBOUNCE_SECONDS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return refresh_queue.DEFAULT_DEBOUNCE_SECONDS
 
 
 class SeatArchiveFetcher:

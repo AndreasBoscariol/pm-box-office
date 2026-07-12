@@ -745,10 +745,6 @@ dd {
   height: auto;
 }
 
-.forecast-chart rect {
-  fill: #ffffff;
-}
-
 .forecast-chart .grid-line {
   stroke: #e4eaee;
   stroke-width: 1;
@@ -760,9 +756,69 @@ dd {
   stroke-width: 1;
 }
 
+.forecast-chart .pre-listing {
+  fill: #edf0f2;
+}
+
+.forecast-chart .bucket-cell {
+  stroke: rgba(255, 255, 255, 0.9);
+  stroke-width: 0.75;
+  shape-rendering: crispEdges;
+}
+
+.forecast-chart .bucket-boundary {
+  stroke: #52716b;
+  stroke-width: 1.25;
+}
+
+.forecast-chart .bucket-label {
+  fill: #41515c;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.forecast-chart .bucket-probability-label {
+  font-size: 11px;
+  font-weight: 700;
+  pointer-events: none;
+}
+
+.forecast-chart .bucket-probability-label-dark {
+  fill: #182026;
+}
+
+.forecast-chart .bucket-probability-label-light {
+  fill: #ffffff;
+}
+
+.forecast-chart .market-open-line {
+  stroke: #2f5f83;
+  stroke-width: 1.5;
+  stroke-dasharray: 4 3;
+}
+
+.forecast-chart .market-open-label {
+  fill: #2f5f83;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.forecast-chart .anchor-dot {
+  fill: #f2c14e;
+  stroke: #182026;
+  stroke-width: 1.5;
+}
+
+.forecast-chart .realized-bucket-outline {
+  fill: none;
+  stroke: #8c2727;
+  stroke-width: 2;
+  pointer-events: none;
+}
+
 .forecast-chart .axis-label {
   fill: #5d6b75;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .forecast-chart .regime-label {
@@ -822,6 +878,77 @@ dd {
   gap: 6px;
 }
 
+.forecast-data-table {
+  margin-top: 14px;
+  border: 1px solid #d5dde2;
+  border-radius: 8px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.forecast-data-table summary {
+  padding: 11px 12px;
+  color: #182026;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.forecast-table-scroll {
+  overflow-x: auto;
+  border-top: 1px solid #d5dde2;
+}
+
+.forecast-data-table table {
+  width: 100%;
+  min-width: 760px;
+  border-collapse: collapse;
+  table-layout: auto;
+}
+
+.forecast-data-table th,
+.forecast-data-table td {
+  padding: 10px 12px;
+  border-right: 1px solid #edf1f3;
+  border-bottom: 1px solid #edf1f3;
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: break-word;
+}
+
+.forecast-data-table th:first-child,
+.forecast-data-table td:first-child {
+  min-width: 140px;
+}
+
+.forecast-data-table th:nth-last-child(-n + 2),
+.forecast-data-table td:nth-last-child(-n + 2) {
+  white-space: nowrap;
+}
+
+.forecast-data-table th:last-child,
+.forecast-data-table td:last-child {
+  border-right: 0;
+}
+
+.forecast-data-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.forecast-data-table th {
+  color: #5d6b75;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  background: #f1f4f6;
+}
+
+.forecast-data-table td small {
+  display: block;
+  margin-top: 3px;
+  color: #6d7a83;
+  font-size: 12px;
+}
+
 .legend-swatch {
   display: inline-block;
   width: 18px;
@@ -842,12 +969,84 @@ dd {
   background: rgba(47, 95, 131, 0.22);
 }
 
+.legend-swatch.probability {
+  background: #0f6f5b;
+}
+
+.legend-swatch.unavailable {
+  border: 1px solid #c8d1d7;
+  background: repeating-linear-gradient(45deg, #f4f6f7, #f4f6f7 3px, #c8d1d7 3px, #c8d1d7 5px);
+}
+
 .legend-swatch.actual {
   height: 3px;
   background: #8c2727;
 }
 
 .forecast-components-detail {
+  margin-top: 12px;
+}
+
+.bucket-definition {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0;
+  margin: 12px 0;
+  border: 1px solid #d5dde2;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.bucket-definition div {
+  min-width: 0;
+  padding: 10px 12px;
+  border-right: 1px solid #e4eaee;
+  border-bottom: 1px solid #e4eaee;
+}
+
+.bucket-definition strong {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.bucket-probability-table {
+  overflow-x: auto;
+}
+
+.bucket-probability-row {
+  display: grid;
+  min-width: 820px;
+  grid-template-columns: minmax(180px, 1.5fr) repeat(4, minmax(120px, 1fr)) 80px;
+  border-top: 1px solid #e4eaee;
+  background: #ffffff;
+}
+
+.bucket-probability-row span {
+  min-width: 0;
+  padding: 9px 10px;
+  overflow-wrap: anywhere;
+}
+
+.bucket-probability-row:not(.head) span:not(:first-child) {
+  text-align: right;
+}
+
+.bucket-probability-row.head {
+  border-top: 0;
+  background: #f1f4f6;
+  color: #5d6b75;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.bucket-probability-row.total {
+  font-weight: 700;
+}
+
+.interval-diagnostics {
   margin-top: 12px;
 }
 

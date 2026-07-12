@@ -30,6 +30,11 @@
           <small>{{ model_versions|length }} versions</small>
         </div>
         <div>
+          <span class="label">Distribution</span>
+          <strong>{{ distribution_policy.label if distribution_policy is defined else "-" }}</strong>
+          <small>{{ (distribution_policy.status or "-") if distribution_policy is defined else "-" }} · {{ distribution_policy.tail_label if distribution_policy is defined else "-" }}</small>
+        </div>
+        <div>
           <span class="label">Latest run</span>
           <strong>{{ summary.latest_run_time|time_ago }}</strong>
           <small>{{ summary.latest_run_time|local_short_datetime }}</small>
@@ -69,6 +74,10 @@
             <option value="{{ target }}" {% if target == filters.target %}selected{% endif %}>{{ target|replace("_", " ") }}</option>
             {% endfor %}
           </select>
+          <label class="checkbox-label">
+            <input type="checkbox" name="include_coverage_fallback" value="1" {% if filters.include_coverage_fallback %}checked{% endif %}>
+            Historical coverage fallback
+          </label>
           <button type="submit">Filter</button>
           <a class="button-link shaded-link" href="/forecasts">Reset</a>
         </form>
@@ -91,11 +100,17 @@
             <span>
               <a href="/forecasts/{{ row.release_run_id }}?model_version={{ row.model_version }}">{{ row.title }}</a>
               <small><code>{{ row.release_run_id }}</code></small>
+              {% if row.coverage_fallback %}<small class="warning-text">Historical model: {{ row.model_version }}</small>{% endif %}
             </span>
             <span>{{ row.opening_weekend_start|forecast_date_value }}</span>
             <span>
+              {% if row.prediction_status == "available" %}
               <strong>{{ row.origin_key }}</strong>
               <small>{{ row.as_of_utc|local_short_datetime }}</small>
+              {% else %}
+              <strong>Unavailable</strong>
+              <small>No eligible production inputs</small>
+              {% endif %}
             </span>
             <span>{{ row.point_usd|forecast_usd }}</span>
             <span>{{ row.lo80_usd|forecast_interval(row.hi80_usd) }}</span>

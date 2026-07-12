@@ -23,147 +23,20 @@
       </div>
       {% endif %}
 
-      {% if movie and latest %}
-      <section class="status-strip" aria-label="Latest forecast">
-        <div>
-          <span class="label">Latest OW</span>
-          <strong>{{ latest.point_usd|forecast_usd }}</strong>
-          <small>{{ latest.origin_key }} · {{ latest.as_of_utc|local_short_datetime }}</small>
-        </div>
-        <div>
-          <span class="label">80% interval</span>
-          <strong>{{ latest.lo80_usd|forecast_interval(latest.hi80_usd) }}</strong>
-          <small>{{ latest.interval_model or "-" }}</small>
-        </div>
-        <div>
-          <span class="label">95% interval</span>
-          <strong>{{ latest.lo95_usd|forecast_interval(latest.hi95_usd) }}</strong>
-          <small>{{ latest.component_source or "-" }}</small>
-        </div>
-        <div>
-          <span class="label">Actual / error</span>
-          <strong>{{ latest.actual_usd|forecast_usd }}</strong>
-          <small>{{ latest.log_error|forecast_signed }} · {{ latest.abs_pct_error|forecast_percent }}</small>
-        </div>
-        <div>
-          <span class="label">Origin</span>
-          <strong>{{ latest.origin_key }}</strong>
-          <small>{{ latest.regime|replace("_", " ") }}</small>
-        </div>
-        <div>
-          <span class="label">Model</span>
-          <strong>{{ selected_model_version or "-" }}</strong>
-          <small><code>{{ latest.run_id }}</code></small>
-        </div>
-      </section>
-      {% endif %}
-
-      <section>
-        <div class="section-head compact-head">
-          <h1>Timeline</h1>
-          <span>{{ selected_model_version or "No model" }}</span>
-        </div>
-        <form class="toolbar forecast-toolbar" method="get" action="/forecasts/{{ release_run_id }}">
-          <select name="model_version" aria-label="Model version">
-            {% for version in model_versions %}
-            <option value="{{ version }}" {% if version == selected_model_version %}selected{% endif %}>{{ version }}</option>
-            {% endfor %}
-            {% if not model_versions %}
-            <option value="">No model versions</option>
-            {% endif %}
-          </select>
-          <button type="submit">Load</button>
-        </form>
-
-        <div class="forecast-chart-card">
-          {% if chart.has_data %}
-          <svg
-            class="forecast-chart"
-            viewBox="0 0 {{ chart.width }} {{ chart.height }}"
-            role="img"
-            aria-label="Opening weekend forecast point estimate and prediction intervals from P_-14 through SUN_EOD"
-          >
-            <rect x="0" y="0" width="{{ chart.width }}" height="{{ chart.height }}" rx="8" fill="#ffffff"></rect>
-            {% for tick in chart.y_ticks %}
-            <line class="grid-line" x1="{{ chart.left }}" y1="{{ tick.y }}" x2="{{ chart.width - chart.right }}" y2="{{ tick.y }}" stroke="#e4eaee" stroke-width="1"></line>
-            <text class="axis-label y-label" x="{{ chart.left - 12 }}" y="{{ tick.y + 4 }}" text-anchor="end" fill="#5d6b75" font-size="12">{{ tick.label }}</text>
-            {% endfor %}
-            {% for marker in chart.regime_markers %}
-            <line class="regime-line" x1="{{ marker.x }}" y1="{{ chart.top }}" x2="{{ marker.x }}" y2="{{ chart.height - chart.bottom }}" stroke="#d4dde3" stroke-width="1" stroke-dasharray="4 4"></line>
-            <text class="axis-label regime-label" x="{{ marker.x + 5 }}" y="{{ chart.top + 12 }}" fill="#5d6b75" font-size="12" font-weight="700">{{ marker.label }}</text>
-            {% endfor %}
-            {% if chart.band95_path %}
-            <path class="interval-band band-95" d="{{ chart.band95_path }}" fill="rgba(47, 95, 131, 0.14)" stroke="none"></path>
-            {% endif %}
-            {% if chart.band80_path %}
-            <path class="interval-band band-80" d="{{ chart.band80_path }}" fill="rgba(36, 122, 85, 0.18)" stroke="none"></path>
-            {% endif %}
-            {% if chart.actual_y is not none %}
-            <line class="actual-line" x1="{{ chart.left }}" y1="{{ chart.actual_y }}" x2="{{ chart.width - chart.right }}" y2="{{ chart.actual_y }}" stroke="#8c2727" stroke-width="2" stroke-dasharray="5 4"></line>
-            <text class="actual-label" x="{{ chart.width - chart.right - 4 }}" y="{{ chart.actual_y - 6 }}" text-anchor="end" fill="#8c2727" font-size="12" font-weight="700">Actual {{ chart.actual_label }}</text>
-            {% endif %}
-            <path class="point-line" d="{{ chart.point_path }}" fill="none" stroke="#182026" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"></path>
-            {% for point in chart.points %}
-            <circle class="point-dot regime-dot-{{ point.regime }}" cx="{{ point.x }}" cy="{{ point.y }}" r="4" fill="#ffffff" stroke="#182026" stroke-width="2">
-              <title>{{ point.origin_key }}: {{ point.point_label }}</title>
-            </circle>
-            {% endfor %}
-            {% for label in chart.x_labels %}
-            <text class="axis-label x-label" x="{{ label.x }}" y="{{ chart.height - 24 }}" text-anchor="middle" fill="#5d6b75" font-size="12">{{ label.label }}</text>
-            {% endfor %}
-          </svg>
-          <div class="forecast-chart-legend">
-            <span><i class="legend-swatch point"></i>Point estimate</span>
-            <span><i class="legend-swatch band80"></i>80% prediction interval</span>
-            <span><i class="legend-swatch band95"></i>95% prediction interval</span>
-            <span><i class="legend-swatch actual"></i>Actual</span>
-          </div>
-          {% else %}
-          <div class="empty-row">No opening-weekend forecast trajectory is available for this model version.</div>
-          {% endif %}
-        </div>
-
-        <details class="operator-details forecast-components-detail">
-          <summary>
-            <span>Origin Components</span>
-            <span>Daily composition and model sources</span>
-          </summary>
-          {% for row in timeline %}
-          {% if row.status == "ready" and row.components %}
-          <details class="operator-details forecast-components">
-            <summary>
-              <span>{{ row.origin_key }} components</span>
-              <span>{{ row.point_usd|forecast_usd }} · {{ row.components|length }} rows</span>
-            </summary>
-            <div class="table forecast-component-table">
-              <div class="forecast-row forecast-component-row head">
-                <span>Day</span>
-                <span>Type</span>
-                <span>Point</span>
-                <span>Sigma</span>
-                <span>80% PI</span>
-                <span>95% PI</span>
-                <span>Model</span>
-                <span>Source</span>
-                <span>Notes</span>
-              </div>
-              {% for component in row.components %}
-              <div class="forecast-row forecast-component-row">
-                <span>{{ component.component_day }}</span>
-                <span><span class="status-pill source-{{ (component.component_type or 'unknown')|lower|replace('_', '-') }}">{{ component.component_type }}</span></span>
-                <span>{{ component.component_point_usd|forecast_usd }}</span>
-                <span>{{ component.component_sigma_log|forecast_signed }}</span>
-                <span>{{ component.component_lo80_usd|forecast_interval(component.component_hi80_usd) }}</span>
-                <span>{{ component.component_lo95_usd|forecast_interval(component.component_hi95_usd) }}</span>
-                <span>{{ component.component_model or "-" }}</span>
-                <span>{{ component.component_source or "-" }}</span>
-                <span>{{ component.component_notes or "-" }}</span>
-              </div>
-              {% endfor %}
-            </div>
-          </details>
-          {% endif %}
-          {% endfor %}
-        </details>
-      </section>
+      {% include "_forecast_detail_live.html" with context %}
+      <script>
+        (() => {
+          const panel = document.getElementById("forecast-live-panel");
+          if (!panel || !window.EventSource) return;
+          const model = {{ selected_model_version|tojson }};
+          const stream = new EventSource(`/forecasts/{{ release_run_id }}/events?model_version=${encodeURIComponent(model)}`);
+          stream.addEventListener("forecast_updated", () => {
+            const current = document.getElementById("forecast-live-panel");
+            if (current && window.htmx) {
+              window.htmx.ajax("GET", current.getAttribute("hx-get"), {target: "#forecast-live-panel", swap: "outerHTML"});
+            }
+          });
+          window.addEventListener("beforeunload", () => stream.close(), {once: true});
+        })();
+      </script>
 {% endblock %}

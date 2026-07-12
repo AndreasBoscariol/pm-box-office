@@ -1,0 +1,174 @@
+<div
+  id="forecast-live-panel"
+  class="forecast-live-panel"
+  hx-get="/forecasts/{{ release_run_id }}/live?model_version={{ selected_model_version }}&grid={{ selected_grid_variant|default('canonical') }}"
+  hx-trigger="every 10s"
+  hx-swap="outerHTML"
+>
+  {% if movie and latest %}
+  <section class="status-strip" aria-label="Latest forecast">
+    <div>
+      <span class="label">Latest OW</span>
+      <strong>{{ latest.point_usd|forecast_usd }}</strong>
+      <small>{{ latest.origin_key }} · {{ latest.as_of_utc|local_short_datetime }}</small>
+    </div>
+    {% if latest.actual_usd is not none %}
+    <div>
+      <span class="label">Actual / error</span>
+      <strong>{{ latest.actual_usd|forecast_usd }}</strong>
+      <small>{{ latest.log_error|forecast_signed }} · {{ latest.abs_pct_error|forecast_percent }}</small>
+    </div>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  <section>
+    <div class="section-head compact-head">
+      <h2>Forecast timeline</h2>
+    </div>
+    <form class="toolbar forecast-toolbar" method="get" action="/forecasts/{{ release_run_id }}">
+      <select name="model_version" aria-label="Model version">
+        {% for version in model_versions %}
+        <option value="{{ version }}" {% if version == selected_model_version %}selected{% endif %}>{{ version }}</option>
+        {% endfor %}
+        {% if not model_versions %}
+        <option value="">No model versions</option>
+        {% endif %}
+      </select>
+      {% if grid_variants_available|default(false) %}
+      <select name="grid" aria-label="Bucket grid">
+        <option value="canonical" {% if selected_grid_variant == "canonical" %}selected{% endif %}>Canonical grid</option>
+        <option value="higher_strike" {% if selected_grid_variant == "higher_strike" %}selected{% endif %}>Higher clean strike</option>
+      </select>
+      {% endif %}
+      <button type="submit">Load</button>
+    </form>
+
+    <div class="forecast-chart-card">
+      {% if market_chart is defined and market_chart.has_grid %}
+      <svg
+        class="forecast-chart"
+        viewBox="0 0 {{ market_chart.width }} {{ market_chart.height }}"
+        role="img"
+        aria-label="Opening-weekend market bucket probabilities from P_-14 through SUN_EOD"
+      >
+        <defs>
+          <pattern id="missing-probability" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+            <rect width="6" height="6" fill="#f4f6f7"></rect>
+            <line x1="0" y1="0" x2="0" y2="6" stroke="#c8d1d7" stroke-width="2"></line>
+          </pattern>
+        </defs>
+        <rect x="0" y="0" width="{{ market_chart.width }}" height="{{ market_chart.height }}" rx="8" fill="#ffffff"></rect>
+        <rect class="pre-listing" x="{{ market_chart.left }}" y="{{ market_chart.top }}" width="{{ market_chart.pre_listing_width }}" height="{{ market_chart.height - market_chart.top - market_chart.bottom }}"></rect>
+        {% for cell in market_chart.cells %}
+        <rect class="bucket-cell {% if cell.probability is none %}bucket-cell-unavailable{% endif %}" x="{{ cell.x }}" y="{{ cell.y }}" width="{{ cell.width }}" height="{{ cell.height }}" fill="{{ cell.color }}">
+          <title>{{ cell.tooltip }}</title>
+        </rect>
+        {% if cell.show_label %}
+        <text class="bucket-probability-label bucket-probability-label-{{ cell.label_tone }}" x="{{ cell.x + cell.width / 2 }}" y="{{ cell.y + cell.height / 2 + 4 }}" text-anchor="middle">{{ cell.label }}</text>
+        {% endif %}
+        {% endfor %}
+        {% for tick in market_chart.y_ticks %}
+        <line class="grid-line" x1="{{ market_chart.left }}" y1="{{ tick.y }}" x2="{{ market_chart.width - market_chart.right }}" y2="{{ tick.y }}"></line>
+        {% endfor %}
+        {% for boundary in market_chart.boundary_lines %}
+        <line class="bucket-boundary" x1="{{ market_chart.left }}" y1="{{ boundary.y }}" x2="{{ market_chart.width - market_chart.right }}" y2="{{ boundary.y }}"></line>
+        {% endfor %}
+        {% for region in market_chart.bucket_regions %}
+        <text class="bucket-label" x="{{ market_chart.left - 12 }}" y="{{ region.y + region.height / 2 + 4 }}" text-anchor="end">{% if region.tail == "lower" %}↓ {% elif region.tail == "upper" %}↑ {% endif %}{{ region.label }}</text>
+        {% endfor %}
+        {% for marker in market_chart.regime_markers %}
+        <line class="regime-line" x1="{{ marker.x }}" y1="{{ market_chart.top }}" x2="{{ marker.x }}" y2="{{ market_chart.height - market_chart.bottom }}"></line>
+        {% endfor %}
+        <line class="market-open-line" x1="{{ market_chart.listing_x }}" y1="{{ market_chart.top }}" x2="{{ market_chart.listing_x }}" y2="{{ market_chart.height - market_chart.bottom }}"></line>
+        {% if market_chart.actual_bucket_index is not none %}
+        <rect class="realized-bucket-outline" x="{{ market_chart.realized_x }}" y="{{ market_chart.realized_y }}" width="{{ market_chart.realized_width }}" height="{{ market_chart.realized_height }}"></rect>
+        {% endif %}
+        {% if market_chart.actual_y is not none %}
+        <line class="actual-line" x1="{{ market_chart.left }}" y1="{{ market_chart.actual_y }}" x2="{{ market_chart.width - market_chart.right }}" y2="{{ market_chart.actual_y }}"></line>
+        <text class="actual-label" x="{{ market_chart.width - market_chart.right - 4 }}" y="{{ market_chart.actual_y - 6 }}" text-anchor="end">Actual {{ market_chart.actual_label }}</text>
+        {% endif %}
+        <path class="point-line" d="{{ market_chart.point_path }}"></path>
+        <circle class="anchor-dot" cx="{{ market_chart.anchor_x }}" cy="{{ market_chart.anchor_y }}" r="6"><title>Anchor forecast {{ market_chart.anchor_label }}</title></circle>
+        {% for point in market_chart.points %}
+        <circle class="point-dot regime-dot-{{ point.regime }}" cx="{{ point.x }}" cy="{{ point.y }}" r="4">
+          <title>{{ point.tooltip }}</title>
+        </circle>
+        {% endfor %}
+        {% for label in market_chart.x_labels %}
+        <text class="axis-label x-label" x="{{ label.x }}" y="{{ market_chart.height - 24 }}" text-anchor="middle">{{ label.label }}</text>
+        {% endfor %}
+      </svg>
+      <div class="forecast-chart-legend">
+        <span><i class="legend-swatch point"></i>Point estimate</span>
+        {% if market_chart.has_probabilities %}
+        <span><i class="legend-swatch probability"></i>Probability at {{ market_chart.latest_probability_origin }}</span>
+        {% else %}
+        <span><i class="legend-swatch unavailable"></i>Probability distribution unavailable for this refresh</span>
+        {% endif %}
+        <span><i class="legend-swatch actual"></i>Actual</span>
+      </div>
+      {% else %}
+      <div class="empty-row">{% if market_chart is defined %}{{ market_chart.reason|default("Market buckets unavailable") }}{% else %}Market buckets unavailable{% endif %}.</div>
+      {% endif %}
+    </div>
+
+    {% if market_chart is defined and market_chart.has_probabilities %}
+    <details class="forecast-data-table">
+      <summary>Latest bucket probabilities · {{ market_chart.latest_probability_origin }}</summary>
+      <div class="forecast-table-scroll">
+        <table>
+          <thead><tr><th scope="col">Bucket</th><th scope="col">Probability</th></tr></thead>
+          <tbody>{% for probability in market_chart.latest_probabilities %}<tr><td>{{ probability.label }}</td><td>{{ probability.probability|forecast_percent }}</td></tr>{% endfor %}</tbody>
+        </table>
+      </div>
+    </details>
+    {% endif %}
+
+    {% if movie and latest %}
+    <details class="forecast-data-table" open>
+      <summary>Latest forecast breakdown · {{ latest.origin_key }}</summary>
+      <div class="forecast-table-scroll">
+        <table>
+          <thead><tr><th scope="col">Day / window</th><th scope="col">Source data</th><th scope="col">Resulting estimate</th><th scope="col">80% range</th></tr></thead>
+          <tbody>
+            {% for component in component_breakdown|default([]) %}
+            <tr>
+              <td><strong>{{ component.day }}</strong><small>{{ component.window }}</small></td>
+              <td><strong>{{ component.source }}</strong><small>{{ component.source_detail }}</small></td>
+              <td><strong>{{ component.point_usd|forecast_usd }}</strong>{% if component.share is not none %}<small>{{ component.share|forecast_percent }} of opening weekend</small>{% endif %}</td>
+              <td>{% if component.is_observed %}Observed{% else %}{{ component.lo80_usd|forecast_interval(component.hi80_usd) }}{% endif %}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4">No daily component breakdown was stored for this forecast.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+    {% endif %}
+
+    {% if pre_release_breakdown|default([]) %}
+    <details class="forecast-data-table">
+      <summary>Pre-release inputs · {{ pre_release_breakdown|length }} window{% if pre_release_breakdown|length != 1 %}s{% endif %}</summary>
+      <div class="forecast-table-scroll">
+        <table>
+          <thead><tr><th scope="col">Window</th><th scope="col">Opening-weekend estimate</th><th scope="col">Source count</th><th scope="col">Contributing forecasts</th><th scope="col">80% range</th></tr></thead>
+          <tbody>
+            {% for row in pre_release_breakdown %}
+            <tr>
+              <td><strong>{{ row.window }}</strong><small>{{ row.origin_key }}</small></td>
+              <td>{{ row.point_usd|forecast_usd }}</td>
+              <td>{{ row.source_count if row.source_count is not none else "-" }}</td>
+              <td>{% if row.sources %}{{ row.sources|join(" · ") }}{% else %}-{% endif %}</td>
+              <td>{{ row.lo80_usd|forecast_interval(row.hi80_usd) }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+    {% endif %}
+
+  </section>
+</div>

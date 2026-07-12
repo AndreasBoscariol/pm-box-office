@@ -336,6 +336,99 @@ def record_autorun_trigger(conn: Any, *, schedule_key: str = DAILY_RUN_ALL_SCHED
     )
 
 
+def source_has_recent_trigger(
+    conn: Any,
+    *,
+    source_key: str,
+    trigger: str,
+    since: dt.datetime,
+) -> bool:
+    """Avoid duplicate source polls when the scheduler restarts within a slot."""
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM ingest_runs
+        WHERE source_key = %s
+          AND trigger = %s
+          AND requested_at >= %s
+        LIMIT 1
+        """,
+        (source_key, trigger, since),
+    ).fetchone()
+    return row is not None
+
+
+def source_window_publication_found(conn: Any, *, source_key: str, local_date: dt.date) -> bool:
+    """Whether a source has produced the expected publication for this window.
+
+    Polling continues only until a newly dated source record exists.  This uses
+    source publication dates rather than ingest-run success because a scraper
+    can complete successfully before an upstream source has published.
+    """
+    queries: dict[str, tuple[str, str, tuple[Any, ...]]] = {
+        "boxofficepro": (
+            "boxofficepro_articles",
+            "SELECT 1 FROM boxofficepro_articles WHERE discovered_date = %s LIMIT 1",
+            (local_date,),
+        ),
+        "boxofficereport": (
+            "boxofficereport_articles",
+            "SELECT 1 FROM boxofficereport_articles WHERE prediction_made_date = %s LIMIT 1",
+            (local_date,),
+        ),
+        "boxofficetheory": (
+            "boxofficetheory_posts",
+            "SELECT 1 FROM boxofficetheory_posts WHERE published_date = %s LIMIT 1",
+            (local_date,),
+        ),
+        "boxofficetheory_substack": (
+            "boxofficetheory_substack_posts",
+            "SELECT 1 FROM boxofficetheory_substack_posts WHERE published_date = %s LIMIT 1",
+            (local_date,),
+        ),
+        "edwarddouglas_substack": (
+            "edwarddouglas_substack_posts",
+            "SELECT 1 FROM edwarddouglas_substack_posts WHERE published_date = %s LIMIT 1",
+            (local_date,),
+        ),
+        "boxofficeguru": (
+            "boxofficeguru_articles",
+            """
+            SELECT 1
+            FROM boxofficeguru_articles
+            WHERE prediction_made_date = %s
+               OR target_start_date BETWEEN %s AND %s
+            LIMIT 1
+            """,
+            (local_date, local_date, local_date + dt.timedelta(days=4)),
+        ),
+        "toddmthatcher": (
+            "toddmthatcher_articles",
+            "SELECT 1 FROM toddmthatcher_articles WHERE discovered_date = %s LIMIT 1",
+            (local_date,),
+        ),
+        "joblo": (
+            "joblo_articles",
+            "SELECT 1 FROM joblo_articles WHERE discovered_date = %s LIMIT 1",
+            (local_date,),
+        ),
+        # The daily chart for the prior calendar day is the expected file.
+        "the_numbers": (
+            "daily_chart_pages",
+            "SELECT 1 FROM daily_chart_pages WHERE chart_date::date = %s LIMIT 1",
+            (local_date - dt.timedelta(days=1),),
+        ),
+    }
+    query = queries.get(source_key)
+    if query is None:
+        return False
+    relation_name, sql, params = query
+    relation = conn.execute("SELECT to_regclass(%s)", (relation_name,)).fetchone()
+    if not relation or relation[0] is None:
+        return False
+    return conn.execute(sql, params).fetchone() is not None
+
+
 def mark_run_spawned(conn: Any, *, run_id: uuid.UUID | str, pid: int) -> None:
     conn.execute(
         """
@@ -607,6 +700,13 @@ def refresh_all_source_freshness(conn: Any) -> None:
     )
     refresh_table_metric(
         conn,
+        source_key="edwarddouglas_substack",
+        metric_key="movie_predictions",
+        table_name="edwarddouglas_substack_predictions",
+        timestamp_column="fetched_at",
+    )
+    refresh_table_metric(
+        conn,
         source_key="boxofficeguru",
         metric_key="weekend_predictions",
         table_name="boxofficeguru_predictions",
@@ -614,9 +714,16 @@ def refresh_all_source_freshness(conn: Any) -> None:
     )
     refresh_table_metric(
         conn,
-        source_key="the_numbers_predictions",
-        metric_key="prediction_rows",
-        table_name="the_numbers_prediction_rows",
+        source_key="toddmthatcher",
+        metric_key="weekend_predictions",
+        table_name="toddmthatcher_weekend_predictions",
+        timestamp_column="fetched_at",
+    )
+    refresh_table_metric(
+        conn,
+        source_key="joblo",
+        metric_key="weekend_predictions",
+        table_name="joblo_weekend_predictions",
         timestamp_column="fetched_at",
     )
     refresh_table_metric(
@@ -668,6 +775,21 @@ def refresh_all_source_freshness(conn: Any) -> None:
         metric_key="seat_snapshots",
         table_name="amc_seat_snapshots",
         timestamp_column="fetched_at",
+    )
+    refresh_table_metric(
+        conn,
+        source_key="polymarket_metadata",
+        metric_key="events",
+        table_name="prediction_market_backtest.polymarket_events",
+        timestamp_column="synced_at_utc",
+    )
+    refresh_table_metric(
+        conn,
+        source_key="polymarket_metadata",
+        metric_key="validated_bucket_sets",
+        table_name="prediction_market_backtest.event_bucket_validations",
+        timestamp_column="validated_at",
+        where_clause="validation_status = 'valid'",
     )
 
 

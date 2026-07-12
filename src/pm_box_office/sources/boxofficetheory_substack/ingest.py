@@ -25,8 +25,8 @@ from pm_box_office.domain import movies as movie_identity
 from pm_box_office.sources.boxofficetheory import ingest as theory
 from pm_box_office.sources.common.cli import parse_date_arg
 from pm_box_office.sources.common.fetch import CacheFirstFetcher
+from pm_box_office.sources.common.ocr import OcrResult, OcrToken, TesseractOcr
 from pm_box_office.sources.common.schema import acquire_schema_init_lock
-from pm_box_office.sources.the_numbers.predictions import OcrResult, OcrToken, TesseractOcr
 
 
 BASE_URL = "https://boxofficetheory.substack.com"

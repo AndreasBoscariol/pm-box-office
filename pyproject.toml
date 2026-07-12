@@ -16,20 +16,33 @@ dependencies = [
   "fake-useragent>=2.0",
   "playwright>=1.45",
   "numpy>=1.26",
+  "scipy>=1.11",
   "pandas>=2.2",
+  "pyarrow>=16.0",
+  "websockets>=15,<16",
+]
+
+[project.optional-dependencies]
+research = [
+  "scipy>=1.12",
+  "scikit-learn>=1.4",
 ]
 
 [project.scripts]
+prediction-market = "prediction_market_backtest.cli:main"
 pm-box-office-amc-worker = "pm_box_office.sources.amc.jobs.worker:main"
 pm-box-office-collect-amc = "pm_box_office.sources.amc.collect:main"
 pm-box-office-amc-seat-tolerance = "pm_box_office.sources.amc.seat_tolerance_diagnostic:main"
 pm-box-office-polymarket-accounts = "pm_box_office.sources.polymarket.accounts:main"
+pm-box-office-polymarket-metadata-ingest = "pm_box_office.sources.polymarket.ingest:main"
 pm-box-office-boxofficepro-ingest = "pm_box_office.sources.boxofficepro.ingest:main"
 pm-box-office-boxofficereport-ingest = "pm_box_office.sources.boxofficereport.ingest:main"
 pm-box-office-boxofficetheory-ingest = "pm_box_office.sources.boxofficetheory.ingest:main"
+pm-box-office-edwarddouglas-substack-ingest = "pm_box_office.sources.edwarddouglas_substack.ingest:main"
 pm-box-office-boxofficeguru-ingest = "pm_box_office.sources.boxofficeguru.ingest:main"
+pm-box-office-toddmthatcher-ingest = "pm_box_office.sources.toddmthatcher.ingest:main"
+pm-box-office-joblo-ingest = "pm_box_office.sources.joblo.ingest:main"
 pm-box-office-scrape-the-numbers = "pm_box_office.sources.the_numbers.ingest:main"
-pm-box-office-the-numbers-predictions = "pm_box_office.sources.the_numbers.predictions:main"
 pm-box-office-audience-ingest = "pm_box_office.sources.audience.ingest:main"
 pm-box-office-wikipedia-ingest = "pm_box_office.sources.wikipedia.ingest:main"
 pm-box-office-rotten-tomatoes-ingest = "pm_box_office.sources.rotten_tomatoes.ingest:main"

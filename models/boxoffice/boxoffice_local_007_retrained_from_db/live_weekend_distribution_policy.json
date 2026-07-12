@@ -1,0 +1,22 @@
+{
+  "policy_name": "production_live_weekend_cdf_v1",
+  "policy_version": "v1",
+  "distribution_schema_version": "live_ow_cdf_v1",
+  "simulation_draw_count": 50000,
+  "quantile_grid": {"count": 201, "method": "interior_even"},
+  "component_dependence_policy": "independent_component_residual_draws",
+  "actual_source_policy": "daily_box_office_non_estimate_as_of",
+  "AMC_eligibility_policy": "eligible_current_day_only",
+  "AMC_uncertainty_floor_policy": "existing_amc_and_daily_interval_policy",
+  "preview_update_policy": "frozen_thursday_preview_updater",
+  "missing_actual_fallback_policy": "latest_leakage_safe_state",
+  "missing_AMC_fallback_policy": "state_appropriate_baseline",
+  "live_tail_policy": "disabled",
+  "after_friday_production": "independent_component_benchmark",
+  "after_friday_mixture_status": "shadow_only",
+  "after_saturday_production": "signed_saturday_surprise_sunday_distribution",
+  "after_saturday_pooled_status": "benchmark_preserved",
+  "amc_component_status": "production_mechanics_forward_validation_active",
+  "joint_residual_status": "shadow_research_priority",
+  "training_cutoff": "2026-07-10"
+}

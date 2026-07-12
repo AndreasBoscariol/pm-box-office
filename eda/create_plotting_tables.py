@@ -52,6 +52,7 @@ def empty_estimate_select() -> str:
             NULL::date AS estimate_date,
             NULL::date AS target_start_date,
             NULL::date AS target_end_date,
+            NULL::integer AS target_day_count,
             NULL::text AS forecast_metric,
             NULL::numeric AS estimate_low_usd,
             NULL::numeric AS estimate_high_usd,
@@ -76,6 +77,7 @@ def estimate_union_sql(conn: Any) -> str:
                 COALESCE(a.discovered_date, p.target_start_date)::date AS estimate_date,
                 p.target_start_date,
                 p.target_end_date,
+                (p.target_end_date - p.target_start_date + 1)::integer AS target_day_count,
                 p.forecast_metric,
                 p.range_low_usd::numeric AS estimate_low_usd,
                 p.range_high_usd::numeric AS estimate_high_usd,
@@ -100,6 +102,7 @@ def estimate_union_sql(conn: Any) -> str:
                 COALESCE(p.prediction_made_at::date, a.prediction_made_date, p.target_start_date)::date AS estimate_date,
                 p.target_start_date,
                 p.target_end_date,
+                (p.target_end_date - p.target_start_date + 1)::integer AS target_day_count,
                 p.forecast_metric,
                 p.weekend_gross_prediction_usd::numeric AS estimate_low_usd,
                 p.weekend_gross_prediction_usd::numeric AS estimate_high_usd,
@@ -123,6 +126,7 @@ def estimate_union_sql(conn: Any) -> str:
                 COALESCE(p.prediction_made_at::date, a.prediction_made_date, p.target_start_date)::date AS estimate_date,
                 p.target_start_date,
                 p.target_end_date,
+                (p.target_end_date - p.target_start_date + 1)::integer AS target_day_count,
                 p.forecast_metric,
                 p.weekend_gross_prediction_usd::numeric AS estimate_low_usd,
                 p.weekend_gross_prediction_usd::numeric AS estimate_high_usd,
@@ -136,6 +140,30 @@ def estimate_union_sql(conn: Any) -> str:
             WHERE p.weekend_gross_prediction_usd IS NOT NULL
             """
         )
+    if relation_exists(conn, "toddmthatcher_weekend_predictions"):
+        selects.append(
+            """
+            SELECT
+                'toddmthatcher'::text AS estimate_source,
+                p.prediction_id::bigint AS source_prediction_id,
+                p.movie_id,
+                COALESCE(p.prediction_made_date, a.discovered_date, p.target_start_date)::date AS estimate_date,
+                p.target_start_date,
+                p.target_end_date,
+                (p.target_end_date - p.target_start_date + 1)::integer AS target_day_count,
+                p.forecast_metric,
+                p.weekend_gross_prediction_usd::numeric AS estimate_low_usd,
+                p.weekend_gross_prediction_usd::numeric AS estimate_high_usd,
+                p.weekend_gross_prediction_usd::numeric AS estimate_mid_usd,
+                0::numeric AS estimate_width_usd,
+                p.source_movie_title,
+                NULL::text AS distributor,
+                p.raw_forecast_text
+            FROM toddmthatcher_weekend_predictions p
+            LEFT JOIN toddmthatcher_articles a ON a.article_id = p.article_id
+            WHERE p.weekend_gross_prediction_usd IS NOT NULL
+            """
+        )
     if relation_exists(conn, "boxofficetheory_predictions"):
         selects.append(
             """
@@ -144,8 +172,22 @@ def estimate_union_sql(conn: Any) -> str:
                 p.prediction_id::bigint AS source_prediction_id,
                 p.movie_id,
                 COALESCE(p.prediction_made_date, post.published_date, p.release_date)::date AS estimate_date,
-                COALESCE(p.release_date, post.published_date)::date AS target_start_date,
+                (
+                    COALESCE(p.release_date, post.published_date)::date
+                    + ((5 - EXTRACT(DOW FROM COALESCE(p.release_date, post.published_date)::date)::integer + 7) % 7)
+                )::date AS target_start_date,
                 NULL::date AS target_end_date,
+                CASE
+                    WHEN COALESCE(
+                        p.opening_weekend_low_usd,
+                        p.opening_weekend_high_usd,
+                        p.opening_weekend_pinpoint_usd
+                    ) IS NOT NULL
+                    THEN p.opening_weekend_day_count
+                    WHEN p.weekend_forecast_usd IS NOT NULL
+                    THEN p.weekend_day_count
+                    ELSE NULL
+                END AS target_day_count,
                 p.forecast_metric,
                 COALESCE(
                     p.opening_weekend_low_usd,
@@ -184,6 +226,154 @@ def estimate_union_sql(conn: Any) -> str:
                   ) IS NOT NULL
             """
         )
+    if relation_exists(conn, "boxofficetheory_substack_predictions"):
+        selects.append(
+            """
+            SELECT
+                'boxofficetheory_substack'::text AS estimate_source,
+                p.prediction_id::bigint AS source_prediction_id,
+                p.movie_id,
+                COALESCE(p.prediction_made_date, post.published_date, p.release_date)::date AS estimate_date,
+                (
+                    COALESCE(p.release_date, post.published_date)::date
+                    + ((5 - EXTRACT(DOW FROM COALESCE(p.release_date, post.published_date)::date)::integer + 7) % 7)
+                )::date AS target_start_date,
+                NULL::date AS target_end_date,
+                CASE
+                    WHEN COALESCE(
+                        p.opening_weekend_low_usd,
+                        p.opening_weekend_high_usd,
+                        p.opening_weekend_pinpoint_usd
+                    ) IS NOT NULL
+                    THEN p.opening_weekend_day_count
+                    WHEN p.weekend_forecast_usd IS NOT NULL
+                    THEN p.weekend_day_count
+                    ELSE NULL
+                END AS target_day_count,
+                p.forecast_metric,
+                COALESCE(
+                    p.opening_weekend_low_usd,
+                    p.opening_weekend_pinpoint_usd,
+                    p.weekend_forecast_usd
+                )::numeric AS estimate_low_usd,
+                COALESCE(
+                    p.opening_weekend_high_usd,
+                    p.opening_weekend_pinpoint_usd,
+                    p.weekend_forecast_usd
+                )::numeric AS estimate_high_usd,
+                COALESCE(
+                    p.opening_weekend_pinpoint_usd::numeric,
+                    p.weekend_forecast_usd::numeric,
+                    (
+                        p.opening_weekend_low_usd::numeric
+                        + p.opening_weekend_high_usd::numeric
+                    ) / 2.0
+                ) AS estimate_mid_usd,
+                CASE
+                    WHEN p.opening_weekend_low_usd IS NOT NULL
+                     AND p.opening_weekend_high_usd IS NOT NULL
+                    THEN p.opening_weekend_high_usd::numeric - p.opening_weekend_low_usd::numeric
+                    ELSE 0::numeric
+                END AS estimate_width_usd,
+                p.source_movie_title,
+                NULLIF(p.distributor, '') AS distributor,
+                p.raw_forecast_text
+            FROM boxofficetheory_substack_predictions p
+            LEFT JOIN boxofficetheory_substack_posts post ON post.post_id = p.post_id
+            WHERE COALESCE(
+                    p.opening_weekend_low_usd,
+                    p.opening_weekend_high_usd,
+                    p.opening_weekend_pinpoint_usd,
+                    p.weekend_forecast_usd
+                  ) IS NOT NULL
+            """
+        )
+    if relation_exists(conn, "edwarddouglas_substack_predictions"):
+        selects.append(
+            """
+            SELECT
+                'edwarddouglas_substack'::text AS estimate_source,
+                p.prediction_id::bigint AS source_prediction_id,
+                p.movie_id,
+                COALESCE(p.prediction_made_date, post.published_date, p.release_date)::date AS estimate_date,
+                COALESCE(p.release_date, post.published_date)::date AS target_start_date,
+                NULL::date AS target_end_date,
+                CASE
+                    WHEN COALESCE(
+                        p.opening_weekend_low_usd,
+                        p.opening_weekend_high_usd,
+                        p.opening_weekend_pinpoint_usd
+                    ) IS NOT NULL
+                    THEN p.opening_weekend_day_count
+                    WHEN p.weekend_forecast_usd IS NOT NULL
+                    THEN p.weekend_day_count
+                    ELSE NULL
+                END AS target_day_count,
+                p.forecast_metric,
+                COALESCE(
+                    p.opening_weekend_low_usd,
+                    p.opening_weekend_pinpoint_usd,
+                    p.weekend_forecast_usd
+                )::numeric AS estimate_low_usd,
+                COALESCE(
+                    p.opening_weekend_high_usd,
+                    p.opening_weekend_pinpoint_usd,
+                    p.weekend_forecast_usd
+                )::numeric AS estimate_high_usd,
+                COALESCE(
+                    p.opening_weekend_pinpoint_usd::numeric,
+                    p.weekend_forecast_usd::numeric,
+                    (
+                        p.opening_weekend_low_usd::numeric
+                        + p.opening_weekend_high_usd::numeric
+                    ) / 2.0
+                ) AS estimate_mid_usd,
+                CASE
+                    WHEN p.opening_weekend_low_usd IS NOT NULL
+                     AND p.opening_weekend_high_usd IS NOT NULL
+                    THEN p.opening_weekend_high_usd::numeric - p.opening_weekend_low_usd::numeric
+                    ELSE 0::numeric
+                END AS estimate_width_usd,
+                p.source_movie_title,
+                NULLIF(p.distributor, '') AS distributor,
+                p.raw_forecast_text
+            FROM edwarddouglas_substack_predictions p
+            LEFT JOIN edwarddouglas_substack_posts post ON post.post_id = p.post_id
+            WHERE COALESCE(
+                    p.opening_weekend_low_usd,
+                    p.opening_weekend_high_usd,
+                    p.opening_weekend_pinpoint_usd,
+                    p.weekend_forecast_usd
+                  ) IS NOT NULL
+            """
+        )
+    if relation_exists(conn, "joblo_weekend_predictions"):
+        selects.append(
+            """
+            SELECT
+                'joblo'::text AS estimate_source,
+                p.prediction_id::bigint AS source_prediction_id,
+                p.movie_id,
+                COALESCE(a.discovered_date, p.target_start_date)::date AS estimate_date,
+                p.target_start_date,
+                p.target_end_date,
+                CASE
+                    WHEN p.target_start_date IS NOT NULL AND p.target_end_date IS NOT NULL
+                    THEN (p.target_end_date - p.target_start_date + 1)::integer
+                    ELSE 3::integer
+                END AS target_day_count,
+                p.forecast_metric,
+                p.range_low_usd::numeric AS estimate_low_usd,
+                p.range_high_usd::numeric AS estimate_high_usd,
+                ((p.range_low_usd::numeric + p.range_high_usd::numeric) / 2.0) AS estimate_mid_usd,
+                (p.range_high_usd::numeric - p.range_low_usd::numeric) AS estimate_width_usd,
+                p.source_movie_title,
+                NULLIF(p.distributor, '') AS distributor,
+                p.raw_forecast_text
+            FROM joblo_weekend_predictions p
+            LEFT JOIN joblo_articles a ON a.article_id = p.article_id
+            """
+        )
     if (
         relation_exists(conn, "the_numbers_prediction_rows")
         and relation_exists(conn, "the_numbers_prediction_images")
@@ -198,6 +388,7 @@ def estimate_union_sql(conn: Any) -> str:
                 COALESCE(a.article_date, p.fetched_at::date, p.release_date)::date AS estimate_date,
                 p.release_date AS target_start_date,
                 NULL::date AS target_end_date,
+                3::integer AS target_day_count,
                 CONCAT_WS(':', p.table_kind, p.metric, NULLIF(p.row_label, '')) AS forecast_metric,
                 p.predicted_usd::numeric AS estimate_low_usd,
                 p.predicted_usd::numeric AS estimate_high_usd,
@@ -499,11 +690,11 @@ def create_movie_openings_sql(
         FROM opening_window ow
         JOIN estimate_rows e ON e.movie_id = ow.movie_id
         WHERE e.estimate_mid_usd IS NOT NULL
+          AND e.target_day_count = 3
           AND (e.estimate_date IS NULL OR e.estimate_date <= ow.opening_weekend_start)
           AND (
                 e.target_start_date IS NULL
                 OR e.target_start_date = ow.opening_weekend_start
-                OR e.forecast_metric ILIKE '%opening%'
               )
         ORDER BY ow.release_run_id, e.estimate_date DESC NULLS LAST, e.estimate_source
     ),
@@ -519,11 +710,11 @@ def create_movie_openings_sql(
         FROM opening_window ow
         JOIN estimate_rows e ON e.movie_id = ow.movie_id
         WHERE e.estimate_mid_usd IS NOT NULL
+          AND e.target_day_count = 3
           AND (e.estimate_date IS NULL OR e.estimate_date <= ow.opening_weekend_start)
           AND (
                 e.target_start_date IS NULL
                 OR e.target_start_date = ow.opening_weekend_start
-                OR e.forecast_metric ILIKE '%opening%'
               )
         GROUP BY ow.release_run_id
     ),
@@ -709,11 +900,11 @@ def create_movie_openings_sql(
         END AS release_width_bucket,
         COALESCE(b.opening_weekend_theaters, 0) >= {wide_threshold} AS is_wide_release,
         COALESCE(b.opening_weekend_theaters, 0) >= {large_threshold} AS is_large_release,
-        LN(NULLIF(b.opening_weekend_gross_usd, 0)) AS log_opening_weekend_gross,
-        LN(NULLIF(b.domestic_total_gross_usd, 0)) AS log_domestic_total_gross,
-        LN(NULLIF(b.opening_weekend_theaters, 0)) AS log_opening_weekend_theaters,
-        LN(NULLIF(b.computed_opening_weekend_pta_usd, 0)) AS log_opening_weekend_pta,
-        LN(NULLIF(b.production_budget_usd, 0)) AS log_production_budget,
+        CASE WHEN b.opening_weekend_gross_usd > 0 THEN LN(b.opening_weekend_gross_usd) END AS log_opening_weekend_gross,
+        CASE WHEN b.domestic_total_gross_usd > 0 THEN LN(b.domestic_total_gross_usd) END AS log_domestic_total_gross,
+        CASE WHEN b.opening_weekend_theaters > 0 THEN LN(b.opening_weekend_theaters) END AS log_opening_weekend_theaters,
+        CASE WHEN b.computed_opening_weekend_pta_usd > 0 THEN LN(b.computed_opening_weekend_pta_usd) END AS log_opening_weekend_pta,
+        CASE WHEN b.production_budget_usd > 0 THEN LN(b.production_budget_usd) END AS log_production_budget,
         CASE
             WHEN b.opening_weekend_gross_usd > 0
             THEN b.domestic_total_gross_usd / b.opening_weekend_gross_usd
@@ -862,9 +1053,9 @@ def create_movie_days_sql(conn: Any, *, logged: bool) -> str:
             WHEN 6 THEN 'Sat'
             WHEN 7 THEN 'Sun'
         END AS day_name,
-        LN(NULLIF(gross_usd, 0)) AS log_gross_usd,
-        LN(NULLIF(theaters, 0)) AS log_theaters,
-        LN(NULLIF(per_theater_usd, 0)) AS log_per_theater_usd
+        CASE WHEN gross_usd > 0 THEN LN(gross_usd) END AS log_gross_usd,
+        CASE WHEN theaters > 0 THEN LN(theaters) END AS log_theaters,
+        CASE WHEN per_theater_usd > 0 THEN LN(per_theater_usd) END AS log_per_theater_usd
     FROM daily_with_activity;
 
     CREATE INDEX idx_eda_movie_days_release_date
@@ -903,6 +1094,7 @@ def create_news_estimates_sql(conn: Any, *, logged: bool) -> str:
         e.estimate_date,
         e.target_start_date,
         e.target_end_date,
+        e.target_day_count,
         e.forecast_metric,
         e.estimate_low_usd,
         e.estimate_high_usd,
@@ -931,10 +1123,10 @@ def create_news_estimates_sql(conn: Any, *, logged: bool) -> str:
     FROM estimate_rows e
     LEFT JOIN analytics.eda_movie_openings o
       ON o.movie_id = e.movie_id
+     AND e.target_day_count = 3
      AND (
             e.target_start_date IS NULL
             OR e.target_start_date = o.opening_weekend_start
-            OR e.forecast_metric ILIKE '%opening%'
          )
     WHERE e.estimate_mid_usd IS NOT NULL;
 

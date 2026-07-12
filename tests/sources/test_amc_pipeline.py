@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import unittest
+from unittest.mock import Mock, patch
 
 from pm_box_office.sources.amc import collect
 from pm_box_office.sources.amc import db
@@ -11,7 +13,7 @@ from pm_box_office.sources.amc.parsers import SeatFill, ShowtimeRecord
 from pm_box_office.sources.amc.parsers import showtimes_url
 from pm_box_office.sources.amc.sampling import fixed_theatre_sample, stratified_sample
 from pm_box_office.sources.amc.scheduler import DEFAULT_OFFSETS_MINUTES, scheduled_snapshots
-from pm_box_office.sources.amc.services import movie_service, sample_service, showtime_service
+from pm_box_office.sources.amc.services import movie_service, sample_service, seat_service, showtime_service
 from pm_box_office.sources.amc.sitemap import AmcTheatre
 from pm_box_office.sources.amc.sitemap import parse_theatre_sitemap
 from pm_box_office.sources.amc.timezones import infer_us_timezone, parse_showtime_to_local_and_utc
@@ -166,6 +168,50 @@ class AmcPipelineUnitTests(unittest.TestCase):
         self.assertEqual([360, 120, 30, 5], [snapshot.minutes_before_showtime for snapshot in snapshots])
         self.assertEqual("2026-07-01T20:00:00+00:00", snapshots[0].due_utc_at.isoformat())
         self.assertEqual("2026-07-01T13:00:00-07:00", snapshots[0].due_local_at.isoformat())
+
+    def test_collect_snapshot_enqueues_forecast_refresh_after_seat_write(self) -> None:
+        observed = dt.datetime(2026, 7, 10, 20, 55, tzinfo=dt.timezone.utc)
+        showtime = db.StoredShowtime(
+            showtime_id="100",
+            amc_theatre_id=1,
+            theatre_slug="amc-sample-10",
+            local_show_date="2026-07-10",
+            local_start_at=observed,
+            utc_start_at=observed + dt.timedelta(minutes=5),
+            timezone="UTC",
+            amc_movie_id="movie-1",
+            amc_movie_name="Sample One",
+        )
+        fill = SeatFill(
+            theatre_slug="amc-sample-10",
+            date="2026-07-10",
+            showtime_id="100",
+            showtime_url="https://www.amctheatres.com/showtimes/100",
+            total_seats=100,
+            available_seats=60,
+            filled_or_unavailable_seats=40,
+            fill_rate=0.4,
+            raw_cache_path="cache/seats/100.html",
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(seat_service, "fetch_seat_fill", return_value=fill),
+            patch.object(seat_service.db, "upsert_seat_snapshot") as upsert,
+            patch.object(seat_service, "record_ingest_event") as record_event,
+            patch.object(seat_service.refresh_queue, "enqueue_from_amc_showtime", return_value=1) as enqueue,
+        ):
+            seat_service.collect_snapshot(Mock(), Mock(), showtime=showtime, target_offset_minutes=5, observed_at=observed)
+
+        upsert.assert_called_once()
+        record_event.assert_called_once()
+        enqueue.assert_called_once_with(
+            upsert.call_args.args[0],
+            showtime_id="100",
+            model_version="latest",
+            debounce_seconds=20,
+            source_updated_at=observed,
+        )
 
     def test_smooth_seat_scan_schedule_spreads_same_minute_bursts(self) -> None:
         start = dt.datetime(2026, 7, 1, 23, 0, tzinfo=dt.timezone.utc)
@@ -512,6 +558,42 @@ class AmcPipelinePostgresTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual(["movie-1"], [str(row[0]) for row in selected_rows])
 
+    def test_select_the_numbers_active_movies_includes_opening_weekend_movies(self) -> None:
+        theatre = parse_theatre_sitemap(SITEMAP_XML)[0]
+        db.upsert_theatres(self.conn, [theatre])
+        stored_theatre = db.select_active_theatres(self.conn)[0]
+        db.upsert_showtimes(
+            self.conn,
+            theatre=stored_theatre,
+            showtimes=[
+                ShowtimeRecord(
+                    theatre_slug=stored_theatre.slug,
+                    date="2026-07-10",
+                    showtime_id="300",
+                    when="2026-07-10T19:00:00-04:00",
+                    movie_name="Opening Example",
+                    movie_id="opening-example",
+                    showtime_url="https://www.amctheatres.com/showtimes/300",
+                    attribute_names="",
+                )
+            ],
+        )
+        self.conn.execute("ALTER TABLE movies ADD COLUMN IF NOT EXISTS release_date DATE")
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS daily_chart_pages (chart_date TEXT, movie_url TEXT, title TEXT, gross_usd INTEGER, days_in_release INTEGER)"
+        )
+        self.conn.execute("CREATE TABLE IF NOT EXISTS movie_source_ids (source TEXT, source_movie_id TEXT, movie_id INTEGER)")
+        self.conn.execute(
+            "INSERT INTO movies (movie_id, title, release_date) VALUES (104, 'Opening Example', '2026-07-10')"
+        )
+
+        matches = movie_service.select_the_numbers_active_movies(
+            self.conn,
+            exhibition_date=dt.date(2026, 7, 10),
+        )
+
+        self.assertEqual(["opening-example"], [match.amc_movie_id for match in matches])
+
     def test_create_seat_scan_tasks_supports_multiple_offsets(self) -> None:
         theatre = parse_theatre_sitemap(SITEMAP_XML)[0]
         db.upsert_theatres(self.conn, [theatre])
@@ -561,6 +643,56 @@ class AmcPipelinePostgresTests(unittest.TestCase):
         self.assertEqual(4, task_count)
         self.assertEqual([120, 30, 5, -15], [row[1] for row in rows])
         self.assertEqual(showtime.utc_start_at + dt.timedelta(minutes=15), db.ensure_utc(rows[-1][2]))
+
+    def test_create_seat_scan_tasks_allows_unmatched_movie_source_id(self) -> None:
+        theatre = parse_theatre_sitemap(SITEMAP_XML)[0]
+        db.upsert_theatres(self.conn, [theatre])
+        stored_theatre = db.select_active_theatres_basic(self.conn)[0]
+        db.upsert_showtimes(
+            self.conn,
+            theatre=stored_theatre,
+            showtimes=[
+                ShowtimeRecord(
+                    theatre_slug=stored_theatre.slug,
+                    date="2026-07-01",
+                    showtime_id="100",
+                    when="2026-07-01T19:00:00-04:00",
+                    movie_name="Sample One",
+                    movie_id="movie-1",
+                    showtime_url="https://www.amctheatres.com/showtimes/100",
+                    attribute_names="Reserved Seating",
+                )
+            ],
+        )
+        self.conn.execute(
+            """
+            INSERT INTO movie_source_ids (movie_id, source, source_movie_id, source_title, match_status)
+            VALUES (NULL, 'amc', 'movie-1', 'Sample One', 'unmatched')
+            """
+        )
+        campaign_id = db.ensure_campaign(self.conn, dt.date(2026, 7, 1))
+        run_id = db.create_run(self.conn, campaign_id=campaign_id, run_type="seat_collection")
+        showtime = db.select_showtimes_for_target(
+            self.conn,
+            target_date="2026-07-01",
+            target_amc_movie_id="movie-1",
+            target_amc_movie_name=None,
+        )[0]
+
+        task_count = db.create_seat_scan_tasks(
+            self.conn,
+            run_id=run_id,
+            showtimes=[showtime],
+            target_offsets_minutes=(30,),
+        )
+        self.conn.commit()
+
+        row = self.conn.execute(
+            "SELECT movie_id FROM collection_tasks WHERE run_id = %s",
+            (run_id,),
+        ).fetchone()
+        self.assertEqual(1, task_count)
+        self.assertIsNone(row[0])
 
     def test_seat_collection_quality_view_uses_planned_task_grid(self) -> None:
         theatre = parse_theatre_sitemap(SITEMAP_XML)[0]
@@ -722,6 +854,75 @@ class AmcPipelinePostgresTests(unittest.TestCase):
         self.assertEqual(inventory_tasks_1, inventory_tasks_2)
         self.assertEqual(seat_run_1, seat_run_2)
         self.assertEqual(seat_tasks_1, seat_tasks_2)
+
+    def test_seat_collection_includes_unselected_live_movies(self) -> None:
+        theatre = parse_theatre_sitemap(SITEMAP_XML)[0]
+        db.upsert_theatres(self.conn, [theatre])
+        stored_theatre = db.select_active_theatres_basic(self.conn)[0]
+        db.upsert_showtimes(
+            self.conn,
+            theatre=stored_theatre,
+            showtimes=[
+                ShowtimeRecord(
+                    theatre_slug=stored_theatre.slug,
+                    date="2026-07-01",
+                    showtime_id="100",
+                    when="2026-07-01T19:00:00-04:00",
+                    movie_name="Selected Movie",
+                    movie_id="movie-1",
+                    showtime_url="https://www.amctheatres.com/showtimes/100",
+                    attribute_names="Reserved Seating",
+                ),
+                ShowtimeRecord(
+                    theatre_slug=stored_theatre.slug,
+                    date="2026-07-01",
+                    showtime_id="200",
+                    when="2026-07-01T20:00:00-04:00",
+                    movie_name="Unselected Movie",
+                    movie_id="movie-2",
+                    showtime_url="https://www.amctheatres.com/showtimes/200",
+                    attribute_names="Reserved Seating",
+                ),
+            ],
+        )
+        db.upsert_amc_movie(self.conn, amc_movie_id="movie-1", amc_movie_name="Selected Movie")
+        db.upsert_amc_movie(self.conn, amc_movie_id="movie-2", amc_movie_name="Unselected Movie")
+        campaign_id = db.ensure_campaign(self.conn, dt.date(2026, 7, 1))
+        db.set_campaign_movie_selected(
+            self.conn,
+            campaign_id=campaign_id,
+            amc_movie_id="movie-1",
+            selected=True,
+        )
+        sample_service.ensure_default_theatre_sample(
+            self.conn,
+            sample_key="all-live-movies",
+            sample_size=1,
+            certainty_count=1,
+            seed="all-live-movies",
+        )
+        self.conn.commit()
+
+        run_id, task_count = movie_service.create_seat_collection_run(
+            self.conn,
+            exhibition_date=dt.date(2026, 7, 1),
+            sample_key="all-live-movies",
+        )
+
+        movie_ids = {
+            str(row[0])
+            for row in self.conn.execute(
+                """
+                SELECT s.amc_movie_id
+                FROM collection_tasks t
+                JOIN amc_showtimes s ON s.showtime_id = t.showtime_id
+                WHERE t.run_id = %s
+                """,
+                (run_id,),
+            ).fetchall()
+        }
+        self.assertEqual(2, task_count)
+        self.assertEqual({"movie-1", "movie-2"}, movie_ids)
 
     def test_create_inventory_run_force_refresh_cancels_active_run(self) -> None:
         theatre = parse_theatre_sitemap(SITEMAP_XML)[0]

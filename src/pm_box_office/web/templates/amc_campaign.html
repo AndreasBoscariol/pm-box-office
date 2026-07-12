@@ -2,6 +2,7 @@
 {% block title %}AMC Collection{% endblock %}
 {% block content %}
     {% set diagnostics = collection_diagnostics|default({}) %}
+    {% set forecast_worker = forecast_worker_status|default({}) %}
       <header class="topbar">
         <form class="date-form" method="get" action="/amc/campaigns/{{ date_value }}">
           <label for="date">Reporting date</label>
@@ -56,9 +57,9 @@
           <small>sample / inventory</small>
         </div>
         <div>
-          <span class="label">Selected movies</span>
-          <strong>{{ selected_movie_count }}</strong>
-          <small>{{ selected_sampled_showtimes }} sampled showtimes</small>
+          <span class="label">Live movies</span>
+          <strong>{{ inventory_movie_count }}</strong>
+          <small>{{ sampled_showtimes }} sampled showtimes</small>
         </div>
         <div>
           <span class="label">Queue</span>
@@ -121,6 +122,9 @@
               class="row movie-row"
               method="post"
               action="/amc/campaigns/{{ date_value }}/movies/{{ movie.amc_movie_id }}"
+              hx-post="/amc/campaigns/{{ date_value }}/movies/{{ movie.amc_movie_id }}"
+              hx-trigger="change"
+              hx-swap="none"
               data-movie-name="{{ movie.amc_movie_name|lower }}"
               data-movie-id="{{ movie.amc_movie_id|lower }}"
             >
@@ -130,7 +134,6 @@
                   name="selected"
                   value="on"
                   {% if movie.selected %}checked{% endif %}
-                  onchange="this.form.submit()"
                 >
               </span>
               <span title="{{ movie.sampled_theatre_count }} sample theatres · {{ movie.theatre_count }} inventory theatres">{{ movie.amc_movie_name }}</span>
@@ -157,7 +160,17 @@
           <form method="post" action="/amc/workers/restart">
             <button type="submit">Restart workers</button>
           </form>
+          {% if forecast_worker.running|default(false) %}
+          <form method="post" action="/amc/forecast-worker/restart">
+            <button type="submit">Restart forecast refresh</button>
+          </form>
+          {% else %}
+          <form method="post" action="/amc/forecast-worker/start">
+            <button type="submit">Start forecast refresh</button>
+          </form>
+          {% endif %}
         </div>
+        <p class="muted">Forecast refresh: {% if forecast_worker.running|default(false) %}running (PID {{ forecast_worker.pid }}){% else %}stopped{% endif %}</p>
         <div class="worker-grid">
           <div class="worker-row head">
             <span>Slot</span>

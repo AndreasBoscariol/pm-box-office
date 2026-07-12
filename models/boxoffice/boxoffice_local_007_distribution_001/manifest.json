@@ -1,0 +1,25 @@
+{
+  "artifact_name": "boxoffice_local_007_distribution_001",
+  "forecast_policy_name": "007",
+  "forecast_policy_version": "boxoffice_local_007_weighted_interval_calibration",
+  "canonical_source_artifact": "../boxoffice_local_007_weighted_interval_calibration",
+  "distribution_runtime": "prediction_market_backtest.policy007",
+  "distribution_definition": "weighted empirical quantile function with the 007 n/(n+20) conditional-to-global shrinkage applied at every probability",
+  "residual_coordinate": "log(actual_opening_weekend_gross_usd / primary_point_forecast_usd)",
+  "quantile_interpolation": "first value whose cumulative positive weight is at least q times total weight",
+  "movie_weight": "inverse row count for release_run_id within selected conditional cell",
+  "conditioning_hierarchy": [
+    ["origin_bucket", "source_count_bucket", "point_bucket", "release_scope_bucket"],
+    ["origin_bucket", "source_count_bucket", "point_bucket"],
+    ["origin_bucket", "source_count_bucket"],
+    ["origin_bucket"]
+  ],
+  "shrink_k": 20,
+  "caps": null,
+  "floors": null,
+  "zero_handling": "positive production point and actual required; exponential back-transformation is positive",
+  "minimum_draws": 50000,
+  "status": "rejected",
+  "production_probability_eligible": false,
+  "approval_reason": "failed Phase 4 full-CDF calibration gate; retained for audit and as a Phase 6 benchmark only"
+}

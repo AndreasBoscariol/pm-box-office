@@ -1,0 +1,10 @@
+source,movie_keys,matched_movie_keys,unmatched_movie_keys,estimate_rows,min_target_start_date,max_target_start_date
+boxofficeguru,3141,2686,455,3141,2008-02-22,2022-12-16
+boxofficepro,4513,4508,5,4745,2015-12-18,2026-07-31
+boxofficereport,4657,4657,0,4679,2016-12-02,2026-07-10
+boxofficetheory,1343,1288,55,2333,2024-04-24,2026-07-03
+boxofficetheory_substack,43,15,28,54,2026-01-01,2026-07-02
+edwarddouglas_substack,430,134,296,507,2023-04-20,2026-07-10
+joblo,20,16,4,20,2022-03-11,2022-06-17
+the_numbers,106,85,21,147,2004-05-19,2025-07-02
+toddmthatcher,1494,228,1266,1525,2012-11-16,2016-09-23

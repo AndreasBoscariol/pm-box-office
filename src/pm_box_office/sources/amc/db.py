@@ -1117,6 +1117,18 @@ def ensure_campaign(conn: Any, exhibition_date: dt.date) -> uuid.UUID:
     return as_uuid(row[0])
 
 
+def activate_campaign(conn: Any, campaign_id: uuid.UUID) -> None:
+    """Mark a campaign active when its collection run is scheduled."""
+    conn.execute(
+        """
+        UPDATE collection_campaigns
+        SET status = 'active', activated_at = COALESCE(activated_at, CURRENT_TIMESTAMP), completed_at = NULL
+        WHERE campaign_id = %s
+        """,
+        (campaign_id,),
+    )
+
+
 def create_run(
     conn: Any,
     *,
@@ -2815,6 +2827,8 @@ def list_the_numbers_active_amc_movies(
         if row is None or row[0] is None:
             return []
     start_date = exhibition_date - dt.timedelta(days=max(1, lookback_days))
+    weekend_start = exhibition_date - dt.timedelta(days=(exhibition_date.weekday() - 4) % 7)
+    weekend_end = weekend_start + dt.timedelta(days=2)
     rows = conn.execute(
         """
         WITH amc_inventory AS (
@@ -2842,6 +2856,22 @@ def list_the_numbers_active_amc_movies(
               AND dcp.title NOT ILIKE '%%re-release%%'
               AND m.title NOT ILIKE '%%re-release%%'
             GROUP BY m.movie_id, m.title
+        ),
+        opening_this_weekend AS (
+            SELECT
+                m.movie_id,
+                m.title,
+                m.release_date AS latest_box_office_date,
+                0::bigint AS recent_gross_usd,
+                0::integer AS recent_days_reported
+            FROM movies m
+            WHERE m.release_date BETWEEN %s AND %s
+              AND m.title NOT ILIKE '%%re-release%%'
+        ),
+        candidate_movies AS (
+            SELECT * FROM recent_the_numbers
+            UNION ALL
+            SELECT * FROM opening_this_weekend
         )
         SELECT
             a.amc_movie_id,
@@ -2851,11 +2881,11 @@ def list_the_numbers_active_amc_movies(
             t.recent_gross_usd,
             t.recent_days_reported
         FROM amc_inventory a
-        JOIN recent_the_numbers t
+        JOIN candidate_movies t
           ON TRUE
         ORDER BY t.latest_box_office_date DESC, t.recent_gross_usd DESC, a.amc_movie_name
         """,
-        (exhibition_date, start_date, exhibition_date),
+        (exhibition_date, start_date, exhibition_date, weekend_start, weekend_end),
     ).fetchall()
     return [
         TheNumbersActiveMovieMatch(

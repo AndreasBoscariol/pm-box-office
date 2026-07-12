@@ -11,7 +11,9 @@ from typing import Any
 SOURCE_BOXOFFICEPRO = "boxofficepro"
 SOURCE_BOXOFFICEREPORT = "boxofficereport"
 SOURCE_BOXOFFICETHEORY = "boxofficetheory"
+SOURCE_EDWARD_DOUGLAS_SUBSTACK = "edwarddouglas_substack"
 SOURCE_BOXOFFICEGURU = "boxofficeguru"
+SOURCE_JOBLO = "joblo"
 SOURCE_AMC = "amc"
 SOURCE_IMDB = "imdb"
 SOURCE_LETTERBOXD = "letterboxd"
@@ -30,6 +32,154 @@ def normalize_title(value: str) -> str:
     text = re.sub(r"&", " and ", text)
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return " ".join(text.split())
+
+
+def opening_weekend_start(value: dt.date) -> dt.date:
+    return value + dt.timedelta(days=(4 - value.weekday()) % 7)
+
+
+PREDICTION_IDENTITY_TABLES = (
+    ("boxofficepro", "boxofficepro_weekend_predictions", "prediction_id", "target_start_date"),
+    ("boxofficereport", "boxofficereport_weekend_predictions", "prediction_id", "target_start_date"),
+    ("boxofficetheory", "boxofficetheory_predictions", "prediction_id", "release_date"),
+    ("boxofficetheory_substack", "boxofficetheory_substack_predictions", "prediction_id", "release_date"),
+    ("edwarddouglas_substack", "edwarddouglas_substack_predictions", "prediction_id", "release_date"),
+    ("boxofficeguru", "boxofficeguru_predictions", "prediction_id", "target_start_date"),
+    ("joblo", "joblo_weekend_predictions", "prediction_id", "target_start_date"),
+)
+
+
+def reconcile_prediction_movie_identities(conn: Any, *, dry_run: bool = False) -> dict[str, int]:
+    """Move prediction source identities to exact canonical title/weekend matches.
+
+    This is intentionally repeatable: prediction sources can arrive before the
+    authoritative The Numbers identity, then be repointed once it exists.
+    """
+    ensure_movie_identity_schema(conn)
+    daily_join = ""
+    match_release_date_expr = "movie.release_date"
+    if relation_exists(conn, "daily_chart_pages"):
+        daily_join = """
+        LEFT JOIN (
+            SELECT movie_id, MIN(chart_date::date) AS first_daily_date
+            FROM daily_chart_pages
+            WHERE movie_id IS NOT NULL
+            GROUP BY movie_id
+        ) daily_first ON daily_first.movie_id = movie.movie_id
+        """
+        match_release_date_expr = "COALESCE(daily_first.first_daily_date, movie.release_date)"
+    canonical_rows = conn.execute(
+        f"""
+        SELECT movie.movie_id, movie.title, {match_release_date_expr} AS match_release_date,
+               movie.release_year, movie.movie_url
+        FROM movies movie
+        {daily_join}
+        WHERE movie.movie_url IS NOT NULL
+        """
+    ).fetchall()
+    canonical: dict[tuple[str, dt.date], int] = {}
+    canonical_by_year: dict[tuple[str, int], int] = {}
+    ambiguous: set[tuple[str, dt.date]] = set()
+    ambiguous_by_year: set[tuple[str, int]] = set()
+    for movie_id, title, release_date, release_year, movie_url in canonical_rows:
+        title_keys = the_numbers_title_keys(str(title), str(movie_url))
+        if release_date is not None:
+            for title_key in title_keys:
+                key = (title_key, opening_weekend_start(release_date))
+                if key in canonical and canonical[key] != int(movie_id):
+                    ambiguous.add(key)
+                else:
+                    canonical[key] = int(movie_id)
+        canonical_year = release_date.year if release_date is not None else (parse_the_numbers_url_year(str(movie_url)) or release_year)
+        if canonical_year is not None:
+            for title_key in title_keys:
+                year_key = (title_key, int(canonical_year))
+                if year_key in canonical_by_year and canonical_by_year[year_key] != int(movie_id):
+                    ambiguous_by_year.add(year_key)
+                else:
+                    canonical_by_year[year_key] = int(movie_id)
+    for key in ambiguous:
+        canonical.pop(key, None)
+    for key in ambiguous_by_year:
+        canonical_by_year.pop(key, None)
+
+    stats: dict[str, Any] = {
+        "repointed_predictions": 0,
+        "repointed_source_ids": 0,
+        "ambiguous": len(ambiguous) + len(ambiguous_by_year),
+        "affected_movie_ids": [],
+    }
+    affected_movie_ids: set[int] = set()
+    for source, table, primary_key, release_column in PREDICTION_IDENTITY_TABLES:
+        if not relation_exists(conn, table):
+            continue
+        rows = conn.execute(
+            f"""
+            SELECT {primary_key}, source_movie_id, source_movie_title, {release_column}, movie_id
+            FROM {table}
+            WHERE source_movie_id IS NOT NULL
+              AND source_movie_title IS NOT NULL
+              AND {release_column} IS NOT NULL
+            """
+        ).fetchall()
+        for prediction_id, source_movie_id, source_title, release_date, current_movie_id in rows:
+            key = (normalize_title(str(source_title)), opening_weekend_start(release_date))
+            canonical_movie_id = canonical.get(key)
+            # A title/year fallback is only safe for the active release horizon.
+            # Historical titles routinely reuse names and must have an exact
+            # release-weekend match or a manual override.
+            if canonical_movie_id is None and release_date >= dt.date.today() - dt.timedelta(days=14):
+                canonical_movie_id = canonical_by_year.get((key[0], release_date.year))
+            if canonical_movie_id is None or canonical_movie_id == current_movie_id:
+                continue
+            stats["repointed_predictions"] += 1
+            affected_movie_ids.add(canonical_movie_id)
+            if dry_run:
+                continue
+            conn.execute(
+                f"""
+                UPDATE {table}
+                SET movie_id = %s,
+                    match_status = 'matched',
+                    match_method = 'canonical_title_opening_weekend_reconciliation',
+                    match_score = 1.0,
+                    match_notes = 'Repointed from provisional or stale movie identity'
+                WHERE {primary_key} = %s
+                """,
+                (canonical_movie_id, prediction_id),
+            )
+            row = conn.execute(
+                """
+                INSERT INTO movie_source_ids (
+                    movie_id, source, source_movie_id, source_title,
+                    match_status, match_method, match_score, matched_at
+                ) VALUES (%s, %s, %s, %s, 'matched',
+                          'canonical_title_opening_weekend_reconciliation', 1.0, CURRENT_TIMESTAMP)
+                ON CONFLICT(source, source_movie_id) DO UPDATE SET
+                    movie_id = excluded.movie_id,
+                    source_title = excluded.source_title,
+                    match_status = excluded.match_status,
+                    match_method = excluded.match_method,
+                    match_score = excluded.match_score,
+                    matched_at = excluded.matched_at
+                RETURNING 1
+                """,
+                (canonical_movie_id, source, source_movie_id, source_title),
+            ).fetchone()
+            if row:
+                stats["repointed_source_ids"] += 1
+            conn.execute(
+                """
+                UPDATE movies
+                SET release_date = COALESCE(release_date, %s),
+                    release_year = COALESCE(release_year, EXTRACT(YEAR FROM %s::date)::integer),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE movie_id = %s
+                """,
+                (release_date, release_date, canonical_movie_id),
+            )
+    stats["affected_movie_ids"] = sorted(affected_movie_ids)
+    return stats
 
 
 def relation_exists(conn: Any, relation_name: str) -> bool:
@@ -995,15 +1145,33 @@ def apply_amc_the_numbers_matches(conn: Any) -> None:
             a.movie_id,
             MIN(s.exhibition_date) AS first_exhibition_date,
             MAX(s.exhibition_date) AS last_exhibition_date,
-            COUNT(s.showtime_id) AS showtime_count
+            COUNT(s.showtime_id) AS showtime_count,
+            existing.movie_id AS existing_movie_id,
+            existing.match_status AS existing_match_status,
+            existing.match_method AS existing_match_method,
+            existing.match_score AS existing_match_score
         FROM amc_movies a
         LEFT JOIN amc_showtimes s ON s.amc_movie_id = a.amc_movie_id
-        GROUP BY a.amc_movie_id, a.amc_movie_name, a.movie_id
+        LEFT JOIN movie_source_ids existing
+          ON existing.source = 'amc' AND existing.source_movie_id = a.amc_movie_id
+        GROUP BY a.amc_movie_id, a.amc_movie_name, a.movie_id,
+                 existing.movie_id, existing.match_status,
+                 existing.match_method, existing.match_score
         """
     ).fetchall()
     for row in amc_rows:
-        amc_movie_id, amc_movie_name, _, _, _, _ = row
-        movie_id, method, score = choose_amc_the_numbers_match(tuple(row), candidates_by_key)
+        amc_movie_id, amc_movie_name, canonical_movie_id, _, _, _, existing_movie_id, existing_status, existing_method, existing_score = row
+        # A previously resolved canonical link is stronger evidence than a
+        # transient absence of a current The Numbers candidate. Never turn a
+        # historical match into an unmatched row during a later AMC refresh.
+        if canonical_movie_id is not None:
+            movie_id, method, score = int(canonical_movie_id), "amc_canonical_movie_link", 1.0
+        elif existing_movie_id is not None and str(existing_status or "") in {"matched", "provisional"}:
+            movie_id = int(existing_movie_id)
+            method = str(existing_method or "preserved_existing_amc_match")
+            score = float(existing_score) if existing_score is not None else 1.0
+        else:
+            movie_id, method, score = choose_amc_the_numbers_match(tuple(row[:6]), candidates_by_key)
         status = "matched" if movie_id is not None else "unmatched"
         conn.execute(
             """
@@ -1075,7 +1243,9 @@ def find_movie_id_by_source(conn: Any, *, source: str, source_movie_id: str) -> 
         """,
         (source, source_movie_id),
     ).fetchone()
-    return int(row[0]) if row is not None else None
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
 
 
 def upsert_movie_by_source(

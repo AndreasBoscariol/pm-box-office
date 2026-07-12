@@ -32,8 +32,73 @@ services:
       - ${AMC_WORKER_DELAY_SECONDS:-1.5}
     environment:
       DATABASE_URL: postgresql://pm_box_office:pm_box_office@postgres:5432/pm_box_office
+      FORECAST_REFRESH_MODEL_VERSION: ${FORECAST_REFRESH_MODEL_VERSION:-latest}
+      AMC_FORECAST_REFRESH_DEBOUNCE_SECONDS: ${AMC_FORECAST_REFRESH_DEBOUNCE_SECONDS:-20}
     depends_on:
       - postgres
+
+  forecast-refresh:
+    build: .
+    command:
+      - python3
+      - -m
+      - models.boxoffice.refresh_worker
+      - --limit
+      - ${FORECAST_REFRESH_BATCH_LIMIT:-1}
+      - --idle-seconds
+      - ${FORECAST_REFRESH_IDLE_SECONDS:-2}
+    environment:
+      DATABASE_URL: postgresql://pm_box_office:pm_box_office@postgres:5432/pm_box_office
+      FORECAST_REFRESH_MODEL_VERSION: ${FORECAST_REFRESH_MODEL_VERSION:-latest}
+      AMC_FORECAST_REFRESH_DEBOUNCE_SECONDS: ${AMC_FORECAST_REFRESH_DEBOUNCE_SECONDS:-20}
+    depends_on:
+      - postgres
+
+  prediction-market-shadow:
+    build: .
+    command: python3 -m prediction_market_backtest.cli prospective-supervisor
+    environment:
+      DATABASE_URL: postgresql://pm_box_office:pm_box_office@postgres:5432/pm_box_office
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models:ro
+    restart: unless-stopped
+    depends_on:
+      - postgres
+
+  prediction-market-capture-acceptance:
+    build: .
+    command:
+      - python3
+      - -m
+      - prediction_market_backtest.cli
+      - capture-books
+      - --tokens
+      - ${PM_CAPTURE_TOKENS:-51872688213902718591489699459529330104229430818729734029956444862907889791716,20509669395611413603454440240352841474074387717976173088630295459195602203845}
+      - --duration-hours
+      - ${PM_CAPTURE_DURATION_HOURS:-24.1}
+      - --diagnostic-only
+      - --controlled-faults
+      - --fault-delay-seconds
+      - ${PM_CAPTURE_FAULT_DELAY_SECONDS:-60}
+      - --output
+      - data/diagnostics/prediction_market_clob_capture_acceptance_v6
+    volumes:
+      - ./data:/app/data
+    restart: "no"
+
+  prediction-market-acceptance-supervisor:
+    build: .
+    command:
+      - python3
+      - -m
+      - prediction_market_backtest.cli
+      - acceptance-supervisor
+      - --tokens
+      - ${PM_CAPTURE_TOKENS:-51872688213902718591489699459529330104229430818729734029956444862907889791716,20509669395611413603454440240352841474074387717976173088630295459195602203845}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
 
 volumes:
   postgres_data:

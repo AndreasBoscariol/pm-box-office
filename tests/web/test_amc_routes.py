@@ -57,6 +57,19 @@ class AmcRouteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(set_movie_selected.call_args.kwargs["selected"])
 
+    async def test_toggle_movie_returns_no_content_for_htmx(self) -> None:
+        conn = Mock()
+        request = FakeRequest(b"selected=on")
+        request.headers["HX-Request"] = "true"
+        with (
+            patch.object(amc, "connect_database", return_value=conn),
+            patch.object(amc, "ensure_initialized"),
+            patch.object(amc.movie_service, "set_movie_selected"),
+        ):
+            response = await amc.toggle_movie("2026-06-30", "movie-1", request)
+
+        self.assertEqual(204, response.status_code)
+
     async def test_bulk_movies_ignores_removed_select_top_action(self) -> None:
         conn = Mock()
         movies = [
@@ -330,6 +343,35 @@ class AmcRouteTests(unittest.IsolatedAsyncioTestCase):
         conn.commit.assert_called_once()
         conn.close.assert_called_once()
 
+    def test_campaign_route_renders_when_worker_start_fails(self) -> None:
+        conn = Mock()
+        conn.execute.side_effect = [
+            Mock(fetchone=Mock(return_value=(0, None))),
+            Mock(fetchall=Mock(return_value=[])),
+        ]
+        with (
+            patch.object(amc, "connect_database", return_value=conn),
+            patch.object(amc, "ensure_initialized"),
+            patch.object(amc.db, "ensure_campaign", return_value="campaign-1"),
+            patch.object(amc.movie_service, "list_movies_for_date", return_value=[]),
+            patch.object(
+                amc,
+                "campaign_showtime_reporting_span",
+                return_value={"count": 0, "label": "No showtimes"},
+            ),
+            patch.object(amc.db, "campaign_queue_health", return_value={}),
+            patch.object(amc.db, "campaign_collection_diagnostics", return_value={}),
+            patch.object(amc.amc_workers, "recent_backoff_summary", return_value={"backoff_pressure_events": 0}),
+            patch.object(amc.amc_workers, "ensure_local_workers_started", side_effect=OSError("spawn failed")),
+            patch.object(amc.amc_workers, "local_worker_status", return_value={"running_count": 0}),
+            patch.object(amc.templates, "TemplateResponse", return_value=Mock()) as template_response,
+        ):
+            amc.campaign(Mock(), "2026-07-01")
+
+        template_response.assert_called_once()
+        conn.commit.assert_called_once()
+        conn.close.assert_called_once()
+
     async def test_start_seat_collection_starts_autoscaled_worker_target(self) -> None:
         conn = Mock()
         queue_health = {"due_now": 2, "late": 4, "queued": 4, "tasks_per_minute": 0.0, "eta_minutes": None}
@@ -385,6 +427,28 @@ class AmcRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("use_theatre_sample", create_run.call_args.kwargs)
         self.assertEqual("balanced_175", create_run.call_args.kwargs["sample_key"])
 
+    async def test_start_seat_collection_redirects_when_worker_start_fails(self) -> None:
+        conn = Mock()
+        queue_health = {"due_now": 0, "late": 0, "queued": 0, "tasks_per_minute": 0.0, "eta_minutes": None}
+        with (
+            patch.object(amc, "connect_database", return_value=conn),
+            patch.object(amc, "ensure_initialized"),
+            patch.object(amc.movie_service, "create_seat_collection_run"),
+            patch.object(amc.db, "ensure_campaign", return_value="campaign-1"),
+            patch.object(amc.db, "campaign_queue_health", return_value=queue_health),
+            patch.object(amc.amc_workers, "recent_backoff_summary", return_value={"backoff_pressure_events": 0}),
+            patch.object(amc.amc_workers, "ensure_local_workers_started", side_effect=OSError("spawn failed")),
+        ):
+            response = await amc.start_seat_collection(
+                "2026-07-01",
+                FakeRequest(b"sample_key=balanced_175"),
+            )
+
+        self.assertEqual(303, response.status_code)
+        self.assertEqual("/amc/campaigns/2026-07-01", response.headers["location"])
+        conn.commit.assert_called_once()
+        conn.close.assert_called_once()
+
     def test_collect_showtimes_forces_fresh_inventory_run(self) -> None:
         conn = Mock()
         with (
@@ -412,6 +476,26 @@ class AmcRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(303, response.status_code)
         self.assertEqual("/amc/campaigns/2026-07-01", response.headers["location"])
         restart_local_workers.assert_called_once()
+
+    def test_start_forecast_worker_route_starts_worker(self) -> None:
+        request = Mock()
+        request.headers = {"referer": "/amc/campaigns/2026-07-10"}
+        with patch.object(amc.forecast_workers, "ensure_worker_started") as ensure_worker:
+            response = amc.start_forecast_worker(request)
+
+        self.assertEqual(303, response.status_code)
+        self.assertEqual("/amc/campaigns/2026-07-10", response.headers["location"])
+        ensure_worker.assert_called_once()
+
+    def test_restart_forecast_worker_route_restarts_worker(self) -> None:
+        request = Mock()
+        request.headers = {"referer": "/amc/campaigns/2026-07-10"}
+        with patch.object(amc.forecast_workers, "restart_worker") as restart_worker:
+            response = amc.restart_forecast_worker(request)
+
+        self.assertEqual(303, response.status_code)
+        self.assertEqual("/amc/campaigns/2026-07-10", response.headers["location"])
+        restart_worker.assert_called_once()
 
     def test_restart_local_workers_stops_then_starts(self) -> None:
         with (

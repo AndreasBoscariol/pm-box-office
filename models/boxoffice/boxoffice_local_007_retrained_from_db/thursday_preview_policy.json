@@ -1,0 +1,21 @@
+{
+  "alpha": 1.208592691043934,
+  "baseline_definition": "Production carry-forward OW forecast available before reported previews; Friday-Sunday opening weekend only.",
+  "beta": 0.5900310023759322,
+  "decision_rule": "Promoted for non-AMC Live-Friday baseline after downstream paired influence audit; AMC-plus-preview remains shadow-only.",
+  "fit_method": "OLS on e_log ~ 1 + log(preview_gross_usd / baseline_forecast_usd)",
+  "interval_calibration_status": "legacy_unrecalibrated_for_thursday_preview_update",
+  "minimum_history_rule": "Post-2022 expanding historical diagnostics required at least 20 prior preview movies before scoring.",
+  "old_scale_tolerance_pct": 0.05,
+  "policy_version": "thursday_preview_post_2022_v1",
+  "preview_definition": "Observed final reported Thursday preview gross; used only as an information signal and never added to opening weekend gross.",
+  "production_usage": {
+    "actual_reported_preview": "Rescale Live-Friday/Saturday/Sunday baseline OW prior when leakage-safe preview actual and baseline are available.",
+    "amc_thursday_preview": "Shadow-only nowcast path; never affects production point forecast until separately validated.",
+    "friday_amc": "Unchanged; Friday AMC nowcast replaces Friday component only while Saturday/Sunday retain preview-updated baseline scale."
+  },
+  "training_cutoff": "2026-06-26",
+  "training_movie_count": 56,
+  "training_start": "2023-02-03",
+  "training_window": "post_2022_only"
+}

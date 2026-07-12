@@ -895,13 +895,19 @@ def parse_article(
     )
     predictions = append_unique_predictions(predictions, legacy_predictions)
     rejected.extend(legacy_rejected)
-    heading_predictions, heading_rejected = parse_standalone_forecast_heading_blocks(
-        parser.blocks,
-        article_url=article_url,
-        article_title=title,
-        published_date=published_date,
-        first_row_ordinal=len(predictions) + 1,
-    )
+    # The legacy standalone-heading layout is structurally ambiguous with the
+    # Boxoffice Podium.  A podium starts with section metadata and an aggregate
+    # Top 10 range, which must never be interpreted as a film forecast.
+    if not any(is_podium_section_heading(block.text) for block in parser.blocks):
+        heading_predictions, heading_rejected = parse_standalone_forecast_heading_blocks(
+            parser.blocks,
+            article_url=article_url,
+            article_title=title,
+            published_date=published_date,
+            first_row_ordinal=len(predictions) + 1,
+        )
+    else:
+        heading_predictions, heading_rejected = [], []
     predictions = append_unique_predictions(predictions, heading_predictions)
     rejected.extend(heading_rejected)
     if article.article_type != "weekend_preview" or not predictions:
@@ -1089,6 +1095,9 @@ def parse_standalone_forecast_heading_blocks(
         if title_block.level != 2 or distributor_block.level > 3 or date_block.level > 3 or range_block.level > 3:
             index += 1
             continue
+        if is_podium_section_heading(title_block.text) or is_aggregate_forecast_range(range_block.text):
+            index += 1
+            continue
         title = clean_legacy_movie_title(title_block.text)
         distributor = clean_text(distributor_block.text)
         release_date = forecast_date_from_text(date_block.text) or parse_dateish(re.sub(r"\s*\(.+\)\s*$", "", date_block.text))
@@ -1144,6 +1153,23 @@ def parse_standalone_forecast_heading_blocks(
         )
         index += 4
     return predictions, rejected
+
+
+def is_podium_section_heading(text: str) -> bool:
+    normalized = normalize_header(text)
+    return any(
+        marker in normalized
+        for marker in (
+            "the boxoffice podium",
+            "boxoffice pro podium",
+            "boxoffice barometer",
+        )
+    )
+
+
+def is_aggregate_forecast_range(text: str) -> bool:
+    normalized = normalize_header(text)
+    return re.search(r"\btop\s+\d+\s+(?:\d+\s+day\s+)?(?:range|forecast)\b", normalized) is not None
 
 
 def target_dates_from_release_and_range(
@@ -2552,6 +2578,13 @@ def import_article_parse_result(
         html=result.html,
     )
     predictions = match_predictions(conn, result.predictions)
+    # A reparse is authoritative for one article.  Replacing the complete set
+    # removes records emitted by an older parser version when a later version
+    # correctly rejects them.
+    conn.execute(
+        "DELETE FROM boxofficepro_weekend_predictions WHERE article_id = %s",
+        (article_id,),
+    )
     clear_article_issues(conn, issue_source=issue_source, article_url=result.article.article_url)
     for rejected_block in result.rejected:
         insert_issue(

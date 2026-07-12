@@ -9,7 +9,11 @@ from pm_box_office.sources.boxofficepro import ingest as boxofficepro_ingest
 from pm_box_office.sources.boxofficereport import ingest as boxofficereport_ingest
 from pm_box_office.sources.boxofficetheory import ingest as boxofficetheory_ingest
 from pm_box_office.sources.boxofficetheory_substack import ingest as boxofficetheory_substack_ingest
+from pm_box_office.sources.edwarddouglas_substack import ingest as edwarddouglas_substack_ingest
+from pm_box_office.sources.joblo import ingest as joblo_ingest
+from pm_box_office.sources.polymarket import ingest as polymarket_ingest
 from pm_box_office.sources.the_numbers import ingest as the_numbers_ingest
+from pm_box_office.sources.toddmthatcher import ingest as toddmthatcher_ingest
 from pm_box_office.orchestration import repository
 from pm_box_office.orchestration.registry import (
     BOX_OFFICE_PREDICTION_SOURCE_KEYS,
@@ -48,9 +52,17 @@ def test_box_office_prediction_ingests_are_registered_for_web_without_database()
 
     for source_key in BOX_OFFICE_PREDICTION_SOURCE_KEYS:
         assert source_key in source_by_key
-        assert source_by_key[source_key].command.startswith("pm_box_office.sources.boxoffice")
+        assert source_by_key[source_key].command.startswith("pm_box_office.sources.")
         assert "Predictions" in source_by_key[source_key].display_name
         assert source_key in RUN_ALL_SOURCE_KEYS
+
+
+def test_polymarket_metadata_ingest_is_a_scheduled_web_source_without_database() -> None:
+    source_by_key = {source.source_key: source for source in SOURCE_DEFINITIONS}
+
+    assert source_by_key["polymarket_metadata"].command == "pm_box_office.sources.polymarket.ingest"
+    assert source_by_key["polymarket_metadata"].requires_movies is True
+    assert "polymarket_metadata" not in RUN_ALL_SOURCE_KEYS
 
 
 def test_run_all_source_schema_initializers_take_advisory_lock_before_movie_schema_without_database() -> None:
@@ -60,7 +72,10 @@ def test_run_all_source_schema_initializers_take_advisory_lock_before_movie_sche
         boxofficereport_ingest,
         boxofficetheory_ingest,
         boxofficetheory_substack_ingest,
+        edwarddouglas_substack_ingest,
         boxofficeguru_ingest,
+        toddmthatcher_ingest,
+        joblo_ingest,
     ]
 
     for module in modules:
@@ -68,6 +83,28 @@ def test_run_all_source_schema_initializers_take_advisory_lock_before_movie_sche
         lock_index = source.index("acquire_schema_init_lock(conn)")
         movie_schema_index = source.index("movie_identity.ensure_movie_identity_schema(conn)")
         assert lock_index < movie_schema_index
+
+
+def test_polymarket_metadata_parser_validates_complete_bucket_set_without_database() -> None:
+    event = {
+        "id": "event-1",
+        "title": "Example Movie Opening Weekend Box Office",
+        "description": "Domestic 3-day opening weekend, per The Numbers. If exactly between brackets, use the higher bracket.",
+        "markets": [
+            {"id": "m1", "question": "Will Example Movie make under $10M?"},
+            {"id": "m2", "question": "Will Example Movie make $10M-$20M?"},
+            {"id": "m3", "question": "Will Example Movie make $20M-$30M?"},
+            {"id": "m4", "question": "Will Example Movie make $30M-$40M?"},
+            {"id": "m5", "question": "Will Example Movie make $40M or more?"},
+        ],
+    }
+
+    buckets, errors = polymarket_ingest.parse_event_buckets(event)
+    validation = polymarket_ingest.validate_bucket_set(buckets)
+
+    assert errors == []
+    assert validation.valid
+    assert [bucket.market_id for bucket in buckets] == ["m1", "m2", "m3", "m4", "m5"]
 
 
 class OrchestrationRepositoryTests(unittest.TestCase):
@@ -146,6 +183,63 @@ class OrchestrationRepositoryTests(unittest.TestCase):
             ("Rotten Tomatoes Critics", "pm_box_office.sources.rotten_tomatoes.ingest", True),
             tuple(row),
         )
+
+    def test_polymarket_metadata_sync_upserts_valid_market_tables(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE movies (
+                movie_id BIGINT PRIMARY KEY,
+                title TEXT NOT NULL,
+                release_date DATE,
+                release_year INTEGER
+            )
+            """
+        )
+        self.conn.execute(
+            "INSERT INTO movies (movie_id, title, release_date, release_year) VALUES (1, 'Example Movie', '2026-07-10', 2026)"
+        )
+        event = {
+            "id": "event-1",
+            "slug": "example-movie-opening-weekend",
+            "title": "Example Movie Opening Weekend Box Office",
+            "description": "Domestic 3-day opening weekend, per The Numbers. If exactly between brackets, use the higher bracket.",
+            "active": True,
+            "closed": False,
+            "markets": [
+                {"id": "m1", "question": "Will Example Movie make under $10M?", "clobTokenIds": '["101","102"]', "outcomes": '["Yes","No"]'},
+                {"id": "m2", "question": "Will Example Movie make $10M-$20M?"},
+                {"id": "m3", "question": "Will Example Movie make $20M-$30M?"},
+                {"id": "m4", "question": "Will Example Movie make $30M-$40M?"},
+                {"id": "m5", "question": "Will Example Movie make $40M or more?"},
+            ],
+        }
+
+        summary = polymarket_ingest.sync_metadata(self.conn, [event])
+
+        self.assertEqual(1, summary.events_upserted)
+        self.assertEqual(5, summary.markets_upserted)
+        self.assertEqual(5, summary.semantics_upserted)
+        self.assertEqual(1, summary.valid_events)
+        self.assertEqual((1,), summary.matched_movie_ids)
+        validation = self.conn.execute(
+            """
+            SELECT validation_status, validated_bucket_count, validation_errors
+            FROM prediction_market_backtest.event_bucket_validations
+            WHERE event_id = 'event-1'
+            """
+        ).fetchone()
+        self.assertEqual("valid", validation[0])
+        self.assertEqual(5, validation[1])
+        self.assertEqual([], validation[2])
+        boundaries = self.conn.execute(
+            """
+            SELECT bucket_upper
+            FROM prediction_market_backtest.contract_semantics
+            WHERE market_id IN ('m1', 'm2', 'm3', 'm4')
+            ORDER BY bucket_upper
+            """
+        ).fetchall()
+        self.assertEqual([10_000_000, 20_000_000, 30_000_000, 40_000_000], [int(row[0]) for row in boundaries])
 
     def test_seed_sources_registers_the_numbers_predictions_for_manual_runs(self) -> None:
         row = self.conn.execute(

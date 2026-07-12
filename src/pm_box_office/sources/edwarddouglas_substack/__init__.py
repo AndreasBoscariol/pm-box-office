@@ -1,0 +1,1 @@
+"""Edward Douglas Substack ingestion."""
